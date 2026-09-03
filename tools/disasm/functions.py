@@ -256,6 +256,14 @@ class FunctionDetector:
                 code_ranges.add(addr)
 
         call_targets = self.engine.get_call_targets()
+        # How many distinct call sites name each target: the corroboration the
+        # alignment rule below is standing in for.
+        call_sites: Dict[int, int] = {}
+        for insn in self.engine.instructions.values():
+            if insn.call_target is not None:
+                call_sites[insn.call_target] = \
+                    call_sites.get(insn.call_target, 0) + 1
+
         realigned = unaligned = 0
         for target in call_targets:
             section = self.image.get_section_at_va(target)
@@ -276,7 +284,9 @@ class FunctionDetector:
                 # that is almost never aligned; a real MSVC function start
                 # almost always is. Targets that already decoded are untouched,
                 # whatever their alignment -- that is pre-existing behaviour.
-                if target % config.CALL_TARGET_REALIGN_ALIGNMENT:
+                if (target % config.CALL_TARGET_REALIGN_ALIGNMENT
+                        and call_sites.get(target, 0)
+                        < config.CALL_TARGET_UNALIGNED_MIN_SITES):
                     unaligned += 1
                     continue
                 if self.engine.decode_at(target):
@@ -294,8 +304,8 @@ class FunctionDetector:
 
     def _pass_tail_jump_targets(self, sections: List[SectionInfo]) -> bool:
         """
-        Pass 6: Add the target of every unconditional jmp that leaves the body
-        of the function containing it.
+        Pass 6: Add the target of every jmp -- conditional or not -- that
+        leaves the body of the function containing it.
 
         Returns True if any new candidate was added.
         """
@@ -304,7 +314,17 @@ class FunctionDetector:
         added = False
 
         for insn in self.engine.instructions.values():
-            if not insn.is_jump or insn.is_cond_jump:
+            # Conditional branches count too. The translator emits a tail call
+            # for an out-of-body branch whichever kind it is -- a jne to another
+            # function's code becomes "if (cond) { sub_target(); return; }" --
+            # so a target reachable only that way still needs a function at it.
+            # Skipping them left the target undetected and the generated call
+            # resolved to an empty stub that returns immediately, silently
+            # skipping real code. Breakdown reaches its CRT floating-point
+            # helpers exactly this way: jne 0x1b2a30 at 0x001B2A99 lands in the
+            # gap between sub_001B2930 and sub_001B2A61, and hand-written CRT
+            # asm shares tails like this constantly.
+            if not insn.is_branch:
                 continue
             target = insn.jump_target
             if target is None or target in self._candidates:

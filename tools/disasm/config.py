@@ -113,6 +113,21 @@ MIN_CC_RUN = 1
 # Set to 1 to disable the check.
 CALL_TARGET_REALIGN_ALIGNMENT = 16
 
+# ...unless this many distinct call sites independently agree on the same
+# unaligned address, in which case take it despite the alignment.
+#
+# Alignment is a proxy for corroboration, and call-site count measures the same
+# thing directly. A call operand misdecoded out of data is an accident of where
+# the sweep lost phase, so it gets referenced once; many callers do not all land
+# on one address by accident. Breakdown's CRT per-thread-data accessor at
+# 0x001B22E4 is exactly this shape: 4 mod 16, sitting right after a jump table
+# the sweep decoded as instructions, and called from 17 sites that immediately
+# dereference what it returns. Undetected it became a `g_esp += 4` no-op and
+# every one of those callers read through a garbage pointer.
+#
+# Set high to effectively disable, or 1 to accept any unaligned call target.
+CALL_TARGET_UNALIGNED_MIN_SITES = 3
+
 CONFIDENCE_KNOWN = 1.0       # Entry point, known addresses
 CONFIDENCE_PROLOGUE = 0.95   # Standard prologue pattern
 CONFIDENCE_CALL_TARGET = 0.90  # Destination of a call instruction
