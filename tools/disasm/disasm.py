@@ -156,10 +156,26 @@ class Disassembler:
 
         # Add seed functions from vtable scanner or other sources
         if self.seed_functions:
+            realigned = 0
             for addr in self.seed_functions:
+                # Decode there if the linear sweep stepped over the address.
+                # A seed is an explicit assertion that a function starts here --
+                # stronger evidence than any heuristic in the detector -- but
+                # without a decoded instruction _build_functions has nothing to
+                # measure and the candidate silently produces no function. That
+                # is how Breakdown's InitializeCriticalSectionAndSpinCount
+                # fallback at 0x001B6603 stayed missing even when seeded: it
+                # sits just past a jump table the sweep decoded as instructions,
+                # so it never came out in phase. Unresolved, its ICALL returned
+                # eax = 0, the CRT read that as "lock init failed", tore down
+                # its whole lock table, and every later _lock recursed forever.
+                if addr not in self.engine.instructions:
+                    if self.engine.decode_at(addr):
+                        realigned += 1
                 self.func_detector._add_candidate(addr, 0.95, "seed_vtable_thunk")
             if self.verbose:
-                print(f"  Seeded {len(self.seed_functions)} function addresses")
+                print(f"  Seeded {len(self.seed_functions)} function addresses"
+                      f" ({realigned} needed realigning)")
 
         num_funcs = self.func_detector.detect_all(sections)
         if self.verbose:
