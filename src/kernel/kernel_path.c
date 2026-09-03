@@ -123,6 +123,36 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         }
     }
 
+    /* Back \Device\Harddisk0\partition0 with a real 512KB file.
+     *
+     * Partition0 is not a filesystem -- it is a raw kernel-reserved region at
+     * the start of the Xbox HDD holding disk configuration (boot counters,
+     * manufacturing flags, and at offset 0x800 the cache-partition allocation
+     * table). Titles open it directly and read/write that table to claim a
+     * cache partition for themselves; Breakdown does exactly this in
+     * sub_001ABB8E, and without a backing device the open fails, the title
+     * raises a fatal error and reboots to the dashboard.
+     *
+     * Zero-filled is correct and sufficient: the title validates the table's
+     * magic/version/signature and rebuilds it from scratch when they don't
+     * match, so an empty region exercises the same path a freshly formatted
+     * disk would. Created once, then persisted, so an allocation survives
+     * across runs. */
+    {
+        WCHAR p0[MAX_PATH];
+        swprintf_s(p0, MAX_PATH, L"%s\\partition0.bin", s_save_dir);
+        if (GetFileAttributesW(p0) == INVALID_FILE_ATTRIBUTES) {
+            HANDLE h = CreateFileW(p0, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                                   FILE_ATTRIBUTE_NORMAL, NULL);
+            if (h != INVALID_HANDLE_VALUE) {
+                LARGE_INTEGER sz; sz.QuadPart = 0x80000;   /* 512 KB */
+                SetFilePointerEx(h, sz, NULL, FILE_BEGIN);
+                SetEndOfFile(h);
+                CloseHandle(h);
+            }
+        }
+    }
+
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S", s_game_dir, s_save_dir);
 }
@@ -140,6 +170,82 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     if (!s_initialized)
         xbox_path_init(NULL, NULL);
 
+    /* Raw partition0 is a single binary region, not a directory tree, so it
+     * maps to one backing file rather than through the prefix rules below
+     * (which all append a remainder path). See xbox_path_init. */
+    if (match_prefix(xbox_path, "\\Device\\Harddisk0\\partition0")) {
+        fprintf(stderr, "  [PATH] %s -> partition0.bin (raw disk config region)\n",
+                xbox_path);
+        fflush(stderr);
+        swprintf_s(host_path_buf, buf_size, L"%s\\partition0.bin", s_save_dir);
+        return TRUE;
+    }
+
+    /* Cache partitions. Which partition a title gets is decided at runtime by
+     * the allocation table it reads out of partition0 (Breakdown claims one in
+     * sub_001ABB8E and lands on Partition5), so the number cannot be baked
+     * into the rule table -- match any of them and give each its own
+     * directory. Partition1 is excluded: it is the title's own game/user data
+     * and keeps its existing rule below. */
+    if ((skip = match_prefix(xbox_path, "\\Device\\Harddisk0\\Partition")) != 0) {
+        const char* p = xbox_path + skip;
+        int n = 0, ndigits = 0;
+        while (p[ndigits] >= '0' && p[ndigits] <= '9') {
+            n = n * 10 + (p[ndigits] - '0');
+            ndigits++;
+        }
+        if (ndigits > 0 && n != 1) {
+            const char* rem = p + ndigits;
+            WCHAR rem_w[MAX_PATH], dir[MAX_PATH];
+
+            if (*rem == '\0') {
+                /* No trailing separator: this addresses the raw partition
+                 * device, not the filesystem on it. A title formatting a
+                 * freshly allocated cache partition writes a FATX superblock
+                 * and FAT tables straight to this device (Breakdown does so in
+                 * sub_001AE166), so it needs a real backing image rather than
+                 * the directory the filesystem view maps to. Sparse, so the
+                 * nominal partition size costs only what is actually written. */
+                WCHAR img[MAX_PATH];
+                swprintf_s(img, MAX_PATH, L"%s\\Partition%d.img", s_save_dir, n);
+                if (GetFileAttributesW(img) == INVALID_FILE_ATTRIBUTES) {
+                    HANDLE h = CreateFileW(img, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                                           FILE_ATTRIBUTE_NORMAL, NULL);
+                    if (h != INVALID_HANDLE_VALUE) {
+                        LARGE_INTEGER sz;
+                        sz.QuadPart = (LONGLONG)XBOX_CACHE_PARTITION_BYTES;
+                        SetFilePointerEx(h, sz, NULL, FILE_BEGIN);
+                        SetEndOfFile(h);
+                        CloseHandle(h);
+                    }
+                }
+                fprintf(stderr, "  [PATH] %s -> Partition%d.img (raw partition device)\n",
+                        xbox_path, n);
+                fflush(stderr);
+                swprintf_s(host_path_buf, buf_size, L"%s", img);
+                return TRUE;
+            }
+
+            if (*rem == '\\') rem++;
+            swprintf_s(dir, MAX_PATH, L"%s\\Partition%d", s_save_dir, n);
+            SHCreateDirectoryExW(NULL, dir, NULL);
+
+            if (*rem) {
+                MultiByteToWideChar(CP_ACP, 0, rem, -1, rem_w, MAX_PATH);
+                for (WCHAR* q = rem_w; *q; q++)
+                    if (*q == L'/') *q = L'\\';
+                swprintf_s(host_path_buf, buf_size, L"%s\\%s", dir, rem_w);
+            } else {
+                /* The partition root itself -- no trailing separator, so it
+                 * opens cleanly as a directory. */
+                swprintf_s(host_path_buf, buf_size, L"%s", dir);
+            }
+            fprintf(stderr, "  [PATH] %s -> cache Partition%d\n", xbox_path, n);
+            fflush(stderr);
+            return TRUE;
+        }
+    }
+
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
         skip = match_prefix(xbox_path, s_rules[i].prefix);
         if (skip) {
@@ -150,6 +256,13 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
         }
     }
 
+    /* TEMP TRACE (2026-09-03): xbox_log(WARN) is filtered by default, so this
+     * silent passthrough was invisible -- the path is passed through
+     * unchanged and CreateFileW fails on it for real, surfacing only as an
+     * opaque STATUS_OBJECT_PATH_NOT_FOUND several layers up. See HeroLab
+     * task 1b0f5bf7-5d54-4fb6-a89f-1ba04ad8969a. */
+    fprintf(stderr, "  [PATH] UNRECOGNIZED (passthrough, will likely fail): %s\n", xbox_path);
+    fflush(stderr);
     xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "Unrecognized Xbox path: %s", xbox_path);
     MultiByteToWideChar(CP_ACP, 0, xbox_path, -1, host_path_buf, buf_size);
     return TRUE;

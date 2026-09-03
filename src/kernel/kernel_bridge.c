@@ -1314,13 +1314,32 @@ static void bridge_RtlNtStatusToDosError(void)
 /* Extract the ANSI path string from an Xbox OBJECT_ATTRIBUTES */
 static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
 {
+    static RECOMP_TLS char path[MAX_PATH];
     uint32_t ansi_str_va, buf_va;
+    uint16_t len;
+
     if (!obj_attrs_va) return NULL;
     ansi_str_va = BRIDGE_MEM32(obj_attrs_va + 4);
     if (!ansi_str_va) return NULL;
     buf_va = BRIDGE_MEM32(ansi_str_va + 4);
     if (!buf_va) return NULL;
-    return (const char*)XBOX_TO_NATIVE(buf_va);
+
+    /* An ANSI_STRING carries an explicit Length and its buffer is not required
+     * to be NUL-terminated at that length -- a title can point two strings at
+     * one buffer and vary Length to mean different things. Breakdown does
+     * exactly that: it builds "\Device\Harddisk0\PartitionN\" once, then
+     * decrements Length by one to address the raw partition device
+     * ("...PartitionN", no trailing separator) rather than the filesystem root.
+     * Reading the buffer as a C string collapses the two and the raw device
+     * open lands on the filesystem directory instead. Length 0 keeps the old
+     * NUL-terminated reading -- some callers leave it unset. */
+    len = BRIDGE_MEM16(ansi_str_va + 0);
+    if (len == 0 || len >= MAX_PATH)
+        return (const char*)XBOX_TO_NATIVE(buf_va);
+
+    memcpy(path, (const char*)XBOX_TO_NATIVE(buf_va), len);
+    path[len] = '\0';
+    return path;
 }
 
 /* Write NTSTATUS + Information into Xbox IO_STATUS_BLOCK */
@@ -1345,6 +1364,35 @@ static void bridge_write_iostatus(uint32_t ios_va, NTSTATUS status, uint32_t inf
 #define BRIDGE_HANDLE_MASK 0x00FFFFFFu
 #define BRIDGE_HANDLE_MAX  16384
 static HANDLE s_handle_table[BRIDGE_HANDLE_MAX];
+
+/* Xbox path each open handle was created with, so a later open can resolve
+ * an OBJECT_ATTRIBUTES.RootDirectory-relative name against it (see
+ * bridge_build_oa below). Parallel to s_handle_table, indexed the same way;
+ * cleared alongside it in bridge_take_handle. Populated only for handles
+ * opened through bridge_create_file_impl -- good enough since RootDirectory
+ * is only ever a directory handle a title itself opened earlier. */
+static char s_handle_path[BRIDGE_HANDLE_MAX][MAX_PATH];
+
+static void bridge_set_handle_path(uint32_t token, const char* path)
+{
+    if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
+        uint32_t i = token & BRIDGE_HANDLE_MASK;
+        if (i > 0 && i < BRIDGE_HANDLE_MAX && path) {
+            strncpy(s_handle_path[i], path, MAX_PATH - 1);
+            s_handle_path[i][MAX_PATH - 1] = '\0';
+        }
+    }
+}
+
+static const char* bridge_get_handle_path(uint32_t token)
+{
+    if ((token & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
+        uint32_t i = token & BRIDGE_HANDLE_MASK;
+        if (i > 0 && i < BRIDGE_HANDLE_MAX && s_handle_path[i][0])
+            return s_handle_path[i];
+    }
+    return NULL;
+}
 
 static uint32_t bridge_handle_token(HANDLE h)
 {
@@ -1410,17 +1458,55 @@ static HANDLE bridge_take_handle(uint32_t token)
         if (i > 0 && i < BRIDGE_HANDLE_MAX) {
             HANDLE h = s_handle_table[i];
             s_handle_table[i] = NULL;
+            s_handle_path[i][0] = '\0';
             return h;
         }
     }
     return NULL;   /* untagged -> not a table handle, do not close */
 }
 
-/* Build a native OBJECT_ATTRIBUTES wrapping the translated Xbox path. */
+/* Build a native OBJECT_ATTRIBUTES wrapping the translated Xbox path.
+ *
+ * Handles a RootDirectory-relative open: OBJECT_ATTRIBUTES.RootDirectory
+ * (offset 0) names an already-open directory handle, and ObjectName is
+ * then a name relative to it rather than an absolute device path. This
+ * used to be ignored entirely (RootDirectory hardcoded to NULL below, only
+ * ObjectName ever read) -- any title that opens a file relative to a
+ * directory handle instead of building one absolute path string got a
+ * NULL ObjectName->Buffer here and failed with STATUS_OBJECT_PATH_NOT_FOUND
+ * before ever reaching real path translation. See
+ * Breakdown-Launcher HeroLab task 1b0f5bf7-5d54-4fb6-a89f-1ba04ad8969a
+ * (sub_001ABDD9's NtOpenFile, kernel call #124 in that trace). */
 static void bridge_build_oa(uint32_t obj_attrs_va,
                             XBOX_OBJECT_ATTRIBUTES* oa, XBOX_ANSI_STRING* name)
 {
-    const char* path = bridge_get_xbox_path(obj_attrs_va);
+    static RECOMP_TLS char joined[MAX_PATH];
+    uint32_t    root_token = obj_attrs_va ? BRIDGE_MEM32(obj_attrs_va + 0) : 0;
+    const char* root_path  = root_token ? bridge_get_handle_path(root_token) : NULL;
+    const char* rel_path   = bridge_get_xbox_path(obj_attrs_va);
+    const char* path;
+
+    if (root_path) {
+        if (rel_path && rel_path[0]) {
+            /* rel_path may or may not carry its own leading separator. */
+            size_t root_len = strlen(root_path);
+            BOOL   root_has_sep = root_len && (root_path[root_len - 1] == '\\');
+            BOOL   rel_has_sep  = rel_path[0] == '\\';
+            snprintf(joined, MAX_PATH - 1, "%s%s%s", root_path,
+                      (root_has_sep || rel_has_sep) ? "" : "\\",
+                      (root_has_sep && rel_has_sep) ? rel_path + 1 : rel_path);
+        } else {
+            /* No relative name: the open targets the root directory itself. */
+            snprintf(joined, MAX_PATH - 1, "%s", root_path);
+        }
+        joined[MAX_PATH - 1] = '\0';
+        path = joined;
+    } else {
+        /* No RootDirectory (or it didn't resolve to a tracked path) --
+         * unchanged behavior: ObjectName must be the absolute path. */
+        path = rel_path;
+    }
+
     name->Buffer        = (PCHAR)path;
     name->Length        = path ? (USHORT)strlen(path) : 0;
     name->MaximumLength = (USHORT)(name->Length + 1);
@@ -1443,6 +1529,19 @@ static NTSTATUS bridge_create_file_impl(
 
     bridge_build_oa(obj_attrs_va, &oa, &name);
     if (!name.Buffer) {
+        /* TEMP TRACE (2026-09-03): dump the raw guest OBJECT_ATTRIBUTES so
+         * a NULL name isn't a black box -- see HeroLab task
+         * 1b0f5bf7-5d54-4fb6-a89f-1ba04ad8969a. */
+        uint32_t root_tok    = obj_attrs_va ? BRIDGE_MEM32(obj_attrs_va + 0) : 0;
+        uint32_t objname_va  = obj_attrs_va ? BRIDGE_MEM32(obj_attrs_va + 4) : 0;
+        uint32_t buf_va      = objname_va ? BRIDGE_MEM32(objname_va + 4) : 0;
+        uint16_t len         = objname_va ? BRIDGE_MEM16(objname_va + 0) : 0;
+        fprintf(stderr, "  [TRACE bridge_create_file_impl] NULL name: obj_attrs_va=0x%08X "
+                "RootDirectory_token=0x%08X ObjectName_va=0x%08X Buffer_va=0x%08X Length=%u "
+                "root_path_resolved=%s\n",
+                obj_attrs_va, root_tok, objname_va, buf_va, (unsigned)len,
+                bridge_get_handle_path(root_tok) ? bridge_get_handle_path(root_tok) : "(none)");
+        fflush(stderr);
         bridge_write_iostatus(iostatus_va, STATUS_OBJECT_PATH_NOT_FOUND, 0);
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
@@ -1452,7 +1551,12 @@ static NTSTATUS bridge_create_file_impl(
                            file_attrs, share, disposition, options);
 
     if (NT_SUCCESS(st)) {
-        bridge_write_handle(handle_va, h);
+        uint32_t token = bridge_handle_token(h);
+        if (handle_va) BRIDGE_MEM32(handle_va) = token;
+        /* name.Buffer is the resolved (possibly RootDirectory-joined) path
+         * built by bridge_build_oa -- record it so a later open can use
+         * *this* handle as ITS RootDirectory. */
+        bridge_set_handle_path(token, name.Buffer);
         bridge_write_iostatus(iostatus_va, ios.Status, (uint32_t)ios.Information);
     } else {
         bridge_write_iostatus(iostatus_va, st, 0);
@@ -1855,11 +1959,21 @@ static void bridge_IoCreateFile(void)
 /* ── NtDeviceIoControlFile (ordinal 196, 10 args = 40 bytes) */
 static void bridge_NtDeviceIoControlFile(void)
 {
-    uint32_t ioctl = STACK_ARG(5);
-    uint32_t ios_va = STACK_ARG(4);
-    fprintf(stderr, "  [FILE] NtDeviceIoControlFile(0x%X) - stub\n", ioctl);
-    bridge_write_iostatus(ios_va, 0xC00000BBu, 0);
-    g_eax = 0xC00000BBu; /* STATUS_NOT_IMPLEMENTED */
+    HANDLE   handle    = bridge_resolve_handle(STACK_ARG(0));
+    uint32_t ios_va    = STACK_ARG(4);
+    uint32_t ioctl     = STACK_ARG(5);
+    uint32_t in_va     = STACK_ARG(6);
+    uint32_t in_len    = STACK_ARG(7);
+    uint32_t out_va    = STACK_ARG(8);
+    uint32_t out_len   = STACK_ARG(9);
+    XBOX_IO_STATUS_BLOCK ios;
+
+    memset(&ios, 0, sizeof(ios));
+    g_eax = (uint32_t)xbox_NtDeviceIoControlFile(handle, NULL, NULL, NULL, &ios,
+                ioctl,
+                in_va  ? XBOX_TO_NATIVE(in_va)  : NULL, in_len,
+                out_va ? XBOX_TO_NATIVE(out_va) : NULL, out_len);
+    bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
 /* ── NtFsControlFile (ordinal 200, 10 args = 40 bytes) ──── */

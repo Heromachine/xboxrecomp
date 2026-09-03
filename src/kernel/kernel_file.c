@@ -122,13 +122,30 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
+        DWORD existing = GetFileAttributesW(win_path);
+        DWORD disp     = xbox_disposition_to_win32(CreateDisposition);
+
         if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
             flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
+
+        /* The target may already be a directory even though the caller did not
+         * assert FILE_DIRECTORY_FILE -- NT/Xbox let a title open a directory
+         * through a plain NtCreateFile, but Win32 fails CreateFileW on one with
+         * ERROR_ACCESS_DENIED unless FILE_FLAG_BACKUP_SEMANTICS is set (and it
+         * only accepts OPEN_EXISTING for a directory). Breakdown opens its
+         * cache partition's root exactly this way in sub_001AE166, and without
+         * this it got STATUS_ACCESS_DENIED and raised a fatal error. */
+        if (existing != INVALID_FILE_ATTRIBUTES &&
+            (existing & FILE_ATTRIBUTE_DIRECTORY)) {
+            flags_and_attrs |= FILE_FLAG_BACKUP_SEMANTICS;
+            disp = OPEN_EXISTING;
+        }
+
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
             xbox_share_to_win32(ShareAccess), NULL,
-            xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
+            disp, flags_and_attrs, NULL);
     }
 
     if (h == INVALID_HANDLE_VALUE) {
@@ -441,15 +458,22 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
+            /* BytesPerSector * SectorsPerAllocationUnit must equal the Xbox
+             * FATX cluster size (16KB / 0x4000), not the NTFS-typical 4KB
+             * (512*8) this used to report -- Breakdown's own volume-mount
+             * check (sub_001ACD9A, guest VA 0x001ACD9A) multiplies these
+             * two fields and compares against a hardcoded 0x4000, failing
+             * with STATUS_UNRECOGNIZED_VOLUME when they don't match. See
+             * HeroLab task 1b0f5bf7-5d54-4fb6-a89f-1ba04ad8969a. */
             if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
                 info->BytesPerSector = 512;
-                info->SectorsPerAllocationUnit = 8;
+                info->SectorsPerAllocationUnit = 32;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 info->TotalAllocationUnits.QuadPart = total_bytes.QuadPart / cs;
                 info->AvailableAllocationUnits.QuadPart = free_bytes.QuadPart / cs;
             } else {
                 info->BytesPerSector = 512;
-                info->SectorsPerAllocationUnit = 8;
+                info->SectorsPerAllocationUnit = 32;
                 info->TotalAllocationUnits.QuadPart = 1048576;
                 info->AvailableAllocationUnits.QuadPart = 524288;
             }
@@ -965,8 +989,10 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             struct statvfs vfs;
             int fd = w32_handle_fd(FileHandle);
+            /* Must multiply out to the Xbox FATX cluster size (0x4000) --
+             * see the matching comment on the _WIN32 branch above. */
             info->BytesPerSector = 512;
-            info->SectorsPerAllocationUnit = 8;
+            info->SectorsPerAllocationUnit = 32;
             if (fd >= 0 && fstatvfs(fd, &vfs) == 0) {
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 ULONGLONG total = (ULONGLONG)vfs.f_blocks * vfs.f_frsize;
@@ -1177,7 +1203,59 @@ NTSTATUS __stdcall xbox_NtDeviceIoControlFile(
     PVOID OutputBuffer, ULONG OutputBufferLength)
 {
     (void)FileHandle; (void)Event; (void)ApcRoutine; (void)ApcContext;
-    (void)InputBuffer; (void)InputBufferLength; (void)OutputBuffer; (void)OutputBufferLength;
+    (void)InputBuffer; (void)InputBufferLength;
+
+    /* Disk geometry/partition queries. A title formatting a cache partition
+     * issues both before it writes anything: Breakdown's FATX formatter
+     * (sub_001AE166) reads BytesPerSector out of the geometry to size its
+     * clusters, then PartitionLength to decide FAT16 vs FAT32. Both describe
+     * the same nominal partition as the backing image kernel_path.c creates. */
+    switch (IoControlCode) {
+    case 0x00070000: {  /* IOCTL_DISK_GET_DRIVE_GEOMETRY -> DISK_GEOMETRY */
+        uint32_t* g = (uint32_t*)OutputBuffer;
+        const uint32_t sectors_per_track   = 32;
+        const uint32_t tracks_per_cylinder = 2;
+        unsigned long long total_sectors =
+            XBOX_CACHE_PARTITION_BYTES / XBOX_CACHE_BYTES_PER_SECTOR;
+        unsigned long long cylinders =
+            total_sectors / (sectors_per_track * tracks_per_cylinder);
+
+        if (!g || OutputBufferLength < 24) return STATUS_INVALID_PARAMETER;
+        g[0] = (uint32_t)cylinders;
+        g[1] = (uint32_t)(cylinders >> 32);
+        g[2] = 12;                       /* MediaType: FixedMedia */
+        g[3] = tracks_per_cylinder;
+        g[4] = sectors_per_track;
+        g[5] = XBOX_CACHE_BYTES_PER_SECTOR;
+        if (IoStatusBlock) {
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            IoStatusBlock->Information = 24;
+        }
+        return STATUS_SUCCESS;
+    }
+    case 0x00074004: {  /* IOCTL_DISK_GET_PARTITION_INFO -> PARTITION_INFORMATION */
+        uint32_t* p = (uint32_t*)OutputBuffer;
+
+        if (!p || OutputBufferLength < 32) return STATUS_INVALID_PARAMETER;
+        memset(p, 0, 32);
+        /* StartingOffset stays 0: the image is the partition, so offsets a
+         * title computes against it are already partition-relative. */
+        p[2] = (uint32_t)(XBOX_CACHE_PARTITION_BYTES & 0xFFFFFFFFu);  /* PartitionLength */
+        p[3] = (uint32_t)(XBOX_CACHE_PARTITION_BYTES >> 32);
+        p[5] = 0;                        /* PartitionNumber */
+        ((unsigned char*)p)[24] = 0x42;  /* PartitionType */
+        ((unsigned char*)p)[26] = 1;     /* RecognizedPartition */
+        if (IoStatusBlock) {
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            IoStatusBlock->Information = 32;
+        }
+        return STATUS_SUCCESS;
+    }
+    default:
+        break;
+    }
+
+    (void)OutputBuffer; (void)OutputBufferLength;
     xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "NtDeviceIoControlFile(0x%X) - stub", IoControlCode);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_NOT_IMPLEMENTED;

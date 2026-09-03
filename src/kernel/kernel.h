@@ -541,6 +541,18 @@ typedef char  xbox_host_char;
  */
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
+/*
+ * Nominal size of one Xbox HDD cache partition (750 MB).
+ *
+ * The disk-config region's partition map puts the three cache partitions at
+ * 0x00080000, 0x2EE80000 and 0x5DC80000 -- 0x2EE00000 apart. A title that
+ * formats a cache partition asks the device for its geometry first, so the
+ * size reported there and the size of the backing image kernel_path.c creates
+ * have to agree; both come from here.
+ */
+#define XBOX_CACHE_PARTITION_BYTES  0x2EE00000ULL
+#define XBOX_CACHE_BYTES_PER_SECTOR 512u
+
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
  * ============================================================================ */
