@@ -15,6 +15,9 @@
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
+#ifdef RECOMP_ICALL_FEEDBACK
+#include "recomp_icall_feedback.h"
+#endif
 
 /* ============================================================================
  * IRQL Simulation
@@ -248,6 +251,14 @@ VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
         "HalReturnToFirmware: routine=%u (exiting)", Routine);
+    /* ExitProcess below never returns, so it also skips atexit -- dump here
+     * or the run's ICALL feedback (see recomp_icall_feedback.h) is lost.
+     * A title that exits this way instead of crashing is still exactly the
+     * kind of run worth capturing: it reached furthest, so it is the run
+     * with the most feedback to give. */
+#ifdef RECOMP_ICALL_FEEDBACK
+    recomp_icall_feedback_dump(RECOMP_ICALL_FEEDBACK_PATH);
+#endif
     ExitProcess(0);
 }
 

@@ -40,8 +40,13 @@ static inline void xbox_path_normalize(char *p)
 #endif
 }
 
-/* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent on POSIX. */
-#if !defined(_MSC_VER)
+/* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent on POSIX.
+ * NOT for mingw-w64: it targets _WIN32 too and its own <windows.h> already
+ * declares a real __debugbreak(void), which this function-like macro then
+ * collides with (macro takes 0 args, the redeclaration site "calls" it with
+ * args from the declaration itself -- a parse error, not a redefinition
+ * warning). Only define the shim for a true non-Windows POSIX host. */
+#if !defined(_MSC_VER) && !defined(_WIN32)
 #define __debugbreak() __builtin_trap()
 #endif
 

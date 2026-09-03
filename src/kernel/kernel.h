@@ -36,9 +36,19 @@ typedef UCHAR KIRQL, *PKIRQL;
 typedef CCHAR KPROCESSOR_MODE;
 typedef LONG KPRIORITY;
 
-/* Processor modes */
+/* Processor modes.
+ * POSIX-only, unlike the #ifndef-guarded NTSTATUS codes below: KernelMode is
+ * not a macro anywhere in the Windows SDK, so #ifndef can't detect the
+ * conflict. mingw-w64's winnt.h has an unrelated `DWORD KernelMode : 1;`
+ * bitfield elsewhere in the header (real struct field, not a macro) -- an
+ * unguarded object-like macro here textually replaces that field name too
+ * and breaks its declaration. A real Windows host (MSVC or mingw) already
+ * has an equivalent KPROCESSOR_MODE concept reachable through <windows.h>;
+ * this shim is only for the Linux/POSIX type vocabulary in xbox_winnt.h. */
+#if !defined(_WIN32)
 #define KernelMode  0
 #define UserMode    1
+#endif
 
 /* IRQL levels (Xbox uses same NT IRQL model) */
 #define PASSIVE_LEVEL   0
