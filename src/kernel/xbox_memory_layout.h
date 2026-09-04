@@ -191,6 +191,27 @@ typedef union RecompXmm {
 /** Initial ESP value (top of stack, 16-byte aligned). */
 #define XBOX_STACK_TOP      (XBOX_STACK_BASE + XBOX_STACK_SIZE - 16)
 
+/* Fake TIB backing store for fs:-prefixed accesses (FS8/16/32 in
+ * templates/runtime/recomp_types.h -- keep RECOMP_FAKE_TIB_SIZE identical
+ * there, same reasoning as the RECOMP_XMM_DEFINED guard above). Genuinely
+ * per-thread (RECOMP_TLS), and physically separate from the guest's linear
+ * address space so a title's own use of a low linear address (Breakdown
+ * does a plain `mov [4], eax` unrelated to threading) can never collide
+ * with what the fake TIB stores at the same-looking fs: offset. */
+#ifndef RECOMP_FAKE_TIB_SIZE
+#define RECOMP_FAKE_TIB_SIZE 256
+#endif
+extern RECOMP_TLS uint8_t g_fake_tib[RECOMP_FAKE_TIB_SIZE];
+
+/**
+ * Populate this thread's fake TIB. Call once per thread -- the main thread
+ * from xbox_MemoryLayoutInit(), and every SPAWN-mode worker thread from
+ * bridge_thread_main() (kernel_bridge.c) -- since g_fake_tib is
+ * RECOMP_TLS and therefore starts zeroed on every new thread, not just the
+ * first one.
+ */
+void xbox_init_fake_tib(void);
+
 /* ================================================================
  * Worker stack slices (host-tick-driven titles)
  * ================================================================

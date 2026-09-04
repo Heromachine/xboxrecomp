@@ -314,9 +314,17 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     recomp_func_t fn = s->fn;
     uint32_t ctx1 = s->ctx1, ctx2 = s->ctx2;
 
-    /* Own register set (RECOMP_TLS), own simulated stack. */
+    /* Own register set (RECOMP_TLS), own simulated stack, own fake TIB.
+     * g_fake_tib is RECOMP_TLS too and starts zeroed on every new OS
+     * thread, so each genuinely new thread needs this exactly once here --
+     * NOT in bridge_run_thread_inline() below, which this function calls
+     * into but which is also reused for the inline-fallback path on an
+     * ALREADY-running, already-initialized thread when the stack-slot pool
+     * is exhausted; re-running init there would reset that thread's live
+     * fake-TIB state mid-execution. */
     g_is_spawned_thread = 1;
     g_esp = s->stack_top;
+    xbox_init_fake_tib();
     free(s);
 
     bridge_run_thread_inline(fn, ctx1, ctx2);

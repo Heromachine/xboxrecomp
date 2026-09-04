@@ -236,6 +236,34 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
 #define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
 
+/**
+ * fs:[offset] access -- the Xbox TIB/KPCR, a per-thread structure.
+ *
+ * On real hardware fs:[N] and linear guest address N are two entirely
+ * separate pieces of memory. Earlier generated code folded an fs:-prefixed
+ * operand into an ordinary MEM32(N)-style access, as if the segment prefix
+ * were just another displacement -- so a title's own unrelated use of low
+ * linear addresses (e.g. Breakdown does a plain `mov [4], eax` for something
+ * that has nothing to do with threading) silently clobbered whatever the
+ * fake TIB had stored at that same guest address, corrupting a later,
+ * unrelated read of fs:[4] elsewhere in the title. FS8/16/32 read this
+ * separate, RECOMP_TLS (genuinely per-thread) backing store instead, so the
+ * two can never collide. Host code populates it via xbox_init_fake_tib()
+ * (xbox_memory_layout.c) once per thread, main and every spawned worker
+ * alike -- see kernel_bridge.c's bridge_thread_main().
+ *
+ * HeroLab: Xbox Recompiler project, Breakdown sub_001AAC76 investigation
+ * (task tracked 2026-09-04). Offsets actually read across Breakdown's own
+ * binary: 0, 4, 0x20, 0x24, 0x28, 0x58 -- RECOMP_FAKE_TIB_SIZE below is sized
+ * with headroom past that for other titles.
+ */
+#define RECOMP_FAKE_TIB_SIZE 256
+extern RECOMP_TLS uint8_t g_fake_tib[RECOMP_FAKE_TIB_SIZE];
+
+#define FS8(off)   (*(volatile uint8_t  *)(g_fake_tib + (off)))
+#define FS16(off)  (*(volatile uint16_t *)(g_fake_tib + (off)))
+#define FS32(off)  (*(volatile uint32_t *)(g_fake_tib + (off)))
+
 /* ================================================================
  * SSE / XMM register state
  *

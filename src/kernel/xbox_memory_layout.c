@@ -37,6 +37,12 @@ static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
 static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
 
+/* Definition for the RECOMP_TLS backing store FS8/16/32 read and write
+ * (recomp_types.h). Genuinely per-thread: each OS thread gets its own,
+ * zero-initialized copy, so it must be (re)populated on every thread's
+ * startup, not just once at process init -- see xbox_init_fake_tib(). */
+RECOMP_TLS uint8_t g_fake_tib[RECOMP_FAKE_TIB_SIZE];
+
 /* Actual mapped RAM for this run; see the header. Default retail 64 MB. */
 size_t g_xbox_total_ram = XBOX_TOTAL_RAM;
 
@@ -271,6 +277,98 @@ RECOMP_TLS uint32_t g_ebp = 0;
 volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
 volatile uint64_t g_icall_count = 0;
+
+/**
+ * Populate this thread's fake TIB for fs:[offset] access (FS8/16/32 in
+ * recomp_types.h). g_fake_tib is RECOMP_TLS, so it starts zeroed on every
+ * new OS thread -- call this once at the start of each one, not just at
+ * process init. xbox_MemoryLayoutInit() calls it for the main thread;
+ * bridge_thread_main() (kernel_bridge.c) calls it for every SPAWN-mode
+ * worker.
+ *
+ * Moved out of guest linear memory (was Xbox VA 0x0-0x2C) 2026-09-04: real
+ * hardware's fs:[N] and linear guest address N are unrelated memory, but the
+ * lifter used to fold an fs:-prefixed operand into an ordinary MEM32(N), so
+ * whatever a title stored at low linear addresses for its own reasons could
+ * silently clobber these fields. Breakdown does exactly that (a plain
+ * `mov [4], eax` with nothing to do with threading), corrupting fs:[4] mid-
+ * run and crashing a later, unrelated function that legitimately reads it
+ * for a TLS-array lookup (sub_001AAC76; see HeroLab, Xbox Recompiler
+ * project, task tracked 2026-09-04). The two are independent now.
+ */
+void xbox_init_fake_tib(void)
+{
+    #define FAKE_TIB_INIT32(off, val) \
+        (*(uint32_t *)(g_fake_tib + (off)) = (uint32_t)(val))
+
+    memset(g_fake_tib, 0, sizeof(g_fake_tib));
+
+    FAKE_TIB_INIT32(0x00, 0xFFFFFFFF);       /* SEH: end of chain */
+    FAKE_TIB_INIT32(0x08, XBOX_STACK_BASE);  /* Stack limit (low address) */
+    FAKE_TIB_INIT32(0x18, 0x00000000);       /* Self pointer -- a sentinel,
+                                               * same as before; nothing
+                                               * observed dereferences it as
+                                               * a guest VA. */
+
+    /*
+     * fs:[0x04] - was XBOX_STACK_TOP (a scalar), on the mistaken assumption
+     * this mirrors NT_TIB.StackBase. It doesn't: the CRT's _getptd-
+     * equivalent (sub_001B22E4 in Breakdown) walks it as
+     *   ecx = MEM32(4); edi = MEM32(ecx + tls_index*4) + 0xC;
+     * i.e. fs:[4] must be a TLS ARRAY BASE POINTER, not a stack-top address.
+     * Confirmed against real hardware via xemu+gdb (2026-09-03): fs_base+4
+     * held 0xd003ddf0, a genuine pointer, never a stack-top-shaped value.
+     *
+     * The VALUE stays a real guest VA (later code dereferences it with an
+     * ordinary, unprefixed MEM32(ptr + idx*4)) -- only the SLOT that holds
+     * it moved out of colliding guest linear memory into g_fake_tib.
+     *
+     * KNOWN LIMITATION, unchanged by this fix: every thread's tls_index
+     * still resolves into the SAME zeroed guest page (0x00761000) rather
+     * than a genuinely distinct array per thread -- moving the slot out of
+     * guest memory stops it from being clobbered by unrelated game writes,
+     * but does not by itself give each thread its own TLS array contents.
+     * Not correct for a title that depends on distinct per-thread CRT
+     * state; needs a real per-thread-indexed array before that matters
+     * (see HeroLab task 7292f7c9 follow-up notes).
+     */
+    #define FAKE_TLS_ARRAY_VA  0x00761000  /* dedicated, zeroed - see above */
+    FAKE_TIB_INIT32(0x04, FAKE_TLS_ARRAY_VA);
+    #undef FAKE_TLS_ARRAY_VA
+
+    /*
+     * fs:[0x20] - On Xbox KPCR, this is the Prcb pointer. Game code reads
+     * [fs:[0x20] + 0x250] which on the real Xbox accesses a D3D cache
+     * structure. We set it to 0 so the read at offset 0x250 returns 0,
+     * causing the cache init to be skipped.
+     */
+    FAKE_TIB_INIT32(0x20, 0x00000000);
+
+    /*
+     * fs:[0x28] - Thread local storage / RW engine context. Unlike the slot
+     * itself, the structure it points to is genuine guest memory that
+     * translated code dereferences with an ordinary (unprefixed) MEM32, so
+     * it still lives in the guest's linear address space, in the reserved
+     * BSS area below -- only the pointer TO it moved into g_fake_tib.
+     */
+    {
+        #define XBOX_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
+        #define MEM32_INIT(va, val) (*(uint32_t *)XBOX_VA(va) = (uint32_t)(val))
+        #define FAKE_TLS_VA     0x00760000  /* Fake TLS structure (in BSS) */
+        #define FAKE_RWDATA_VA  0x00700000  /* RW engine data area (in BSS) */
+
+        FAKE_TIB_INIT32(0x28, FAKE_TLS_VA);
+        /* TLS[0x28] = pointer to RW data area */
+        MEM32_INIT(FAKE_TLS_VA + 0x28, FAKE_RWDATA_VA);
+
+        #undef FAKE_TLS_VA
+        #undef FAKE_RWDATA_VA
+        #undef MEM32_INIT
+        #undef XBOX_VA
+    }
+
+    #undef FAKE_TIB_INIT32
+}
 
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
@@ -539,98 +637,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     fprintf(stderr, "  Stack: %u KB at Xbox VA 0x%08X (ESP = 0x%08X)\n",
             XBOX_STACK_SIZE / 1024, XBOX_STACK_BASE, g_esp);
 
-    /*
-     * Populate the fake Thread Information Block (TIB) at Xbox VA 0x0.
-     *
-     * The original Xbox code uses fs:[offset] to read per-thread data,
-     * but the recompiler drops the fs: segment prefix and generates
-     * MEM32(offset) instead. Since we mapped low memory (0x0-0xFFFF),
-     * we populate the TIB fields that game code accesses:
-     *
-     *   fs:[0x00] = SEH exception list (-1 = end of chain)
-     *   fs:[0x04] = stack base (top of stack)
-     *   fs:[0x08] = stack limit (bottom of stack)
-     *   fs:[0x18] = self pointer (TIB address)
-     *   fs:[0x20] = KPCR Prcb pointer (→ fake structure)
-     *   fs:[0x28] = TLS / RW engine context pointer
-     *
-     * We use free space in the BSS area for the fake structures.
-     */
-    {
-        #define XBOX_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
-        #define MEM32_INIT(va, val) (*(uint32_t *)XBOX_VA(va) = (uint32_t)(val))
-
-        /* Fake TIB at address 0x0 */
-        MEM32_INIT(0x00, 0xFFFFFFFF);       /* SEH: end of chain */
-        MEM32_INIT(0x08, XBOX_STACK_BASE);  /* Stack limit (low address) */
-        MEM32_INIT(0x18, 0x00000000);       /* Self pointer (TIB at VA 0) */
-
-        /*
-         * fs:[0x04] - was XBOX_STACK_TOP (a scalar), on the mistaken
-         * assumption this mirrors NT_TIB.StackBase. It doesn't: the CRT's
-         * _getptd-equivalent (sub_001B22E4 in Breakdown) walks it as
-         *   ecx = MEM32(4); edi = MEM32(ecx + tls_index*4) + 0xC;
-         * i.e. fs:[4] must be a TLS ARRAY BASE POINTER, not a stack-top
-         * address. Confirmed against real hardware via xemu+gdb
-         * (2026-09-03): fs_base+4 held 0xd003ddf0, a genuine pointer, never
-         * a stack-top-shaped value. With the old scalar, that walk landed
-         * near whichever host thread's real stack happened to be, which is
-         * exactly the `[esi+0x94]` access violations Breakdown hit shortly
-         * after CRT lock init (HeroLab task 7292f7c9).
-         *
-         * Fix: back it with a real zeroed array instead. sub_001B22E4 is
-         * only supposed to take this branch once fs:[0x28]+0x28 is
-         * non-zero (real hardware reads 0 there this early - see below);
-         * our fake TIB currently forces that flag true from process start
-         * for the RenderWare engine's sake, so this branch gets taken on
-         * the very first call regardless. Backing it with real zeroed
-         * memory means the walk lands on a zero slot, and _getptd's own
-         * logic then correctly falls into its "allocate a fresh _tiddata"
-         * path instead of dereferencing garbage - which is what should
-         * happen on the first call either way.
-         *
-         * KNOWN LIMITATION: every tls_index resolves to the same slot
-         * (guest VA 0xC), so the first thread through here claims it and
-         * every later thread reusing this same wrong branch would read
-         * back thread A's _tiddata instead of getting its own. Harmless
-         * for Breakdown's boot (this fixes the crash), but not correct for
-         * a title that depends on distinct per-thread CRT state - needs a
-         * real per-thread-indexed array before that matters (see HeroLab
-         * task 7292f7c9 follow-up notes).
-         */
-        #define FAKE_TLS_ARRAY_VA  0x00761000  /* dedicated, zeroed - see above */
-        MEM32_INIT(0x04, FAKE_TLS_ARRAY_VA);
-        #undef FAKE_TLS_ARRAY_VA
-
-        /*
-         * fs:[0x20] - On Xbox KPCR, this is the Prcb pointer.
-         * Game code reads [fs:[0x20] + 0x250] which on the real Xbox
-         * accesses a D3D cache structure. We set it to 0 so the read
-         * at offset 0x250 returns 0, causing the cache init to be skipped.
-         */
-        MEM32_INIT(0x20, 0x00000000);
-
-        /*
-         * fs:[0x28] - Thread local storage / RW engine context.
-         * The RW engine reads [fs:[0x28] + 0x28] to get a pointer
-         * to its data area. We allocate a fake structure at 0x00760000
-         * (in the BSS area) and a data buffer at 0x00700000.
-         */
-        #define FAKE_TLS_VA     0x00760000  /* Fake TLS structure (in BSS) */
-        #define FAKE_RWDATA_VA  0x00700000  /* RW engine data area (in BSS) */
-
-        MEM32_INIT(0x28, FAKE_TLS_VA);
-        /* TLS[0x28] = pointer to RW data area */
-        MEM32_INIT(FAKE_TLS_VA + 0x28, FAKE_RWDATA_VA);
-
-        fprintf(stderr, "  TIB: fake TIB at VA 0x0, TLS at 0x%08X, RW data at 0x%08X\n",
-                FAKE_TLS_VA, FAKE_RWDATA_VA);
-
-        #undef FAKE_TLS_VA
-        #undef FAKE_RWDATA_VA
-        #undef MEM32_INIT
-        #undef XBOX_VA
-    }
+    /* Populate the main thread's fake TIB. Every SPAWN-mode worker thread
+     * calls this again for itself from bridge_thread_main() -- see
+     * xbox_init_fake_tib() below for why this can no longer live at Xbox VA
+     * 0x0 the way it used to. */
+    xbox_init_fake_tib();
 
     /*
      * Contiguous / physical memory window at 0x80000000.

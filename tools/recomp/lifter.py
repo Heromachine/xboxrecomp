@@ -86,8 +86,26 @@ def _fmt_imm(val):
     return f"0x{val:X}"
 
 
-def _mem_accessor(size):
-    """Return the MEM macro name for a given operand size."""
+def _mem_accessor(size, segment=None):
+    """Return the MEM (or, for an fs:-prefixed operand, FS) macro name for a
+    given operand size.
+
+    fs:[disp] reads the Xbox TIB/KPCR, a per-thread structure that does not
+    live in the guest's linear address space on real hardware -- fs:[4] and
+    linear address 4 are two unrelated pieces of memory. Folding the segment
+    prefix into an ordinary MEM32(disp) access (as if it were just another
+    displacement) conflates them, and a title is free to use that same low
+    linear address for its own data: Breakdown does exactly this (a plain
+    `mov [4], eax` for something unrelated to threading), which silently
+    clobbered the fake TIB's fs:[4] slot mid-run and crashed a completely
+    different, later function that legitimately reads fs:[4] for TLS-array
+    lookup. FS8/16/32 route to a separate, per-thread backing store instead
+    (see recomp_types.h and xbox_init_fake_tib() in xbox_memory_layout.c) so
+    the two purposes can never collide. HeroLab: Xbox Recompiler project,
+    Breakdown sub_001AAC76 investigation, 2026-09-04.
+    """
+    if segment == "fs":
+        return {1: "FS8", 2: "FS16", 4: "FS32"}.get(size, "FS32")
     return {1: "MEM8", 2: "MEM16", 4: "MEM32"}.get(size, "MEM32")
 
 
@@ -144,14 +162,14 @@ def _fmt_mem(op):
 
 def _fmt_mem_read(op):
     """Format reading from a memory operand."""
-    accessor = _mem_accessor(op.mem_size)
+    accessor = _mem_accessor(op.mem_size, op.mem_segment)
     addr = _fmt_mem(op)
     return f"{accessor}({addr})"
 
 
 def _fmt_mem_write(op, value_expr):
     """Format writing to a memory operand."""
-    accessor = _mem_accessor(op.mem_size)
+    accessor = _mem_accessor(op.mem_size, op.mem_segment)
     addr = _fmt_mem(op)
     return f"{accessor}({addr}) = {value_expr};"
 
