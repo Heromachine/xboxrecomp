@@ -562,9 +562,45 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
         /* Fake TIB at address 0x0 */
         MEM32_INIT(0x00, 0xFFFFFFFF);       /* SEH: end of chain */
-        MEM32_INIT(0x04, XBOX_STACK_TOP);   /* Stack base (high address) */
         MEM32_INIT(0x08, XBOX_STACK_BASE);  /* Stack limit (low address) */
         MEM32_INIT(0x18, 0x00000000);       /* Self pointer (TIB at VA 0) */
+
+        /*
+         * fs:[0x04] - was XBOX_STACK_TOP (a scalar), on the mistaken
+         * assumption this mirrors NT_TIB.StackBase. It doesn't: the CRT's
+         * _getptd-equivalent (sub_001B22E4 in Breakdown) walks it as
+         *   ecx = MEM32(4); edi = MEM32(ecx + tls_index*4) + 0xC;
+         * i.e. fs:[4] must be a TLS ARRAY BASE POINTER, not a stack-top
+         * address. Confirmed against real hardware via xemu+gdb
+         * (2026-09-03): fs_base+4 held 0xd003ddf0, a genuine pointer, never
+         * a stack-top-shaped value. With the old scalar, that walk landed
+         * near whichever host thread's real stack happened to be, which is
+         * exactly the `[esi+0x94]` access violations Breakdown hit shortly
+         * after CRT lock init (HeroLab task 7292f7c9).
+         *
+         * Fix: back it with a real zeroed array instead. sub_001B22E4 is
+         * only supposed to take this branch once fs:[0x28]+0x28 is
+         * non-zero (real hardware reads 0 there this early - see below);
+         * our fake TIB currently forces that flag true from process start
+         * for the RenderWare engine's sake, so this branch gets taken on
+         * the very first call regardless. Backing it with real zeroed
+         * memory means the walk lands on a zero slot, and _getptd's own
+         * logic then correctly falls into its "allocate a fresh _tiddata"
+         * path instead of dereferencing garbage - which is what should
+         * happen on the first call either way.
+         *
+         * KNOWN LIMITATION: every tls_index resolves to the same slot
+         * (guest VA 0xC), so the first thread through here claims it and
+         * every later thread reusing this same wrong branch would read
+         * back thread A's _tiddata instead of getting its own. Harmless
+         * for Breakdown's boot (this fixes the crash), but not correct for
+         * a title that depends on distinct per-thread CRT state - needs a
+         * real per-thread-indexed array before that matters (see HeroLab
+         * task 7292f7c9 follow-up notes).
+         */
+        #define FAKE_TLS_ARRAY_VA  0x00761000  /* dedicated, zeroed - see above */
+        MEM32_INIT(0x04, FAKE_TLS_ARRAY_VA);
+        #undef FAKE_TLS_ARRAY_VA
 
         /*
          * fs:[0x20] - On Xbox KPCR, this is the Prcb pointer.
