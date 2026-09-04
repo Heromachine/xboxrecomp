@@ -2791,7 +2791,15 @@ static void kernel_thunk_dispatch(void)
 
     g_kernel_call_count++;
 
-    if (g_kernel_call_count <= 200) {
+    /* TEMP DIAGNOSTIC (2026-09-04, HeroLab task f096f240): is the steady-state
+     * RtlEnterCriticalSection traffic on thread #1 (stack ~0x007FFFxx, the
+     * boot thread) still-varying call sites (real forward progress through
+     * new code) or the same handful of return addresses forever (a genuine
+     * spin)? The <=200 cap below only samples the very start of the run, so
+     * also dump a burst of detail every 20000 calls to see the picture deep
+     * into the run without flooding the log. */
+    if (g_kernel_call_count <= 200 ||
+        (g_kernel_call_count % 20000) < 20) {
         /* The guest return address sits at the top of the guest stack: the
          * caller pushed it before dispatching here. Logging it turns "some
          * function is calling this" into "this call site is", which is the
