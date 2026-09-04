@@ -184,6 +184,28 @@ static const uint32_t MCPX_COUNTERS[] = {
     0x020010,   /* APU GP sample counter, DirectSound SetupVoiceProcessor */
 };
 
+/*
+ * APU voice/buffer control-and-acknowledge handshake. Software writes a
+ * control bit to 0xFEC0012C, then polls 0xFEC00130 for bit 0x100 to come
+ * back set, stalling ~20us between attempts (KeStallExecutionProcessor) for
+ * up to a bounded retry count before giving up. Breakdown's NuSoundStream
+ * does this at 0x001DA51D (HeroLab, Xbox Recompiler project, task tracked
+ * 2026-09-04). KeStallExecutionProcessor is unbridged (a no-op -- no real
+ * stall happens), and nothing else in this runtime ever touches 0xFEC00130,
+ * so the poll always exhausts its retries and fails instantly; the caller
+ * then retries the whole operation, a genuine busy spin that blocked
+ * NuSoundStream's worker thread from ever reaching steady state.
+ *
+ * Same honest-answer shape as NV2A_IDLE above, applied to the MCPX aperture
+ * instead: nothing is actually queued for the APU to work through in this
+ * runtime, so continuously reporting "acknowledged" is truthful, not a
+ * guess at real hardware timing -- exactly the same reasoning NV2A_IDLE's
+ * own comment gives for the GPU side.
+ */
+static const struct { uint32_t offset; uint32_t ack_mask; } MCPX_IDLE[] = {
+    { 0x400130, 0x00000100u },  /* APU voice/buffer ack, Breakdown 0x001DA51D */
+};
+
 static void *g_mcpx_regs = NULL;
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
@@ -218,6 +240,13 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 volatile uint32_t *c =
                     (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_COUNTERS[i]);
                 *c += 1;
+            }
+            for (size_t i = 0; i < sizeof(MCPX_IDLE) / sizeof(MCPX_IDLE[0]); i++) {
+                volatile uint32_t *r =
+                    (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_IDLE[i].offset);
+                if ((*r & MCPX_IDLE[i].ack_mask) != MCPX_IDLE[i].ack_mask) {
+                    *r |= MCPX_IDLE[i].ack_mask;
+                }
             }
         }
 
