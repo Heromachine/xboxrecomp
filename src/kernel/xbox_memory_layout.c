@@ -1039,7 +1039,19 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     /* Align the next pointer */
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
-    if (result + size > XBOX_HEAP_TOP) {
+    /* `result + size` is 32-bit and WRAPS, so the obvious form of this check
+     * (result + size > XBOX_HEAP_TOP) passes for a wild size and lets the
+     * memset below run off the end of the mapping. Breakdown hit exactly
+     * that: a D3D caps query whose result was never written (its indirect
+     * jump-table arm failed to resolve, so the output variable kept garbage)
+     * produced size = 0xFFFFE09F; result + size wrapped to ~0x019DE09F,
+     * sailed under the heap top, and the zero-fill walked ~4 GB past the
+     * mapping into an access violation inside memset -- a crash whose stack
+     * pointed here, nowhere near the code that computed the bad size.
+     * Subtracting instead keeps everything in range and cannot wrap, so a
+     * bogus request now fails loudly as out-of-memory with the size printed.
+     * HeroLab, Xbox Recompiler project, task 999ce5ca (2026-09-04). */
+    if (result > XBOX_HEAP_TOP || size > XBOX_HEAP_TOP - result) {
         fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
                 size, g_heap_next - XBOX_HEAP_BASE,
                 (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
