@@ -475,6 +475,40 @@ class FunctionDetector:
             )
             self.functions[start_addr] = func
 
+    # A compiled switch table is contiguous 32-bit code pointers. Stop at the
+    # first entry that is not one rather than trusting a length from anywhere:
+    # the table is usually followed immediately by more code or by another
+    # table, and reading past it would drag unrelated addresses into the
+    # function's extent. The cap is a backstop for a table that never stops
+    # looking plausible.
+    _JUMP_TABLE_MAX_ENTRIES = 256
+
+    def _read_jump_table_targets(self, table_va: int, start: int,
+                                 upper: int) -> List[int]:
+        """Read a compiled switch table, returning only entries that belong
+        inside the function being measured.
+
+        `upper` is already clamped to the next known function start, so an
+        entry within [start, upper) is an internal arm; anything else is not
+        ours to claim and is skipped. Returning [] leaves boundary detection
+        exactly as it was, so a table this cannot make sense of costs nothing.
+        """
+        targets: List[int] = []
+        if self.image.get_section_at_va(table_va) is None:
+            return targets
+
+        for i in range(self._JUMP_TABLE_MAX_ENTRIES):
+            entry = self.image.read_u32_at_va(table_va + i * 4)
+            if entry is None:
+                break
+            # An entry must at least point into a real section to be a code
+            # pointer at all; the first that does not ends the table.
+            if self.image.get_section_at_va(entry) is None:
+                break
+            if start <= entry < upper:
+                targets.append(entry)
+        return targets
+
     def _find_function_end(self, start: int, next_func: Optional[int],
                            sec_end: Optional[int]) -> int:
         """
@@ -518,6 +552,30 @@ class FunctionDetector:
                 if start <= target < upper and target > max_target:
                     # This jump goes forward within bounds, extend
                     max_target = target
+
+            # Same reasoning, for a compiled switch: `jmp [reg*4 + TABLE]` has
+            # no single jump_target, so without this the arms sitting right
+            # after it fall outside the function. That matters beyond a cosmetic
+            # boundary -- the lifter only turns an indirect jump into real gotos
+            # when EVERY table entry lands inside the function (see
+            # _analyze_switch_table); otherwise it emits RECOMP_ITAIL, which at
+            # run time finds no function registered at an arm address, logs
+            # "[ICALL] Failed to resolve VA ...", and silently returns eax = 0.
+            #
+            # Breakdown showed how quiet that failure is: sub_001C5DD0 is an 18
+            # byte D3D helper ending in exactly this dispatch, so its arms --
+            # each of which writes a float constant through a caller-supplied
+            # pointer -- never ran. The caller's output variable kept its
+            # garbage, a size computed from it came out as 0xFFFFE09F, and the
+            # first visible symptom was an access violation inside memset deep
+            # in the heap allocator, with nothing on the stack pointing back
+            # here. HeroLab: Xbox Recompiler, task 999ce5ca (2026-09-04).
+            if (insn.is_jump and not insn.is_cond_jump
+                    and insn.jump_table_base is not None):
+                for target in self._read_jump_table_targets(
+                        insn.jump_table_base, start, upper):
+                    if target > max_target:
+                        max_target = target
 
             if insn.is_ret or (insn.is_jump and not insn.is_cond_jump):
                 # Stop only once we have decoded *past* every internal branch

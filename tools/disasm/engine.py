@@ -37,6 +37,12 @@ class Instruction:
     jump_target: Optional[int] = None     # For direct jumps
     memory_ref: Optional[int] = None      # For [addr] references
     imm_ref: Optional[int] = None         # For `push offset x` / `mov reg, offset x`
+    # Table base of an INDEXED indirect jump -- `jmp [reg*4 + BASE]`, i.e. a
+    # compiled switch. memory_ref deliberately does not cover these (it only
+    # takes operands with no base and no index register), so without this the
+    # table address is discarded and the switch arms stay invisible to
+    # function-boundary detection. See _find_function_end in functions.py.
+    jump_table_base: Optional[int] = None
 
     @property
     def is_branch(self) -> bool:
@@ -126,6 +132,11 @@ class DisasmEngine:
                     insn.jump_target = op.imm & 0xFFFFFFFF
                 elif op.type == CS_OP_MEM and op.mem.base == 0 and op.mem.index == 0:
                     insn.memory_ref = op.mem.disp & 0xFFFFFFFF
+                elif op.type == CS_OP_MEM and op.mem.index != 0 and op.mem.disp:
+                    # Indexed indirect jump: a compiled switch dispatching
+                    # through a table at `disp`. Keep the table address so
+                    # boundary detection can pull the arms into the function.
+                    insn.jump_table_base = op.mem.disp & 0xFFFFFFFF
 
             # Check for memory references in non-branch instructions
             if not (insn.is_call or insn.is_branch) and insn.memory_ref is None:
