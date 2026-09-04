@@ -488,8 +488,10 @@ static void bridge_MmAllocateContiguousMemory(void)
 {
     uint32_t size = STACK_ARG(0);
 
-    /* Allocate from Xbox heap so MEM32(result) works correctly */
-    uint32_t xbox_va = xbox_HeapAlloc(size, 4096);
+    /* From the contiguous window, not the general heap: MEM32() works on both,
+     * but the heap is the title's own arena space and these buffers are large.
+     * See xbox_ContigAlloc. */
+    uint32_t xbox_va = xbox_ContigAlloc(size, 4096);
 
     if (g_kernel_call_count <= 100) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemory: size=%u → Xbox VA 0x%08X\n",
@@ -550,7 +552,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
     }
 
     if (align < 4096) align = 4096;
-    xbox_va = xbox_HeapAlloc(size, align);
+    xbox_va = xbox_ContigAlloc(size, align);
 
     if (g_kernel_call_count <= 100) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u align=%u → Xbox VA 0x%08X\n",
@@ -567,7 +569,16 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 static void bridge_MmFreeContiguousMemory(void)
 {
     uint32_t addr = STACK_ARG(0);
-    xbox_HeapFree(addr);
+
+    /* Route by address rather than assuming: the pinned-physical path above
+     * hands back window addresses it never registered with either allocator,
+     * and older builds of this bridge handed back heap addresses. Both must
+     * survive being freed. */
+    if (xbox_IsContigAddress(addr)) {
+        xbox_ContigFree(addr);
+    } else {
+        xbox_HeapFree(addr);
+    }
     g_eax = 0;
 }
 
