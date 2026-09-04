@@ -276,6 +276,27 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 void xbox_HeapFree(uint32_t xbox_va);
 
 /**
+ * Allocate from the contiguous ("physical") window at XBOX_CONTIG_BASE, which
+ * is where MmAllocateContiguousMemory(Ex) belongs. Returns an Xbox VA in the
+ * 0x8xxxxxxx range -- MEM32() works on it exactly as on a heap VA -- or 0 when
+ * the window is full. Grows DOWNWARD from the top, as the hardware does, so
+ * the bottom of the window stays free for pinned-physical requests and the
+ * fake kernel page. Alignment is rounded up to a page.
+ *
+ * Serving these from the general heap instead is what exhausted Breakdown's
+ * 48.5 MB of heap and produced the CRT out-of-memory cascade; see the long
+ * comment at the definition. Thread-safe: no.
+ */
+uint32_t xbox_ContigAlloc(uint32_t size, uint32_t alignment);
+
+/** Release a block obtained from xbox_ContigAlloc. Ignores unknown addresses. */
+void xbox_ContigFree(uint32_t xbox_va);
+
+/** True when an Xbox VA lies inside the contiguous window. Lets a free path
+ *  route a pointer to the allocator that actually handed it out. */
+int xbox_IsContigAddress(uint32_t xbox_va);
+
+/**
  * Get the file mapping handle for the Xbox memory region.
  * Used by the VEH handler to map additional mirror views on demand.
  * Returns NULL if file mapping is not available.

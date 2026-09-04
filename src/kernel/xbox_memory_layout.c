@@ -1156,6 +1156,155 @@ void xbox_HeapFree(uint32_t xbox_va)
     }
 }
 
+/* ================================================================
+ * Contiguous (physical) memory window
+ * ================================================================
+ *
+ * MmAllocateContiguousMemory hands out physically contiguous pages. On
+ * hardware those come from the same 64 MB the title's own allocator draws on,
+ * but from the TOP down, while the title's heap grows up from the bottom --
+ * which is how a retail title fits both into 64 MB at all.
+ *
+ * These used to be satisfied from xbox_HeapAlloc, on the reasoning that the
+ * result had to be somewhere MEM32() works. That is true but expensive: on
+ * Breakdown it put ~39 MB of framebuffers and audio pools into the 48.5 MB our
+ * layout leaves above XBOX_HEAP_BASE, and the title's next arena request then
+ * failed -- taking the CRT's out-of-memory path down with it (HeroLab, Xbox
+ * Recompiler, task 999ce5ca). The dedicated window at XBOX_CONTIG_BASE is
+ * backed for its full length and MEM32() works there just as well, so serve
+ * them from it and leave the heap to the title.
+ *
+ * Top-down for two reasons: it matches the hardware, and it keeps the bump
+ * pointer away from the bottom of the window, where the fake kernel PE page
+ * (0x80010000) and the pinned-physical addresses honoured by
+ * bridge_MmAllocateContiguousMemoryEx both live. The floor below is the
+ * boundary between the two; a pinned request above it would collide, but
+ * pinning is how a title asks for a LOW physical address (XPhysicalAlloc
+ * passes the address it wants), so in practice the two never meet.
+ */
+#define XBOX_CONTIG_FLOOR   (XBOX_CONTIG_BASE + 1024u * 1024u)
+#define XBOX_CONTIG_TOP     (XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+
+static uint32_t g_contig_next = XBOX_CONTIG_TOP;
+static int g_contig_alloc_count = 0;
+
+/* Same flat table as the heap's, for the same reason -- but allocations come
+ * back in DESCENDING address order here, so block i+1 is the neighbour BELOW
+ * block i and the coalescing tests are mirrored. */
+#define XBOX_CONTIG_MAX_BLOCKS 4096
+static struct { uint32_t addr; uint32_t size; uint8_t free; }
+    g_contig_blocks[XBOX_CONTIG_MAX_BLOCKS];
+static int g_contig_block_count = 0;
+
+int xbox_IsContigAddress(uint32_t xbox_va)
+{
+    return xbox_va >= XBOX_CONTIG_BASE && xbox_va < XBOX_CONTIG_TOP;
+}
+
+uint32_t xbox_ContigAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t result;
+
+    /* Contiguous memory is page memory; a caller asking for less is asking for
+     * something the hardware would not have given it either. */
+    if (alignment < 4096) alignment = 4096;
+    if (size < 16) size = 16;
+
+    /* If the window never mapped, the title still needs memory from somewhere
+     * and the heap is the only other backed region. Warned about at init. */
+    if (!g_contig_memory) {
+        return xbox_HeapAlloc(size, alignment);
+    }
+
+    for (int i = 0; i < g_contig_block_count; i++) {
+        if (!g_contig_blocks[i].free || g_contig_blocks[i].size < size) {
+            continue;
+        }
+        if (g_contig_blocks[i].addr & (alignment - 1)) {
+            continue;   /* wrong alignment for this request */
+        }
+        g_contig_blocks[i].free = 0;
+        result = g_contig_blocks[i].addr;
+        memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+        return result;
+    }
+
+    /* Growing down, so the bounds check is a subtraction and cannot wrap the
+     * way `base + size` does -- the same trap xbox_HeapAlloc documents above.
+     * Test before subtracting, then re-test after aligning down, because the
+     * alignment can push the result below the floor on its own. */
+    if (size > g_contig_next - XBOX_CONTIG_FLOOR) {
+        fprintf(stderr, "xbox_ContigAlloc: out of contiguous memory "
+                "(requested %u, %u free of %u)\n",
+                size, g_contig_next - XBOX_CONTIG_FLOOR,
+                (unsigned)(XBOX_CONTIG_TOP - XBOX_CONTIG_FLOOR));
+        return 0;
+    }
+    result = (g_contig_next - size) & ~(alignment - 1);
+    if (result < XBOX_CONTIG_FLOOR) {
+        fprintf(stderr, "xbox_ContigAlloc: out of contiguous memory "
+                "(requested %u align %u, %u free of %u)\n",
+                size, alignment, g_contig_next - XBOX_CONTIG_FLOOR,
+                (unsigned)(XBOX_CONTIG_TOP - XBOX_CONTIG_FLOOR));
+        return 0;
+    }
+    g_contig_next = result;
+
+    /* The console hands out zeroed pages here and titles rely on it. */
+    memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+
+    if (g_contig_block_count < XBOX_CONTIG_MAX_BLOCKS) {
+        g_contig_blocks[g_contig_block_count].addr = result;
+        g_contig_blocks[g_contig_block_count].size = size;
+        g_contig_blocks[g_contig_block_count].free = 0;
+        g_contig_block_count++;
+    }
+
+    g_contig_alloc_count++;
+    if (g_contig_alloc_count <= 32 || (g_contig_alloc_count % 512) == 0) {
+        fprintf(stderr, "  [CONTIG] #%d: size=%u align=%u → 0x%08X..0x%08X "
+                "(used %u/%u)\n",
+                g_contig_alloc_count, size, alignment, result, result + size,
+                XBOX_CONTIG_TOP - g_contig_next,
+                (unsigned)(XBOX_CONTIG_TOP - XBOX_CONTIG_FLOOR));
+        fflush(stderr);
+    }
+
+    return result;
+}
+
+void xbox_ContigFree(uint32_t xbox_va)
+{
+    if (!xbox_va) {
+        return;
+    }
+    for (int i = 0; i < g_contig_block_count; i++) {
+        if (g_contig_blocks[i].addr != xbox_va || g_contig_blocks[i].free) {
+            continue;
+        }
+        g_contig_blocks[i].free = 1;
+
+        /* Mirrored from xbox_HeapFree: index order is descending address
+         * order, so blocks[i+1] sits immediately BELOW blocks[i]. */
+        if (i + 1 < g_contig_block_count && g_contig_blocks[i + 1].free &&
+            g_contig_blocks[i + 1].addr + g_contig_blocks[i + 1].size ==
+                g_contig_blocks[i].addr) {
+            g_contig_blocks[i + 1].size += g_contig_blocks[i].size;
+            g_contig_blocks[i].size = 0;
+            g_contig_blocks[i].addr = 0;
+            return;
+        }
+        if (i > 0 && g_contig_blocks[i - 1].free &&
+            g_contig_blocks[i].addr + g_contig_blocks[i].size ==
+                g_contig_blocks[i - 1].addr) {
+            g_contig_blocks[i].size += g_contig_blocks[i - 1].size;
+            g_contig_blocks[i - 1].size = 0;
+            g_contig_blocks[i - 1].addr = 0;
+        }
+        return;
+    }
+}
+
 HANDLE xbox_GetMappingHandle(void)
 {
     return g_mapping_handle;
