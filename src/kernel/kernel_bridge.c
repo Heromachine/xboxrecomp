@@ -2140,10 +2140,30 @@ static void bridge_AvSendTVEncoderOption(void)
 /* ── ExFreePool (ordinal 17, 1 arg)
  * Was resolving to a DATA address before the kernel_data_va_for_ordinal fix,
  * so the title was calling into kernel data. Even after that it was an
- * unbridged no-op, which leaks every pool block the title ever frees. */
+ * unbridged no-op, which leaks every pool block the title ever frees.
+ *
+ * Do NOT route this through xbox_ExFreePool: that calls
+ * HeapFree(GetProcessHeap(), P), and guest pool memory is not on the host
+ * heap, so P is a pointer the host allocator has never seen (see the long
+ * memory-model note by the disabled-wrapper list below). The matching
+ * allocators here -- bridge_ExAllocatePool and bridge_ExAllocatePoolWithTag
+ * -- both come from xbox_HeapAlloc, i.e. the GUEST heap, so the free has to
+ * go back to the guest heap too, with the guest VA passed through unchanged
+ * rather than converted.
+ *
+ * UNEXERCISED, and honestly so: this was written while chasing Breakdown's
+ * heap exhaustion on the theory that pool blocks were leaking. They were not.
+ * Breakdown never calls ordinal 17 at all -- its heap filled up because the
+ * contiguous-memory bridges were serving ~39 MB of arenas out of the general
+ * heap, which is fixed separately (xbox_ContigAlloc). So nothing here has ever
+ * run. It is kept because the previous implementation was wrong in a way that
+ * would corrupt the host heap the first time a title did call it, and a
+ * correct-but-untested bridge beats a wrong one sitting behind a comment.
+ * Treat it as unverified until some title exercises it.
+ * HeroLab: Xbox Recompiler, task 999ce5ca (2026-09-04). */
 static void bridge_ExFreePool(void)
 {
-    xbox_ExFreePool(XBOX_TO_NATIVE(STACK_ARG(0)));
+    xbox_HeapFree(STACK_ARG(0));
     g_eax = 0;
 }
 
@@ -2707,7 +2727,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
      */
     /* case   1: bridge_AvGetSavedDataAddress */
     /* case   2: bridge_AvSendTVEncoderOption */
-    /* case  17: bridge_ExFreePool */
+    case  17: return bridge_ExFreePool;   /* guest-heap free -- see note above */
     /* case  65: bridge_IoCreateDevice */
     /* case  97: bridge_KeCancelTimer */
     /* case 100: bridge_KeDisconnectInterrupt */
