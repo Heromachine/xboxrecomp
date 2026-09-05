@@ -307,6 +307,15 @@ volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
 volatile uint64_t g_icall_count = 0;
 
+/* TEMP DIAGNOSTIC (2026-09-04, HeroLab task 1c4b9a06): per-VA ICALL watch,
+ * mirroring g_kernel_watch_va's role for kernel bridge calls. The 16-entry
+ * ring buffer above is overwritten too fast to prove a specific vtable
+ * method is (or isn't) still being dispatched minutes into a run; this is a
+ * durable counter for exactly one VA. Zero (default) costs one compare per
+ * ICALL. Set g_icall_watch_va to arm. */
+volatile uint32_t g_icall_watch_va = 0;
+volatile uint64_t g_icall_watch_count = 0;
+
 /**
  * Populate this thread's fake TIB for fs:[offset] access (FS8/16/32 in
  * recomp_types.h). g_fake_tib is RECOMP_TLS, so it starts zeroed on every

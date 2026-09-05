@@ -172,6 +172,13 @@ extern volatile uint32_t g_icall_trace_idx;
 /** Total count of indirect calls executed. */
 extern volatile uint64_t g_icall_count;
 
+/** Per-VA ICALL watch (see g_kernel_watch_va for the kernel-bridge
+ * equivalent). Zero = off. Set to a guest VA to count every RECOMP_ICALL /
+ * RECOMP_ICALL_SAFE dispatch to it, resolved or not, in g_icall_watch_count
+ * -- durable across a long run, unlike the 16-entry ring buffer above. */
+extern volatile uint32_t g_icall_watch_va;
+extern volatile uint64_t g_icall_watch_count;
+
 /**
  * Called when an indirect call target cannot be resolved.
  * Implement this in your game-specific code to log diagnostics.
@@ -665,6 +672,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
     g_icall_trace_idx++; \
     g_icall_count++; \
+    if (_va == g_icall_watch_va) g_icall_watch_count++; \
     /* Skip garbage VAs outside code section + kernel thunk range */ \
     if (_va >= 0x00400000 && _va < 0xFE000000) { \
         g_esp += 4; eax = 0; break; \
@@ -690,6 +698,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
     g_icall_trace_idx++; \
     g_icall_count++; \
+    if (_va == g_icall_watch_va) g_icall_watch_count++; \
     if (_va >= 0x00400000 && _va < 0xFE000000) { \
         g_esp = (saved_esp); eax = 0; break; \
     } \
@@ -710,6 +719,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  */
 #define RECOMP_ITAIL(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
+    if (_va == g_icall_watch_va) g_icall_watch_count++; \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
