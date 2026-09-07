@@ -3085,8 +3085,26 @@ static int g_slot_arg_bytes[XBOX_KERNEL_THUNK_TABLE_SIZE];
 /* Xbox VA to sample around each bridge call; 0 = off. See dispatch. */
 uint32_t g_kernel_watch_va = 0;
 
-/* Current dispatching slot */
-static int g_kernel_dispatch_slot = -1;
+/* Current dispatching slot.
+ *
+ * MUST be per-thread. Written by recomp_lookup_kernel() (resolve) and read a
+ * few instructions later by kernel_thunk_dispatch() (dispatch) -- previously
+ * a plain `static int`, the only piece of dispatch state in this file that
+ * was not RECOMP_TLS like the rest of the register set (g_esp, g_eax, ...).
+ * Two threads racing through resolve-then-dispatch at the same time (this
+ * runtime delivers four ISR threads at 60 Hz each, plus the boot/game
+ * thread, so this is not rare) let thread B's resolve overwrite thread A's
+ * slot before A reads it: A then runs B's bridge and, worse, cleans
+ * g_slot_arg_bytes[B] bytes off its OWN g_esp. Root-caused live via
+ * kernel_bridge.c__slot-race-check.patch and gs_siblings.py /
+ * gs_2c84_bisect.py in Breakdown-Launcher/debug-instruments -- HeroLab task
+ * e1b79c22 (Xbox Recompiler project). The critical-section pair the /GS
+ * functions call constantly (ordinals 277/294) takes 4 argument bytes; what
+ * the four ISR threads hammer at 60 Hz (KeInsertQueueDpc 119, KeSetEvent
+ * 145, KeDelayExecutionThread 99, KeInitializeDpc 107) all take 12 -- clean
+ * 12 where 4 was owed and esp is left exactly +8, which is where the /GS
+ * stack-cookie epilogue then reads the wrong slot and aborts. */
+static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
 static void kernel_thunk_dispatch(void)
 {
