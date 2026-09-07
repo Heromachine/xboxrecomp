@@ -233,6 +233,19 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
  * kernel's ISR delivery is not sufficient on its own. */
 void nv2a_raise_vblank(void);
 
+/* Point the push buffer puller at GPU-visible memory.
+ *
+ * The Xbox has unified memory: the push buffer a title builds lives in ordinary
+ * RAM, and DMA_PUT/DMA_GET carry physical addresses into it. Until this is
+ * called the puller has nothing to read and NV_USER falls back to
+ * acknowledging commands it never executed.
+ *
+ * `base` is the host address that GPU physical 0 resolves to -- see the call
+ * site in nv2a_hook_init() for why that is the contiguous window rather than
+ * the bottom of the guest's low map.
+ */
+void nv2a_set_guest_ram(void *base, uint32_t size);
+
 /* ============================================================
  * Public API
  * ============================================================ */

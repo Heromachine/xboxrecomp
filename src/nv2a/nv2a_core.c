@@ -10,6 +10,7 @@
 
 #include "nv2a_state.h"
 #include "nv2a_pgraph_d3d11.h"
+#include "../d3d/d3d8_xbox.h"   /* d3d8_PresentFrame, called at FLIP_STALL */
 
 /* ============================================================
  * Global state
@@ -561,8 +562,15 @@ static int g_pgraph_in_begin = 0;
 #define M_SET_COLOR_CLEAR_VALUE 0x01D4
 #define M_SET_BEGIN_END         0x17FC
 #define M_INLINE_ARRAY          0x1818
-#define M_FLIP_INCREMENT_WRITE  0x0114
-#define M_FLIP_STALL            0x0118
+/* The flip group, confirmed against what Breakdown actually emits: 0x0120/24/28
+ * are written 0, 1, 2 back to back during device init (SET_FLIP_READ,
+ * SET_FLIP_WRITE, SET_FLIP_MODULO for a double buffer), and 0x012C then 0x0130
+ * arrive together at the end of the first frame. These were previously 0x0114
+ * and 0x0118 -- the whole group written down 0x18 low -- so FLIP_STALL never
+ * matched, no frame ever ended, and 0x0110 (which is WAIT_FOR_IDLE) was
+ * miscounted as a flip. */
+#define M_FLIP_INCREMENT_WRITE  0x012C
+#define M_FLIP_STALL            0x0130
 #define M_SET_VIEWPORT_OFFSET   0x0A20
 #define M_SET_VIEWPORT_SCALE    0x0AF0
 
@@ -570,6 +578,35 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
                    uint32_t method, uint32_t param)
 {
     g_pgraph_method_count++;
+
+    /* Frame boundary, handled before the translator gets a say.
+     *
+     * FLIP_STALL is where the title says "that was a frame, show it" -- on
+     * hardware the pusher blocks here until the CRTC has flipped. The D3D11
+     * translator's default case swallows 0x0114/0x0118 and returns handled, so
+     * the legacy counters further down never see them; presenting has to
+     * happen here or it does not happen at all. Flush first: the translator
+     * batches draws and the last one of the frame is still pending. */
+    if (method == M_FLIP_STALL) {
+        pgraph_d3d11_flush();
+        g_pgraph_flip_count++;
+        if (g_pgraph_flip_count <= 5 || (g_pgraph_flip_count % 300) == 0) {
+            /* Counts come from the translator, not the legacy counters below.
+             * Those live past a `return` for every method the translator
+             * claims, which is now nearly all of them -- they read 0 forever
+             * and say nothing about whether anything was drawn. */
+            PgraphD3D11Stats st;
+            pgraph_d3d11_get_stats(&st);
+            fprintf(stderr, "[PGRAPH] Frame %u: %u methods (%u ignored), "
+                    "%u draws, %u verts, %u clears\n",
+                    g_pgraph_flip_count, g_pgraph_method_count,
+                    st.methods_ignored, st.draw_calls, st.vertices_submitted,
+                    st.clears);
+            fflush(stderr);
+        }
+        d3d8_PresentFrame();
+        return;
+    }
 
     /* Route through D3D11 translator first */
     if (pgraph_d3d11_method(subchannel, method, param)) {
@@ -612,15 +649,9 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
         }
         break;
 
-    case M_FLIP_INCREMENT_WRITE:
-        g_pgraph_flip_count++;
-        if (g_pgraph_flip_count <= 5 || (g_pgraph_flip_count % 300) == 0) {
-            fprintf(stderr, "[PGRAPH] Frame %u: %u methods, %u draws, %u clears, %u inline verts\n",
-                    g_pgraph_flip_count, g_pgraph_method_count,
-                    g_pgraph_draw_count, g_pgraph_clear_count,
-                    g_pgraph_inline_verts);
-        }
-        break;
+    /* M_FLIP_INCREMENT_WRITE used to count frames here. It never arrives: the
+     * D3D11 translator claims 0x0114 in its ignore list, so this switch is
+     * unreachable for it. Frames are counted at FLIP_STALL above instead. */
 
     default:
         break;
@@ -715,26 +746,152 @@ void nv2a_stub_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 }
 
 /* ============================================================
- * NV_USER - PFIFO channel push buffer pointers
+ * NV_USER - PFIFO channel push buffer pointers, and the puller
  *
  * Software submits work by writing DMA_PUT, then spins reading DMA_GET until
  * it matches: "you have consumed everything I submitted". Left as a stub this
  * read 0 forever and any title driving its own push buffer hangs here --
  * Breakdown does exactly that, spinning ~250,000 reads/second on 0x800044.
  *
- * Advancing GET to PUT reports the commands consumed WITHOUT executing them.
- * Nothing here walks the push buffer yet, so this is an acknowledgement, not
- * rendering -- the same claim the old NV2A_ACK thread in xbox_memory_layout.c
- * made, moved into the register model where it belongs instead of a
- * background thread poking RAM behind the emulation's back.
+ * The puller below walks guest RAM from GET to PUT, decodes the command
+ * stream, and dispatches methods to pgraph. GET advances as commands are
+ * actually consumed, which is both what hardware does and what makes the
+ * title's spin terminate honestly.
  *
- * When a real puller lands, GET must advance as methods are actually
- * dispatched to pgraph rather than being slammed to PUT here.
+ * Before it existed, DMA_PUT simply slammed GET to PUT: the commands were
+ * reported consumed without being executed. That kept the title running and
+ * drew nothing. If guest RAM was never handed over (nv2a_set_guest_ram), the
+ * puller cannot read the stream and that old acknowledgement is still the
+ * fallback -- boot survives, the screen stays black.
  * ============================================================ */
 
 #define NV_USER_DMA_PUT 0x40u
 #define NV_USER_DMA_GET 0x44u
 #define NV_USER_REF     0x48u
+
+/* Host address of guest physical 0, and how much RAM is behind it. */
+static uint8_t *g_guest_ram = NULL;
+static uint32_t g_guest_ram_size = 0;
+
+void nv2a_set_guest_ram(void *base, uint32_t size)
+{
+    g_guest_ram = (uint8_t *)base;
+    g_guest_ram_size = size;
+    fprintf(stderr, "[NV2A] push buffer puller armed: guest RAM %u MB at %p\n",
+            size / (1024u * 1024u), base);
+    fflush(stderr);
+}
+
+/* Read one push buffer dword.
+ *
+ * The Xbox memory controller drives a 26-bit address bus, so every physical
+ * address wraps modulo the installed RAM -- the same wrap the launcher's
+ * mirror views model on the CPU side. Masking here rather than rejecting keeps
+ * a legitimately wrapped pointer working instead of aborting the frame. */
+static inline uint32_t pb_read32(uint32_t phys)
+{
+    return *(const uint32_t *)(g_guest_ram + (phys & (g_guest_ram_size - 1)));
+}
+
+/* Walk the channel's push buffer from GET to PUT, dispatching to pgraph.
+ *
+ * Command encoding is nv04's, unchanged on NV2A:
+ *   bits 1:0 == 1        jump      (get = word & ~3)
+ *   bits 1:0 == 2        call      (get = word & ~3, return address shadowed)
+ *   word == 0x00020000   return
+ *   (word & 0xe0000003) == 0x20000000   old-style jump, 29-bit target
+ *   (word & 0xe0030003) == 0x00000000   increasing methods
+ *   (word & 0xe0030003) == 0x40000000   non-increasing methods
+ * with count in bits 28:18, subchannel in 15:13 and method in 12:2.
+ *
+ * DMA_PUT/DMA_GET are offsets within the channel's push buffer DMA object. On
+ * Xbox that object is the whole of RAM with a zero base -- D3D allocates its
+ * push buffer with MmAllocateContiguousMemory and hands the GPU the physical
+ * address directly -- so the offsets are usable as physical addresses without
+ * loading the DMA context out of RAMIN. A title that reprograms the context
+ * would need nv_dma_load() here; none is known to.
+ */
+static void pfifo_pull(NV2AState *d, uint32_t channel)
+{
+    uint32_t get = d->user.dma_get[channel];
+    uint32_t put = d->user.dma_put[channel];
+    uint32_t jmp_shadow = 0;
+    uint32_t words = 0;
+
+    /* The first submission establishes where the stream starts.
+     *
+     * Hardware loads CACHE1_DMA_GET from the channel's RAMFC context when the
+     * channel is scheduled, and the Xbox driver leaves it to that: it writes
+     * CACHE1_DMA_GET (0x1244) = 0 during setup, programs DMA_INSTANCE and
+     * enables DMA_PUSH, and then simply writes DMA_PUT. Its first PUT is the
+     * push buffer base -- nothing has been appended yet -- so taking it as the
+     * new GET costs no commands. Walking from 0 instead reads whatever is at
+     * guest physical 0 (the KPCR) and decodes noise; that is exactly what the
+     * "unrecognised command 0x00000007 at 0x00000004" abort was. */
+    if (get == 0) {
+        d->user.dma_get[channel] = put;
+        return;
+    }
+
+    while (get != put) {
+        /* A malformed or mis-decoded stream can loop forever on a jump back to
+         * itself. Bail rather than wedge the faulting thread inside the VEH. */
+        if (++words > (1u << 20)) {
+            static int warned;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "[NV2A] puller: runaway at get=0x%08X put=0x%08X, "
+                        "abandoning frame\n", get, put);
+                fflush(stderr);
+            }
+            get = put;
+            break;
+        }
+
+        uint32_t word = pb_read32(get);
+        get += 4;
+
+        if ((word & 0xe0000003) == 0x20000000) {          /* old jump */
+            jmp_shadow = get;
+            get = word & 0x1ffffffc;
+        } else if ((word & 3) == 1) {                     /* jump */
+            jmp_shadow = get;
+            get = word & 0xfffffffc;
+        } else if ((word & 3) == 2) {                     /* call */
+            jmp_shadow = get;
+            get = word & 0xfffffffc;
+        } else if (word == 0x00020000) {                  /* return */
+            get = jmp_shadow;
+        } else if ((word & 0xe0030003) == 0x00000000 ||
+                   (word & 0xe0030003) == 0x40000000) {
+            int increasing = (word & 0x40000000) == 0;
+            uint32_t count = (word >> 18) & 0x7ff;
+            uint32_t method = word & 0x1ffc;
+            uint32_t subchan = (word >> 13) & 7;
+
+            for (uint32_t i = 0; i < count; i++) {
+                uint32_t param = pb_read32(get);
+                get += 4;
+                pgraph_method(d, subchan, increasing ? method + i * 4 : method,
+                              param);
+            }
+        } else {
+            static int warned;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "[NV2A] puller: unrecognised command 0x%08X at "
+                        "0x%08X, abandoning frame\n", word, get - 4);
+                fflush(stderr);
+            }
+            get = put;
+            break;
+        }
+
+        d->user.dma_get[channel] = get;
+    }
+
+    d->user.dma_get[channel] = get;
+}
 
 uint64_t user_read(void *opaque, hwaddr addr, unsigned int size)
 {
@@ -770,7 +927,10 @@ void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     switch (reg) {
     case NV_USER_DMA_PUT:
         d->user.dma_put[channel] = (uint32_t)val;
-        d->user.dma_get[channel] = (uint32_t)val;  /* consumed; see above */
+        if (g_guest_ram)
+            pfifo_pull(d, channel);
+        else
+            d->user.dma_get[channel] = (uint32_t)val;  /* ack only; see above */
         break;
     case NV_USER_DMA_GET:
         d->user.dma_get[channel] = (uint32_t)val;

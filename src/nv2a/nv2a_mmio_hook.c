@@ -517,6 +517,27 @@ void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
 
     fprintf(stderr, "[NV2A] MMIO hook initialized: VRAM=%p RAMIN=%p\n",
             (void*)g_nv2a_vram, (void*)ramin_ptr);
+
+    /* Hand GPU-visible memory to the push buffer puller.
+     *
+     * On the console, physical page P is visible twice: at VA P and at the
+     * physical mirror 0x80000000 + P. Everything the GPU can address comes
+     * from MmAllocateContiguousMemory, which allocates out of that mirror, and
+     * the D3D driver masks the segment bit off before writing DMA_PUT -- so
+     * DMA_PUT 0x03D35000 means the buffer at VA 0x83D35000.
+     *
+     * The two views are NOT aliases here. xbox_MemoryLayoutInit gives the
+     * contiguous window (XBOX_CONTIG_BASE, 0x80000000) its own committed
+     * storage on purpose: the low 64 MB file mapping already holds the title's
+     * code and data at those offsets, so aliasing would drop pinned pools on
+     * top of the XBE. That makes the mirror the real home of GPU memory and
+     * the low map the wrong place to look -- reading the push buffer from
+     * (guest 0 + phys) returns the title's own .data, which decoded as an
+     * endless run of zero-count method headers and read as an empty frame.
+     *
+     * XBOX_CONTIG_BASE is spelled out rather than included: this module links
+     * against platform and d3d8, not the kernel. */
+    nv2a_set_guest_ram((void *)(xbox_mem_offset + 0x80000000), 64u * 1024u * 1024u);
 }
 
 bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,

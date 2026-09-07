@@ -18,6 +18,7 @@
 #include "d3d8_internal.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   /* getenv/strtol, for the frame dump below */
 
 /* ================================================================
  * Internal device state
@@ -94,6 +95,74 @@ void d3d8_PresentFrame(void)
         if (msg.message == WM_QUIT) ExitProcess(0);
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
+    }
+
+    /* Frame dump: write the back buffer to a .ppm before presenting.
+     *
+     * Set XBOXRECOMP_FRAMEDUMP to a frame number (or a comma-free list is not
+     * supported -- one number) and that frame lands in framedump_<n>.ppm in the
+     * working directory. Reading it back AFTER Present would be wrong: the swap
+     * chain is SWAP_EFFECT_DISCARD, so the back buffer is undefined once
+     * presented, and an all-black dump from there says nothing about whether
+     * anything was drawn. That mistake cost a full debug cycle -- the first
+     * readback reported black while the renderer was in fact working, and only
+     * moving it above the Present showed the clear colour sitting in the
+     * buffer. Off unless the variable is set; a dump costs a full-surface copy.
+     */
+    if (g_device_state.swap_chain) {
+        static long want = -2;   /* -2 = not yet parsed, -1 = disabled */
+        static long frame;
+        frame++;
+        if (want == -2) {
+            const char *e = getenv("XBOXRECOMP_FRAMEDUMP");
+            want = e ? strtol(e, NULL, 0) : -1;
+            if (want >= 0)
+                fprintf(stderr, "[D3D8] frame dump armed for frame %ld\n", want);
+        }
+        if (want >= 0 && frame == want) {
+            ID3D11Texture2D *bb = NULL, *stage = NULL;
+            if (SUCCEEDED(IDXGISwapChain_GetBuffer(g_device_state.swap_chain, 0,
+                                                   &IID_ID3D11Texture2D, (void **)&bb))) {
+                D3D11_TEXTURE2D_DESC d;
+                ID3D11Texture2D_GetDesc(bb, &d);
+                d.Usage = D3D11_USAGE_STAGING;
+                d.BindFlags = 0;
+                d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                d.MiscFlags = 0;
+                if (SUCCEEDED(ID3D11Device_CreateTexture2D(g_device_state.d3d11_device,
+                                                           &d, NULL, &stage))) {
+                    D3D11_MAPPED_SUBRESOURCE m;
+                    ID3D11DeviceContext_CopyResource(g_device_state.d3d11_context,
+                                                     (ID3D11Resource *)stage,
+                                                     (ID3D11Resource *)bb);
+                    if (SUCCEEDED(ID3D11DeviceContext_Map(g_device_state.d3d11_context,
+                            (ID3D11Resource *)stage, 0, D3D11_MAP_READ, 0, &m))) {
+                        char name[64];
+                        FILE *f;
+                        snprintf(name, sizeof(name), "framedump_%ld.ppm", frame);
+                        f = fopen(name, "wb");
+                        if (f) {
+                            const unsigned char *base = (const unsigned char *)m.pData;
+                            UINT y, x;
+                            fprintf(f, "P6\n%u %u\n255\n", d.Width, d.Height);
+                            for (y = 0; y < d.Height; y++) {
+                                const unsigned char *row = base + (size_t)y * m.RowPitch;
+                                for (x = 0; x < d.Width; x++)
+                                    fwrite(row + x * 4, 1, 3, f);  /* RGBA -> RGB */
+                            }
+                            fclose(f);
+                            fprintf(stderr, "[D3D8] wrote %s (%ux%u)\n",
+                                    name, d.Width, d.Height);
+                            fflush(stderr);
+                        }
+                        ID3D11DeviceContext_Unmap(g_device_state.d3d11_context,
+                                                  (ID3D11Resource *)stage, 0);
+                    }
+                    ID3D11Texture2D_Release(stage);
+                }
+                ID3D11Texture2D_Release(bb);
+            }
+        }
     }
 
     /* Present the backbuffer (VSync = 1) */
