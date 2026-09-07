@@ -15,6 +15,8 @@
  */
 
 #include "kernel.h"
+#include "xbox_memory_layout.h"
+#include <stdio.h>
 
 /* ============================================================================
  * Helper: Convert NT 100ns interval to Win32 milliseconds
@@ -29,6 +31,35 @@ static DWORD xbox_nt_timeout_to_ms(PLARGE_INTEGER Timeout)
 {
     if (!Timeout)
         return INFINITE;
+
+    /* Timeout is a NATIVE pointer, mapped from a guest VA by whichever bridge
+     * called us. A title that hands over a bad one faults on the dereference
+     * below and takes the whole process down -- repeatedly observed reading
+     * guest 0xFFFD8F00. Convert back and check before touching it.
+     *
+     * The guard belongs HERE, not in a bridge: five sync functions share this
+     * helper, and one added to KeDelayExecutionThread alone missed the fault
+     * completely when it next arrived through a different caller.
+     *
+     * A bad timeout becomes "do not wait" rather than NULL, because NULL means
+     * wait FOREVER in this API -- that would trade a crash for a parked
+     * thread. Reported once per distinct pointer so a caller in a loop cannot
+     * flood the log. */
+    {
+        uintptr_t guest_va = (uintptr_t)Timeout - (uintptr_t)xbox_GetMemoryOffset();
+
+        if (!xbox_IsXboxAddress(guest_va)) {
+            static uintptr_t last_reported;
+
+            if (guest_va != last_reported) {
+                last_reported = guest_va;
+                fprintf(stderr, "  [KERNEL] timeout pointer guest VA 0x%08X is not "
+                        "mapped -- treating as no wait\n", (uint32_t)guest_va);
+                fflush(stderr);
+            }
+            return 0;
+        }
+    }
 
     if (Timeout->QuadPart == 0)
         return 0;
