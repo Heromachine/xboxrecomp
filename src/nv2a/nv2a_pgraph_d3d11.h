@@ -50,6 +50,12 @@ typedef struct {
     uint32_t methods_handled;
     uint32_t methods_ignored;
     uint32_t clears;
+    uint32_t vsh_draws;      /* draw_calls that went through the programmable
+                              * NV2A vertex shader path (d3d8_vsh) rather
+                              * than the fixed-function 2D fallback */
+    uint32_t vsh_rebuilds;   /* d3d8_vsh_create_shader() calls -- should be
+                              * far smaller than vsh_draws; see the comment
+                              * above g_pg.vsh.program_dirty */
 } PgraphD3D11Stats;
 
 void pgraph_d3d11_get_stats(PgraphD3D11Stats *out);

@@ -23,6 +23,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <math.h>
 
 #pragma comment(lib, "d3dcompiler.lib")
@@ -1033,7 +1034,7 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
  * Default format for each input register.
  * This is the common Xbox convention; games may vary.
  */
-static DXGI_FORMAT default_input_format(int vreg)
+DXGI_FORMAT d3d8_vsh_default_input_format(int vreg)
 {
     switch (vreg) {
     case 0:  return DXGI_FORMAT_R32G32B32_FLOAT;    /* Position (xyz) */
@@ -1052,7 +1053,7 @@ static DXGI_FORMAT default_input_format(int vreg)
     }
 }
 
-static UINT input_format_size(DXGI_FORMAT fmt)
+UINT d3d8_vsh_input_format_size(DXGI_FORMAT fmt)
 {
     switch (fmt) {
     case DXGI_FORMAT_R32_FLOAT:            return 4;
@@ -1078,7 +1079,7 @@ static ID3D11InputLayout *create_vsh_input_layout(
         if (!(inputs_read & (1u << i)))
             continue;
 
-        DXGI_FORMAT fmt = default_input_format(i);
+        DXGI_FORMAT fmt = d3d8_vsh_default_input_format(i);
 
         elems[elem_count].SemanticName      = "ATTR";
         elems[elem_count].SemanticIndex      = (UINT)i;
@@ -1089,7 +1090,7 @@ static ID3D11InputLayout *create_vsh_input_layout(
         elems[elem_count].InstanceDataStepRate = 0;
         elem_count++;
 
-        offset += input_format_size(fmt);
+        offset += d3d8_vsh_input_format_size(fmt);
     }
 
     if (elem_count == 0) return NULL;
@@ -1229,6 +1230,17 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
 
     fprintf(stderr, "D3D8 VSH: Compiled shader (hash 0x%08X, %d insns, inputs 0x%04X)\n",
             hash, program.length, program.inputs_read);
+
+    /* Opt-in instrument, same pattern as XBOXRECOMP_FRAMEDUMP: dump the
+     * translated HLSL for every newly-compiled (cache-miss) shader when
+     * asked, so a wrong translation (bad transform, wrong output register,
+     * etc.) can be inspected directly instead of guessed at from pixel
+     * output alone. Off by default -- this fires once per distinct
+     * microcode, not per draw, so it is cheap to leave the check in. */
+    if (getenv("XBOXRECOMP_VSHDUMP")) {
+        fprintf(stderr, "--- D3D8 VSH HLSL (hash 0x%08X) ---\n%s\n--- End ---\n",
+                hash, hlsl_buf);
+    }
 
     return entry;
 }

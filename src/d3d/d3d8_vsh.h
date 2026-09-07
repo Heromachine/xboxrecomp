@@ -391,6 +391,18 @@ void d3d8_vsh_parse(const DWORD *microcode, int num_insns,
 int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
                             char *buf, int bufsize);
 
+/**
+ * Default D3D11 vertex-buffer format/size for a given NV2A input register
+ * (v0-v15), matching the "common Xbox convention" table create_vsh_input_
+ * layout() builds the bound input layout from. Exposed so any caller that
+ * assembles raw vertex bytes for a programmable draw (e.g. a pgraph path
+ * that bypasses the D3D8 CreateVertexShader/DrawPrimitiveUP API entirely)
+ * can match that layout exactly instead of keeping a second, driftable
+ * copy of the table.
+ */
+DXGI_FORMAT d3d8_vsh_default_input_format(int vreg);
+UINT d3d8_vsh_input_format_size(DXGI_FORMAT fmt);
+
 #ifdef __cplusplus
 }
 #endif
