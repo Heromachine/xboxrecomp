@@ -521,7 +521,6 @@ class FunctionTranslator:
 
         # Determine which registers are used
         used_regs = self._find_used_registers(instructions)
-        used_xmm = self._find_used_xmm(instructions)
         has_prologue = self._func_has_prologue(instructions)
         has_fpu = any(insn.mnemonic.startswith("f") for insn in instructions)
 
@@ -689,18 +688,16 @@ class FunctionTranslator:
         self.lifter.needs_cf = has_carry
         self.lifter.publishes_ebp = self._func_has_prologue(instructions)
 
-        # SSE/MMX register declarations
-        if used_xmm:
-            xmm_regs = sorted([r for r in used_xmm if r.startswith("xmm")])
-            mmx_regs = sorted([r for r in used_xmm if r.startswith("mm")
-                               and not r.startswith("xmm")])
-            # XMM is architectural state and is declared globally by the
-            # runtime, exactly like the GPRs and the x87 stack. Declaring it
-            # here would shadow that global with a fresh zeroed local, so a
-            # value produced in one block and read in the next - a return
-            # value in xmm0, or a spill straddling a branch - would be lost.
-            if mmx_regs:
-                lines.append(f"    uint64_t {', '.join(mmx_regs)};")
+        # SSE/MMX registers (xmm0-xmm7, mm0-mm7) are both architectural
+        # state declared globally by the runtime, exactly like the GPRs and
+        # the x87 stack (see recomp_types.h). Declaring either here would
+        # shadow that global with a fresh zeroed local, so a value produced
+        # in one block and read in the next -- a return value in xmm0, or an
+        # MMX accumulator straddling a branch -- would be lost. mm0-mm7 used
+        # to get exactly that local declaration (`uint64_t mm0, ...;`)
+        # before real MMX arithmetic existed to expose the bug; now that
+        # recomp_types.h declares g_mm0-g_mm7 and aliases mm0-mm7 to them,
+        # used_xmm needs no further handling here at all.
 
         # The x87 stack is architectural state and survives guest calls. Some
         # detector boundaries also split one original CRT helper into several
@@ -755,6 +752,34 @@ class FunctionTranslator:
             if not leaves and i + 1 < len(blocks):
                 preds[blocks[i + 1].start].add(bb.start)
 
+        # Back edges break the address-order walk below: a loop-top block's
+        # jmp-back predecessor sits *after* it in the listing, so its real
+        # out_state isn't known yet and the walk used to fall back to "flags
+        # unknown" for every such block -- which silently emits `if (_flags
+        # ...)` (see _lift_jcc) against a variable nothing ever sets, i.e. a
+        # condition that is always false. For a loop's own exit check that is
+        # not a merely-imprecise fallback, it is a guaranteed infinite loop
+        # (confirmed on Breakdown: sub_001DE35D's tail-flush loop, `dec eax` /
+        # `jmp` back to a `je` loop-exit check, spins forever every time it's
+        # reached -- one of 60 occurrences of this pattern found in that
+        # title's lift alone).
+        #
+        # A block's own flag-setting instructions overwrite whatever flag
+        # state entered it, independent of what that incoming state actually
+        # was. So a block's out_state can be computed without knowing its own
+        # incoming state, as long as it contains at least one flag-setting
+        # instruction of its own -- which the large majority do. Pre-compute
+        # that address-order-independent approximation for every block up
+        # front (discarding the throwaway statements) and fall back to it
+        # below for a predecessor whose real out_state isn't in yet. A block
+        # that turns out to be flag-transparent (no local flag setter) still
+        # yields None here, same as today -- no regression, just a missed
+        # resolution in that narrower case.
+        local_out_state = {}
+        for bb in blocks:
+            _, local_out_state[bb.start] = lift_basic_block(
+                self.lifter, bb, flag_state=None)
+
         out_state = {}
         for bb in blocks:
             # Emit label if this block is a branch target
@@ -768,20 +793,53 @@ class FunctionTranslator:
 
             # Inherit the flag state only when every predecessor agrees on it.
             # Blocks are walked in address order, so a back edge's predecessor
-            # may not be computed yet -- treat that as unknown rather than
-            # guessing, which costs a fallback condition and never a wrong one.
+            # may not have its real (incoming-dependent) out_state computed
+            # yet; fall back to that predecessor's local_out_state (see
+            # above) rather than giving up immediately -- it's exact whenever
+            # the predecessor sets flags itself, which covers the common
+            # `dec`/`jmp back to top` loop shape.
             sources = preds[bb.start]
             if bb.start == start or not sources:
                 incoming = None
-            elif all(p in out_state for p in sources):
-                states = [out_state[p] for p in sources]
-                incoming = states[0]
-                for other in states[1:]:
-                    if other != incoming:
-                        incoming = None
-                        break
             else:
-                incoming = None
+                states = []
+                resolvable = True
+                for p in sources:
+                    if p in out_state:
+                        states.append(out_state[p])
+                    elif local_out_state.get(p) is not None:
+                        states.append(local_out_state[p])
+                    else:
+                        resolvable = False
+                        break
+                if resolvable and states:
+                    incoming = states[0]
+                    for other in states[1:]:
+                        if other != incoming:
+                            incoming = None
+                            break
+                    if incoming is None:
+                        # Raw states disagree (e.g. one predecessor is a
+                        # `dec`, another a `sub` into the same register) but
+                        # may still be behaviourally identical for *this*
+                        # block -- both resolve the same jcc to the same
+                        # condition. Ask the real lifter rather than
+                        # re-deriving that equivalence here: re-lift this
+                        # block with each distinct candidate and compare the
+                        # emitted statements. Only agreement on the actual
+                        # output is trusted; anything else keeps today's
+                        # conservative None.
+                        distinct = []
+                        for s in states:
+                            if s not in distinct:
+                                distinct.append(s)
+                        if len(distinct) > 1:
+                            outputs = [lift_basic_block(self.lifter, bb, flag_state=s)[0]
+                                       for s in distinct]
+                            if all(o == outputs[0] for o in outputs[1:]):
+                                incoming = distinct[0]
+                else:
+                    incoming = None
 
             stmts, out_state[bb.start] = lift_basic_block(
                 self.lifter, bb, flag_state=incoming)

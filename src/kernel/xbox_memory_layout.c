@@ -298,6 +298,10 @@ RECOMP_TLS int g_fp_cmp = 0;
 /* SSE. 128 bits of architectural state, per-thread like the rest. */
 RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
+/* MMX. Modelled as eight independent 64-bit integers, not aliased onto
+ * g_fp_stack -- see the long comment in recomp_types.h for why. */
+RECOMP_TLS uint64_t g_mm0, g_mm1, g_mm2, g_mm3;
+RECOMP_TLS uint64_t g_mm4, g_mm5, g_mm6, g_mm7;
 /* Last frame established by `mov ebp, esp`. Read by frameless functions
  * that address their caller's frame through ebp. */
 RECOMP_TLS uint32_t g_ebp = 0;
@@ -910,6 +914,43 @@ void xbox_ProtectMirrorsForDebug(void)
     }
     fprintf(stderr, "  Mirrors: %d/%d made read-only (debug)\n",
             n, XBOX_NUM_MIRRORS);
+}
+
+BOOL xbox_Nv2aEnableTrapping(void)
+{
+    DWORD old_protect = 0;
+
+    if (!g_nv2a_memory) {
+        fprintf(stderr, "  NV2A: no aperture to trap\n");
+        return FALSE;
+    }
+
+    /* Stop the ack thread first. It writes NV2A_ACK / NV2A_IDLE registers
+     * through the aperture directly, so once the pages trap those writes
+     * become faults -- servicing them would push a background thread's guesses
+     * through the same MMIO path the register model owns. Whatever those
+     * registers need must come from the handlers now. */
+    if (g_nv2a_ack_thread) {
+        InterlockedExchange(&g_nv2a_ack_stop, 1);
+        WaitForSingleObject(g_nv2a_ack_thread, 1000);
+        CloseHandle(g_nv2a_ack_thread);
+        g_nv2a_ack_thread = NULL;
+        fprintf(stderr, "  NV2A busy-bit ack thread stopped "
+                "(register semantics now come from GPU emulation)\n");
+    }
+
+    if (!VirtualProtect(g_nv2a_memory, XBOX_NV2A_SIZE,
+                        PAGE_NOACCESS, &old_protect)) {
+        fprintf(stderr, "  NV2A: failed to trap aperture (error %lu); "
+                "falling back to plain RAM with no ack thread\n",
+                GetLastError());
+        return FALSE;
+    }
+
+    fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA 0x%08X now "
+            "TRAPPING (routed to GPU emulation)\n",
+            XBOX_NV2A_SIZE / (1024 * 1024), XBOX_NV2A_BASE);
+    return TRUE;
 }
 
 void xbox_MemoryLayoutShutdown(void)

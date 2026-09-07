@@ -53,6 +53,7 @@
 /* NV2A headers */
 #include "nv2a_state.h"         /* NV2A GPU state */
 #include "nv2a_regs.h"          /* NV2A register definitions */
+#include "nv2a_mmio_hook.h"     /* MMIO trapping / VEH integration */
 #include "qemu_shim.h"          /* QEMU type abstraction */
 
 #endif /* XBOXRECOMP_H */

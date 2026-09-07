@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include <stdio.h>
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -216,6 +217,31 @@ VOID __stdcall xbox_KeBugCheckEx(
  * this for GPU and southbridge setup. Not needed on Windows - stub it.
  * ============================================================================ */
 
+/* NV2A config space, bus 1 / device 0 / function 0.
+ *
+ * Only the GPU is modelled. A zeroed buffer (what this returned before) reads
+ * as vendor ID 0x0000, so a title probing for the GPU concludes the slot is
+ * empty: Breakdown allocates its framebuffers, probes here, finds nothing, and
+ * tears the vblank interrupt back down instead of calling AvSetDisplayMode.
+ *
+ * BAR0 is the register aperture at 0xFD000000 -- the same range
+ * xbox_memory_layout.c currently backs as plain RAM, so a title that trusts
+ * this and starts driving registers will read zeros rather than GPU state.
+ * That is the next gap, not something this function can close. */
+static uint32_t nv2a_pci_config_dword(ULONG reg)
+{
+    switch (reg & 0xFCu) {
+    case 0x00: return 0x02A010DEu;  /* device 0x02A0 (NV2A), vendor 0x10DE */
+    case 0x04: return 0x02B00007u;  /* status; command: io+mem+bus master */
+    case 0x08: return 0x030000A1u;  /* class 03:00:00 VGA, revision A1 */
+    case 0x10: return 0xFD000000u;  /* BAR0: MMIO registers */
+    case 0x14: return 0xF0000000u;  /* BAR1: framebuffer aperture */
+    case 0x2C: return 0x02A010DEu;  /* subsystem id/vendor */
+    case 0x3C: return 0x00000103u;  /* interrupt pin A, line 3 */
+    default:   return 0x00000000u;
+    }
+}
+
 VOID __stdcall xbox_HalReadWritePCISpace(
     ULONG BusNumber,
     ULONG SlotNumber,
@@ -224,20 +250,138 @@ VOID __stdcall xbox_HalReadWritePCISpace(
     ULONG Length,
     BOOLEAN WritePCISpace)
 {
-    (void)BusNumber;
-    (void)SlotNumber;
-    (void)RegisterNumber;
-    (void)Length;
-    (void)WritePCISpace;
+    /* NT packs the slot as device in bits 0-4, function in bits 5-7. */
+    ULONG device   = SlotNumber & 0x1Fu;
+    ULONG function = (SlotNumber >> 5) & 0x07u;
+    int   is_nv2a  = (BusNumber == 1 && device == 0 && function == 0);
+    uint32_t dword;
+    uint8_t bytes[4];
+    ULONG i;
 
-    /* Return zeroed buffer for reads */
-    if (!WritePCISpace && Buffer)
-        memset(Buffer, 0, Length);
+    xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
+        "HalReadWritePCISpace: bus=%u dev=%u fn=%u reg=0x%X len=%u %s%s",
+        BusNumber, device, function, RegisterNumber, Length,
+        WritePCISpace ? "WRITE" : "READ", is_nv2a ? " [NV2A]" : "");
 
-    xbox_log(XBOX_LOG_TRACE, XBOX_LOG_HAL,
-        "HalReadWritePCISpace: bus=%u slot=%u reg=0x%X len=%u %s (stubbed)",
-        BusNumber, SlotNumber, RegisterNumber, Length,
-        WritePCISpace ? "WRITE" : "READ");
+    if (WritePCISpace || !Buffer || Length == 0)
+        return;
+
+    /* All-ones is what real PCI returns for an unpopulated slot. */
+    dword = is_nv2a ? nv2a_pci_config_dword(RegisterNumber) : 0xFFFFFFFFu;
+
+    bytes[0] = (uint8_t)(dword);
+    bytes[1] = (uint8_t)(dword >> 8);
+    bytes[2] = (uint8_t)(dword >> 16);
+    bytes[3] = (uint8_t)(dword >> 24);
+
+    for (i = 0; i < Length; i++)
+        ((uint8_t *)Buffer)[i] = bytes[(RegisterNumber + i) & 3u];
+}
+
+/* ============================================================================
+ * Port I/O
+ *
+ * Backs the IN/OUT instructions the lifter now emits calls for. Before that
+ * they hit the lifter's generic unhandled-instruction path, which emits a
+ * comment and nothing else -- so `in al, dx` left AL holding whatever the
+ * previous instruction had put in eax, and the title acted on a garbage port
+ * value that shifted with unrelated code changes.
+ *
+ * Ground truth for the model is xemu (hw/xbox/acpi_xbox.c), the project's
+ * reference emulator: the Xbox PM/ACPI I/O block sits at 0x8000 and its GPIO
+ * sub-block at offset 0xC0, so GPIO register 0 is port 0x80C0.
+ * ============================================================================ */
+
+#define XBOX_PM_IO_BASE   0x8000u
+#define XBOX_PM_GPIO0     (XBOX_PM_IO_BASE + 0xC0u)  /* 0x80C0 */
+
+/* Bit 5 of GPIO 0 is the TV encoder's field pin -- which field of an
+ * interlaced frame is being scanned out. xemu alternates it on every read
+ * rather than tying it to a clock, and that is what the reference emulator
+ * runs titles against, so match it: a caller polling for a field change makes
+ * progress instead of spinning. Breakdown's D3D layer reads it, inverts bit 5
+ * and stores the boolean (sub_001C68F4 / sub_001C6AF1).
+ *
+ * Unsynchronised on purpose: concurrent reads can only disagree about which
+ * field is current, which is exactly what racing the real pin would do. */
+static unsigned g_tv_field_pin;
+
+uint32_t recomp_port_in(uint16_t port, unsigned width)
+{
+    uint32_t value = 0;
+
+    if (port == XBOX_PM_GPIO0) {
+        g_tv_field_pin = (g_tv_field_pin + 1u) & 1u;
+        value = g_tv_field_pin << 5;
+    } else {
+        static int unmodelled_warnings;
+        if (unmodelled_warnings < 8) {
+            unmodelled_warnings++;
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
+                "recomp_port_in: unmodelled port 0x%04X (width %u) -> 0",
+                port, width);
+        }
+    }
+
+    if (width == 1) return value & 0xFFu;
+    if (width == 2) return value & 0xFFFFu;
+    return value;
+}
+
+void recomp_port_out(uint16_t port, uint32_t value, unsigned width)
+{
+    /* Writing GPIO 0 latches output pins nothing here models; xemu ignores it
+     * too, acting only on the aspect-ratio register at GPIO 0x16 (port
+     * 0x80D6), which is worth revisiting once there is a display to size. */
+    if (port == XBOX_PM_GPIO0)
+        return;
+
+    {
+        static int unmodelled_warnings;
+        if (unmodelled_warnings < 8) {
+            unmodelled_warnings++;
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
+                "recomp_port_out: unmodelled port 0x%04X = 0x%X (width %u)",
+                port, value, width);
+        }
+    }
+}
+
+/* ============================================================================
+ * Guest INT 3
+ *
+ * Backs the __debugbreak() the lifter emits for a guest 0xCC. See the comment
+ * on that macro in templates/runtime/recomp_types.h for why this reports and
+ * returns rather than trapping.
+ *
+ * Deduplicated per call site so a break inside a hot loop cannot flood the
+ * log. File pointers compare by identity, which is exact here: every site in
+ * one translation unit shares the same __FILE__ literal.
+ * ============================================================================ */
+
+void recomp_debug_break(const char *file, int line)
+{
+    enum { MAX_SITES = 64 };
+    static const char *seen_file[MAX_SITES];
+    static int seen_line[MAX_SITES];
+    static int seen_count;
+    int i;
+
+    for (i = 0; i < seen_count; i++) {
+        if (seen_line[i] == line && seen_file[i] == file)
+            return;
+    }
+
+    if (seen_count < MAX_SITES) {
+        seen_file[seen_count] = file;
+        seen_line[seen_count] = line;
+        seen_count++;
+    }
+
+    fprintf(stderr, "  [GUEST] int3 debug break at %s:%d -- continuing "
+            "(hardware ignores it with no debugger attached)\n",
+            file ? file : "?", line);
+    fflush(stderr);
 }
 
 /* ============================================================================

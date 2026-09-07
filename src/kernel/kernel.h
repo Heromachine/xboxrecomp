@@ -760,6 +760,17 @@ BOOLEAN  __stdcall xbox_KeSynchronizeExecution(PXBOX_KINTERRUPT Interrupt, PVOID
 
 VOID    __stdcall xbox_HalReadWritePCISpace(ULONG BusNumber, ULONG SlotNumber, ULONG RegisterNumber, PVOID Buffer, ULONG Length, BOOLEAN WritePCISpace);
 VOID    __stdcall xbox_HalReturnToFirmware(ULONG Routine);
+
+/* x86 port I/O for translated code. Declared identically in
+ * templates/runtime/recomp_types.h, which is what the generated chunks see;
+ * kept here too so the definitions in kernel_hal.c are prototype-checked. */
+/* Guest INT 3, emitted by the lifter as __debugbreak(). Reports the site and
+ * returns -- see recomp_types.h for why it must not trap. */
+void     recomp_debug_break(const char *file, int line);
+
+uint32_t recomp_port_in(uint16_t port, unsigned width);
+void     recomp_port_out(uint16_t port, uint32_t value, unsigned width);
+
 ULONG   __stdcall xbox_HalReadSMCTrayState(PULONG TrayState, PULONG TrayStateChangeCount);
 VOID    __stdcall xbox_HalClearSoftwareInterrupt(KIRQL RequestIrql);
 VOID    __stdcall xbox_HalRequestSoftwareInterrupt(KIRQL RequestIrql);

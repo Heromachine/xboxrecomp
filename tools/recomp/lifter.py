@@ -106,7 +106,11 @@ def _mem_accessor(size, segment=None):
     """
     if segment == "fs":
         return {1: "FS8", 2: "FS16", 4: "FS32"}.get(size, "FS32")
-    return {1: "MEM8", 2: "MEM16", 4: "MEM32"}.get(size, "MEM32")
+    # size 8: a qword memory operand -- movq mm, [addr] and MMX ops with a
+    # qword-ptr source (e.g. "pand mm0, qword ptr [addr]"). Before this
+    # mapping existed, an 8-byte operand fell through to the size-4
+    # default below and silently read only the low half.
+    return {1: "MEM8", 2: "MEM16", 4: "MEM32", 8: "MEM64"}.get(size, "MEM32")
 
 
 def _smem_accessor(size):
@@ -281,6 +285,7 @@ _EFLAGS_PRESERVE = frozenset({
     "cld", "std", "cli", "sti",
     "pushfd", "popfd", "pushal",
     "sgdt", "ljmp", "sfence",
+    "in", "out",  # Port I/O moves data only, like mov
     # SSE scalar float
     "movss", "movsd",
     "addss", "subss", "mulss", "divss",
@@ -320,6 +325,7 @@ _EFLAGS_PRESERVE = frozenset({
     "punpckhbw", "punpckhwd", "punpckhdq", "punpckhqdq",
     "packsswb", "packssdw", "packuswb",
     "pmovmskb",
+    "pavgb", "cvtps2pi", "cvtpi2ps",
     # String operations (without rep prefix)
     "stosb", "stosw", "stosd",
     "movsb", "movsw", "movsd",
@@ -911,6 +917,16 @@ class Lifter:
             return self._lift_imul(insn, ops)
         if m in ("mul", "div", "idiv"):
             return self._lift_muldiv(insn, ops, m)
+        if m == "rdtsc":
+            # Real host cycle counter -> edx:eax, matching x86 rdtsc's
+            # output convention. See RECOMP_RDTSC64 in recomp_types.h for
+            # why an unscaled host read is the right fix, not a stub.
+            return [
+                "{ uint64_t _tsc = RECOMP_RDTSC64();",
+                "  eax = (uint32_t)_tsc; edx = (uint32_t)(_tsc >> 32); } /* rdtsc */"
+            ]
+        if m in ("in", "out"):
+            return self._lift_portio(insn, ops, m)
         if m == "sbb":
             return self._lift_sbb(insn, ops)
         if m == "adc":
@@ -1042,6 +1058,24 @@ class Lifter:
                  "pand", "pandn", "por", "pxor", "pcmpgtd"):
             return self._lift_sse(insn, m, ops)
 
+        # ── MMX (packed integer, mm0-mm7) ──
+        # movd/movq/pand/pandn/por/pxor/pcmpgtd stay above: those mnemonics
+        # are shared with SSE/SSE2 and _lift_sse already tells an mm operand
+        # from an xmm one. Everything below has no XMM form in this CPU
+        # generation (Xbox is SSE1, not SSE2) and is MMX-only.
+        if m in ("paddb", "paddw", "paddd", "psubb", "psubw", "psubd",
+                 "pmullw", "pmaddwd", "pavgb",
+                 "pcmpeqb", "pcmpeqw", "pcmpgtb", "pcmpgtw",
+                 "packsswb", "packssdw", "packuswb",
+                 "punpcklbw", "punpckhbw", "punpcklwd", "punpckhwd",
+                 "punpckldq", "punpckhdq",
+                 "psllw", "pslld", "psllq",
+                 "psrlw", "psrld", "psrlq",
+                 "psraw", "psrad",
+                 "pshufw", "movntq",
+                 "cvtps2pi", "cvtpi2ps"):
+            return self._lift_mmx(insn, m, ops)
+
         # ── FPU ──
         if m.startswith("f"):
             return self._lift_fpu(insn, m, ops)
@@ -1060,6 +1094,39 @@ class Lifter:
 
         # ── Unhandled ──
         return [f"/* TODO: {m} {insn.op_str} */"]
+
+    # ── Port I/O ──
+
+    def _lift_portio(self, insn, ops, m):
+        """x86 IN/OUT against the runtime's modelled port space.
+
+        Unhandled these fell through to the generic TODO fallback, which emits
+        a comment and nothing else -- the same shape as the old rdtsc stub, and
+        the same class of bug. `in al, dx` left AL holding whatever the previous
+        instruction happened to leave in eax, so the title read a garbage port
+        value that varied with unrelated surrounding code; `out` vanished.
+
+        Breakdown hits port 0x80C0 three times from its D3D layer (the Xbox PM
+        GPIO block's register 0, whose bit 5 is the TV encoder's field pin).
+        recomp_port_in/out in kernel_hal.c hold the model.
+
+        The port operand is dx for the register forms and an imm8 for the short
+        forms; width comes from the data operand, which is the one that carries
+        a register width (an immediate port has none of its own).
+        """
+        if len(ops) < 2:
+            return [f"/* {m} {insn.op_str}: unexpected operand form */"]
+
+        if m == "in":
+            dst, port = ops[0], ops[1]
+            read = (f"recomp_port_in((uint16_t)({_fmt_operand_read(port)}), "
+                    f"{_operand_width(dst) or 4})")
+            return [f"{_fmt_operand_write(dst, read)} /* in {insn.op_str} */"]
+
+        port, src = ops[0], ops[1]
+        return [f"recomp_port_out((uint16_t)({_fmt_operand_read(port)}), "
+                f"(uint32_t)({_fmt_operand_read(src)}), "
+                f"{_operand_width(src) or 4}); /* out {insn.op_str} */"]
 
     # ── MOV family ──
 
@@ -1877,6 +1944,44 @@ class Lifter:
                 return [f"{_fmt_operand_write(ops[0], src)} /* movd */"]
             return [f"/* movd {insn.op_str} */"]
 
+        # movq moves 64 bits. mm0-mm7 are plain uint64_t globals (see
+        # recomp_types.h), so the MMX forms (reg<-reg, reg<-mem, mem<-reg)
+        # are a bare scalar copy through the same generic read/write helpers
+        # movd already uses above -- no operand here needs a lane view.
+        # Before this case existed, movq fell all the way through _lift_sse
+        # to the final "unhandled SSE" comment below and emitted nothing, so
+        # every MMX register load/store/spill in the XMV movie codec (its
+        # only user in this title) was silently dropped.
+        #
+        # The xmm forms (SSE2's "MOVQ xmm, xmm/m64" / "MOVQ xmm/m64, xmm")
+        # are not exercised by any title seen so far -- Xbox's CPU is SSE1,
+        # not SSE2 -- but are handled for completeness, since this file is
+        # shared across titles. Real hardware always zeroes the destination
+        # xmm's upper 64 bits for the load form; the store-to-xmm form does
+        # the same.
+        if m == "movq":
+            if nops >= 2:
+                if _is_xmm(ops[0]):
+                    if _is_xmm(ops[1]):
+                        src_q = f"{ops[1].reg}.q[0]"
+                    elif _is_mmx(ops[1]):
+                        src_q = ops[1].reg
+                    elif ops[1].type == "mem":
+                        src_q = _fmt_mem_read(ops[1])
+                    else:
+                        src_q = None
+                    if src_q is not None:
+                        return [f"{ops[0].reg} = XMM_ZERO();",
+                                f"{ops[0].reg}.q[0] = {src_q}; /* movq */"]
+                elif ops[0].type == "mem" and _is_xmm(ops[1]):
+                    return [_fmt_mem_write(ops[0], f"{ops[1].reg}.q[0]")
+                            + " /* movq */"]
+                else:
+                    # MMX / generic 64-bit forms.
+                    src = _fmt_operand_read(ops[1])
+                    return [f"{_fmt_operand_write(ops[0], src)} /* movq */"]
+            return [f"/* movq {insn.op_str} */"]
+
         # ── Arithmetic ──
         if m in ("addss", "addsd"):
             if nops >= 2:
@@ -2017,9 +2122,37 @@ class Lifter:
             return [f"/* {m} {insn.op_str} */"]
 
         # ── MMX / integer SIMD ──
+        # Shared mnemonics between MMX (mm0-mm7, this title's only user --
+        # Xbox is SSE1, not SSE2) and SSE2's 128-bit integer form (xmm,
+        # unused by any title seen so far but handled for parity with the
+        # rest of this file). These used to unconditionally emit a bare
+        # comment regardless of operand kind, so a zeroing idiom
+        # (`pxor mm0, mm0`) or a merge (`por mm4, mm1`) in the XMV movie
+        # codec's IDCT/motion-compensation inner loops did nothing at all.
         if m in ("pand", "pandn", "por", "pxor", "pcmpgtd"):
             if nops >= 2:
-                return [f"/* {m} {insn.op_str} (MMX/SIMD integer) */"]
+                if _is_mmx(ops[0]):
+                    dst = ops[0].reg
+                    src = _fmt_operand_read(ops[1])
+                    if m == "pxor" and _is_mmx(ops[1]) and ops[1].reg == dst:
+                        return [f"{dst} = 0; /* {m} self = zero */"]
+                    op_expr = {"pand": f"{dst} & ({src})",
+                               "por": f"{dst} | ({src})",
+                               "pxor": f"{dst} ^ ({src})",
+                               "pandn": f"(~{dst}) & ({src})",
+                               "pcmpgtd": f"MMX_PCMPGTD({dst}, {src})"}[m]
+                    return [f"{dst} = {op_expr}; /* {m} */"]
+                if _is_xmm(ops[0]):
+                    if (m == "pxor" and _is_xmm(ops[1])
+                            and ops[1].reg == ops[0].reg):
+                        return [f"{ops[0].reg} = XMM_ZERO(); /* {m} self = zero */"]
+                    helper = {"pand": "XMM_AND", "por": "XMM_OR",
+                              "pxor": "XMM_XOR", "pandn": "XMM_ANDN",
+                              "pcmpgtd": "XMM_CMP_GT_D"}[m]
+                    lifted = _packed_binary(helper)
+                    if lifted is not None:
+                        return lifted
+                return [f"/* {m} {insn.op_str} */"]
 
         # ── Shuffle/unpack ──
         # shufps is the broadcast in every matrix concatenation.
@@ -2043,6 +2176,132 @@ class Lifter:
             return [f"/* {m} {insn.op_str} */"]
 
         return [f"/* SSE: {m} {insn.op_str} */"]
+
+    def _lift_mmx(self, insn, m, ops):
+        """Translate MMX-only packed-integer instructions (mm0-mm7).
+
+        These mnemonics have no XMM/SSE2 form on this CPU generation --
+        Xbox's CPU is SSE1, not SSE2 -- unlike movd/movq/pand/pandn/por/
+        pxor/pcmpgtd, which _lift_sse already handles for both an mm and
+        an xmm operand. Before this method existed, every one of these
+        fell through to the generic "unhandled instruction" fallback,
+        which emits nothing: the XMV movie codec's IDCT, motion
+        compensation and YUV->RGB inner loops (this title's only MMX
+        user) were entirely no-ops, 20 functions' worth.
+
+        mm0-mm7 are plain uint64_t globals (see recomp_types.h for why:
+        movd/movq already round-trip them as a bare scalar, so a lane
+        view here would need to go through a helper anyway). Every
+        runtime helper below therefore takes/returns a uint64_t and does
+        its own lane reinterpretation internally.
+        """
+        nops = len(ops)
+        if nops < 1:
+            return [f"/* {m}: no operands */"]
+
+        def _is_mmx(op):
+            return (op.type == "reg" and op.reg and op.reg.startswith("mm")
+                    and not op.reg.startswith("xmm"))
+
+        def _is_xmm(op):
+            return op.type == "reg" and op.reg and op.reg.startswith("xmm")
+
+        # dst, src -> dst = HELPER(dst, src). `src` may be another mm
+        # register or a qword memory operand; _fmt_operand_read handles
+        # both (a qword operand routes to MEM64 via _mem_accessor's size-8
+        # entry, added alongside this).
+        def _binary(helper):
+            if nops < 2 or not _is_mmx(ops[0]):
+                return None
+            dst = ops[0].reg
+            src = _fmt_operand_read(ops[1])
+            return [f"{dst} = {helper}({dst}, {src}); /* {m} */"]
+
+        ARITH_HELPERS = {
+            "paddb": "MMX_PADDB", "paddw": "MMX_PADDW", "paddd": "MMX_PADDD",
+            "psubb": "MMX_PSUBB", "psubw": "MMX_PSUBW", "psubd": "MMX_PSUBD",
+            "pmullw": "MMX_PMULLW", "pmaddwd": "MMX_PMADDWD",
+            "pavgb": "MMX_PAVGB",
+            "pcmpeqb": "MMX_PCMPEQB", "pcmpeqw": "MMX_PCMPEQW",
+            "pcmpgtb": "MMX_PCMPGTB", "pcmpgtw": "MMX_PCMPGTW",
+            "packsswb": "MMX_PACKSSWB", "packssdw": "MMX_PACKSSDW",
+            "packuswb": "MMX_PACKUSWB",
+            "punpcklbw": "MMX_PUNPCKLBW", "punpckhbw": "MMX_PUNPCKHBW",
+            "punpcklwd": "MMX_PUNPCKLWD", "punpckhwd": "MMX_PUNPCKHWD",
+            "punpckldq": "MMX_PUNPCKLDQ", "punpckhdq": "MMX_PUNPCKHDQ",
+        }
+        if m in ARITH_HELPERS:
+            lifted = _binary(ARITH_HELPERS[m])
+            if lifted is not None:
+                return lifted
+            return [f"/* {m} {insn.op_str} */"]
+
+        # Shifts: the count is an 8-bit immediate, an mm register (full 64
+        # bits significant), or a 64-bit memory operand. All three read
+        # generically and pass straight through as the helper's uint64_t
+        # count -- the "count too large" clamp lives in the helper, not here.
+        SHIFT_HELPERS = {
+            "psllw": "MMX_PSLLW", "pslld": "MMX_PSLLD", "psllq": "MMX_PSLLQ",
+            "psrlw": "MMX_PSRLW", "psrld": "MMX_PSRLD", "psrlq": "MMX_PSRLQ",
+            "psraw": "MMX_PSRAW", "psrad": "MMX_PSRAD",
+        }
+        if m in SHIFT_HELPERS:
+            if nops >= 2 and _is_mmx(ops[0]):
+                dst = ops[0].reg
+                count = _fmt_operand_read(ops[1])
+                return [f"{dst} = {SHIFT_HELPERS[m]}({dst}, (uint64_t)({count})); "
+                        f"/* {m} */"]
+            return [f"/* {m} {insn.op_str} */"]
+
+        # pshufw dst, src, imm8 -- the only 3-operand MMX mnemonic here.
+        if m == "pshufw":
+            if nops >= 3 and _is_mmx(ops[0]) and ops[2].type == "imm":
+                src = _fmt_operand_read(ops[1])
+                return [f"{ops[0].reg} = MMX_PSHUFW({src}, {_fmt_imm(ops[2].imm)}); "
+                        f"/* {m} */"]
+            return [f"/* {m} {insn.op_str} */"]
+
+        # movntq [addr], mm -- a plain qword store; the "non-temporal"
+        # cache hint has no meaning for this runtime.
+        if m == "movntq":
+            if nops >= 2 and ops[0].type == "mem" and _is_mmx(ops[1]):
+                return [_fmt_mem_write(ops[0], ops[1].reg) + f" /* {m} */"]
+            return [f"/* {m} {insn.op_str} */"]
+
+        # cvtps2pi mm, xmm/m64 -- the source's low two floats -> the
+        # destination's two signed 32-bit ints. Every occurrence actually
+        # seen in this title is register-to-register; the memory form
+        # reuses XMM_MEM (a full 128-bit guest load) for the two floats it
+        # needs rather than adding a narrower accessor solely for this.
+        if m == "cvtps2pi":
+            if nops >= 2 and _is_mmx(ops[0]):
+                if _is_xmm(ops[1]):
+                    src = ops[1].reg
+                elif ops[1].type == "mem":
+                    src = f"XMM_MEM({_fmt_mem(ops[1])})"
+                else:
+                    src = None
+                if src is not None:
+                    return [f"{ops[0].reg} = MMX_CVTPS2PI({src}); /* {m} */"]
+            return [f"/* {m} {insn.op_str} */"]
+
+        # cvtpi2ps xmm, mm/m64 -- the source's two ints -> the low two
+        # lanes of xmm; its upper two lanes pass through untouched, so the
+        # helper takes and returns the whole xmm value.
+        if m == "cvtpi2ps":
+            if nops >= 2 and _is_xmm(ops[0]):
+                if _is_mmx(ops[1]):
+                    src = ops[1].reg
+                elif ops[1].type == "mem":
+                    src = _fmt_mem_read(ops[1])
+                else:
+                    src = None
+                if src is not None:
+                    return [f"{ops[0].reg} = MMX_CVTPI2PS({ops[0].reg}, {src}); "
+                            f"/* {m} */"]
+            return [f"/* {m} {insn.op_str} */"]
+
+        return [f"/* MMX: {m} {insn.op_str} */"]
 
     # ── FPU (x87) ──
 

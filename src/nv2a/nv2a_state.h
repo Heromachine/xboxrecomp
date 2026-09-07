@@ -35,6 +35,11 @@
 /* NV2A_DEVICE: cast to NV2AState* */
 #define NV2A_DEVICE(obj) ((NV2AState*)(obj))
 
+/* PFIFO exposes 32 DMA channels, each with a 64 KB slice of the NV_USER
+ * aperture. Titles use channel 0 for the graphics push buffer. */
+#define NV2A_USER_NUM_CHANNELS   32u
+#define NV2A_USER_CHANNEL_SIZE   0x10000u
+
 /* ============================================================
  * FIFO Engine types
  * ============================================================ */
@@ -107,6 +112,14 @@ typedef struct NV2AState {
         bool fifo_kick;
         bool halt;
     } pfifo;
+
+    /* NV_USER: per-channel push buffer pointers. Software writes DMA_PUT and
+     * spins reading DMA_GET until it catches up. */
+    struct {
+        uint32_t dma_put[NV2A_USER_NUM_CHANNELS];
+        uint32_t dma_get[NV2A_USER_NUM_CHANNELS];
+        uint32_t ref[NV2A_USER_NUM_CHANNELS];
+    } user;
 
     struct {
         uint32_t regs[0x1000];
@@ -214,6 +227,11 @@ void *nv_dma_map(NV2AState *d, hwaddr dma_obj_address, hwaddr *len);
 /* PGRAPH method dispatch (from push buffer commands) */
 void pgraph_method(NV2AState *d, uint32_t subchannel,
                    uint32_t method, uint32_t param);
+
+/* Raise a vertical-blank interrupt in the register model. The caller is
+ * simulating the CRTC and owns the rate; see the definition for why the
+ * kernel's ISR delivery is not sufficient on its own. */
+void nv2a_raise_vblank(void);
 
 /* ============================================================
  * Public API

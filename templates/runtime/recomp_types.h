@@ -47,6 +47,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <time.h>
 /* math.h is load-bearing, and its absence was invisible.
  *
  * The lifter emits sqrt() and fabs() for fsqrt/fabs -- 146 of them in one of
@@ -66,11 +67,42 @@
 #define __forceinline inline __attribute__((always_inline))
 #endif
 
-/* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent.
- * The auto-generated code emits __debugbreak for x86 INT 3 instructions. */
-#if !defined(_MSC_VER) && !defined(__debugbreak)
-#define __debugbreak() __builtin_trap()
+/* Guest INT 3.
+ *
+ * A guest int3 is a DEBUG BREAK, not a fatal fault, and modelling it as one
+ * was wrong on every host. Retail Xbox code uses int3 as "stop here if a
+ * debugger is attached, otherwise carry on", and titles rely on that. The
+ * NV2A FIFO error handler in Breakdown is the clear case (guest 0x001C7150):
+ *
+ *     push 0x1cd110 ; call 0x1ca140   ; print Type/Source/Class/Method/Data
+ *     add  esp, 0x20                  ; clean up its arguments
+ *     int3                            ; break IF a debugger is attached
+ *     mov  [esi+0x2100], 0x1000       ; ...then ACKNOWLEDGE and continue
+ *
+ * Execution deliberately continues in the same function. On hardware with no
+ * debugger attached this is an ordinary assert-and-continue.
+ *
+ * __builtin_trap() emits ud2 and kills the process; MSVC's intrinsic raises a
+ * breakpoint that terminates just the same with nothing attached. Either way
+ * an ordinary guest assertion became a hard crash -- and under Wine it became
+ * a SILENT HANG, because an unhandled fault parks the process at a debugger
+ * prompt with every counter frozen. That cost this project a whole
+ * investigation (HeroLab task b7d706a3).
+ *
+ * So: report the site once and return. This name is deliberately hijacked
+ * even on MSVC -- recomp_types.h is included only by translated guest code,
+ * so the override is scoped to exactly the construct it is about.
+ *
+ * int3 ALSO appears as ordinary inter-function padding, where reaching it IS
+ * a genuine bug. Logging keeps that case visible rather than silent: the run
+ * continues into whatever follows the padding, and the harness's [FATAL]
+ * handler names the resulting crash instead of hanging.
+ */
+#ifdef __debugbreak
+#undef __debugbreak
 #endif
+void recomp_debug_break(const char *file, int line);
+#define __debugbreak() recomp_debug_break(__FILE__, __LINE__)
 
 /* ================================================================
  * Memory offset
@@ -232,6 +264,11 @@ void recomp_trace_esp(const char *name, const char *tag);
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
 #define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
+/* 64-bit: MMX movq/qword-operand instructions (movq mm, [addr]; pand mm,
+ * qword ptr [addr]; ...). _mem_accessor() in the lifter maps mem_size 8
+ * here -- before that mapping existed it silently fell back to MEM32,
+ * which would have read only half of a qword operand. */
+#define MEM64(addr)  (*(volatile uint64_t *)XBOX_PTR(addr))
 
 /** Signed memory reads. */
 #define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
@@ -436,6 +473,325 @@ static inline RecompXmm XMM_UNPACK_HIGH(RecompXmm a, RecompXmm b) {
     return r;
 }
 
+/** pcmpgtd on XMM operands (integer dword compare -- distinct from the
+ * float compares above). Not exercised by any title yet, added for
+ * parity with the MMX form below, which real code does use. */
+static inline RecompXmm XMM_CMP_GT_D(RecompXmm a, RecompXmm b) {
+    RecompXmm r; int i;
+    for (i = 0; i < 4; ++i) r.u[i] = (a.i[i] > b.i[i]) ? 0xFFFFFFFFu : 0u;
+    return r;
+}
+
+/* ================================================================
+ * MMX register state
+ *
+ * Real MMX aliases the x87 FPU register stack: each 64-bit MMX register
+ * is the low 64 bits of one x87 data register, and EMMS resets the tag
+ * word so the FPU can be used again. This runtime models x87 separately
+ * as g_fp_stack[8]/g_fp_top, so routing MMX through it would need EMMS
+ * to actually retag those stack slots, and every FPU op to know when it
+ * is looking at retired MMX bits rather than a float.
+ *
+ * That complexity is only needed if a title interleaves x87 float code
+ * with MMX in the same live range. Breakdown's XMV movie codec (IDCT,
+ * motion compensation, YUV->RGB -- the only MMX user in this title as
+ * of this writing) does not: every one of its functions that touches
+ * mm0-mm7 was checked for real x87 mnemonics (fld, fst, fadd, ...)
+ * anywhere in the same body, and none were found; several call emms
+ * exactly once, at the end, as well-formed MMX code should. So mm0-mm7
+ * are modelled here as eight independent 64-bit integer registers, not
+ * as indices into g_fp_stack. This is an empirical finding about this
+ * title's code, not a general MMX truth -- a title that does interleave
+ * x87 and MMX inside one function would need the aliased model instead,
+ * and should not assume this comment still applies to it.
+ *
+ * The registers are global RECOMP_TLS state for the same reason the XMM
+ * registers above are (see that comment): one guest routine can lift to
+ * several C functions, so a value produced in one body and read in the
+ * next has to outlive the body that wrote it. mm0-mm7 were previously
+ * declared as per-function locals in the generated code (see
+ * FunctionTranslator._find_used_xmm / the mmx_regs declaration this
+ * replaced) -- exactly the shadowing bug the XMM comment warns about,
+ * just not yet observed in practice because nothing exercised real MMX
+ * arithmetic across a body split before this change existed.
+ *
+ * Plain uint64_t (not a lane union like RecompXmm) is deliberate: movd
+ * already lifts as a direct scalar read/write of mm0-mm7 (`mm0 =
+ * MEM32(ecx);` zero-extends exactly like real MOVD-to-MMX), and
+ * register-to-register movq/pand/por/pxor lift the same way (`mm0 =
+ * mm2;`, `mm0 &= mm2;`). A union type would make that scalar assignment
+ * a type error. Instructions that need a lane view (paddw, punpcklbw,
+ * psraw, ...) get one through the MMX_* helpers below, which
+ * reinterpret the uint64_t internally via RecompMmxLanes and hand back
+ * a uint64_t -- the generated call site never sees a union.
+ * ================================================================ */
+
+extern RECOMP_TLS uint64_t g_mm0, g_mm1, g_mm2, g_mm3;
+extern RECOMP_TLS uint64_t g_mm4, g_mm5, g_mm6, g_mm7;
+
+/** movq mm, [addr] / movq [addr], mm / movntq [addr], mm -- qword guest
+ * memory access. (movntq's "non-temporal" cache hint has no meaning for
+ * this runtime; it is otherwise a plain store.) */
+#define MMX_MEM(addr)        MEM64(addr)
+#define MMX_STORE(addr, v)   (MEM64(addr) = (uint64_t)(v))
+
+typedef union RecompMmxLanes {
+    uint64_t q;
+    int64_t  sq;
+    uint32_t d[2];
+    int32_t  sd[2];
+    uint16_t w[4];
+    int16_t  sw[4];
+    uint8_t  b[8];
+    int8_t   sb[8];
+} RecompMmxLanes;
+
+/* -- lane-wise arithmetic / compare --
+ * Each MMX_* helper takes the two source registers as plain uint64_t
+ * (already read out of mm0-mm7 or memory by the caller) and returns the
+ * new 64-bit value to assign back, e.g. `mm4 = MMX_PADDW(mm4, mm2);`.
+ * Non-saturating adds/subs/multiplies rely on normal C unsigned
+ * wraparound to supply the hardware's wraparound-on-overflow -- the
+ * result bit pattern is identical whether the lane is read as signed or
+ * unsigned, so these do not need a signed/unsigned variant. */
+
+#define RECOMP_MMX_LANEWISE(name, field, count, expr)                    \
+    static inline uint64_t name(uint64_t av, uint64_t bv) {              \
+        RecompMmxLanes a, b, r; int i;                                   \
+        a.q = av; b.q = bv;                                              \
+        for (i = 0; i < (count); ++i) { r.field[i] = (expr); }           \
+        return r.q;                                                      \
+    }
+
+RECOMP_MMX_LANEWISE(MMX_PADDB, b, 8, (uint8_t)(a.b[i] + b.b[i]))
+RECOMP_MMX_LANEWISE(MMX_PADDW, w, 4, (uint16_t)(a.w[i] + b.w[i]))
+RECOMP_MMX_LANEWISE(MMX_PADDD, d, 2, (uint32_t)(a.d[i] + b.d[i]))
+RECOMP_MMX_LANEWISE(MMX_PSUBB, b, 8, (uint8_t)(a.b[i] - b.b[i]))
+RECOMP_MMX_LANEWISE(MMX_PSUBW, w, 4, (uint16_t)(a.w[i] - b.w[i]))
+RECOMP_MMX_LANEWISE(MMX_PSUBD, d, 2, (uint32_t)(a.d[i] - b.d[i]))
+/* PMULLW keeps the low 16 bits of each 16x16 product, which is the same
+ * bit pattern whether the inputs are taken as signed or unsigned. */
+RECOMP_MMX_LANEWISE(MMX_PMULLW, w, 4,
+                     (uint16_t)((uint32_t)a.w[i] * (uint32_t)b.w[i]))
+/* PAVGB: unsigned, round-to-nearest average -- (a + b + 1) >> 1. */
+RECOMP_MMX_LANEWISE(MMX_PAVGB, b, 8,
+                     (uint8_t)(((unsigned)a.b[i] + (unsigned)b.b[i] + 1u) >> 1))
+RECOMP_MMX_LANEWISE(MMX_PCMPEQB, b, 8, (a.b[i] == b.b[i]) ? 0xFFu : 0u)
+RECOMP_MMX_LANEWISE(MMX_PCMPEQW, w, 4, (a.w[i] == b.w[i]) ? 0xFFFFu : 0u)
+RECOMP_MMX_LANEWISE(MMX_PCMPGTB, sb, 8, (a.sb[i] > b.sb[i]) ? 0xFFu : 0u)
+RECOMP_MMX_LANEWISE(MMX_PCMPGTW, sw, 4, (a.sw[i] > b.sw[i]) ? 0xFFFFu : 0u)
+/* pcmpgtd shares its mnemonic with an SSE2 128-bit form (see
+ * _lift_sse's pand/pandn/por/pxor/pcmpgtd handling); this is the MMX
+ * (64-bit, two dwords) side of it. */
+RECOMP_MMX_LANEWISE(MMX_PCMPGTD, sd, 2, (a.sd[i] > b.sd[i]) ? 0xFFFFFFFFu : 0u)
+
+/** pmaddwd: multiply four signed word lanes pairwise, add adjacent
+ * products into two signed dwords. */
+static inline uint64_t MMX_PMADDWD(uint64_t av, uint64_t bv) {
+    RecompMmxLanes a, b, r;
+    a.q = av; b.q = bv;
+    r.sd[0] = (int32_t)a.sw[0] * (int32_t)b.sw[0]
+            + (int32_t)a.sw[1] * (int32_t)b.sw[1];
+    r.sd[1] = (int32_t)a.sw[2] * (int32_t)b.sw[2]
+            + (int32_t)a.sw[3] * (int32_t)b.sw[3];
+    return r.q;
+}
+
+/* -- pack (narrow with saturation) -- */
+
+static inline int16_t recomp_ssat16(int32_t v) {
+    if (v > 32767) return 32767;
+    if (v < -32768) return -32768;
+    return (int16_t)v;
+}
+static inline int8_t recomp_ssat8(int32_t v) {
+    if (v > 127) return 127;
+    if (v < -128) return -128;
+    return (int8_t)v;
+}
+static inline uint8_t recomp_usat8(int32_t v) {
+    if (v > 255) return 255;
+    if (v < 0) return 0;
+    return (uint8_t)v;
+}
+
+/** packssdw dst, src: dst's two signed dwords -> the low two words of
+ * the result (signed-saturated), src's two dwords -> the high two. */
+static inline uint64_t MMX_PACKSSDW(uint64_t av, uint64_t bv) {
+    RecompMmxLanes a, b, r;
+    a.q = av; b.q = bv;
+    r.sw[0] = recomp_ssat16(a.sd[0]); r.sw[1] = recomp_ssat16(a.sd[1]);
+    r.sw[2] = recomp_ssat16(b.sd[0]); r.sw[3] = recomp_ssat16(b.sd[1]);
+    return r.q;
+}
+
+/** packsswb dst, src: dst's four signed words -> the low four bytes
+ * (signed-saturated), src's four words -> the high four. */
+static inline uint64_t MMX_PACKSSWB(uint64_t av, uint64_t bv) {
+    RecompMmxLanes a, b, r; int i;
+    a.q = av; b.q = bv;
+    for (i = 0; i < 4; ++i) {
+        r.sb[i]     = recomp_ssat8(a.sw[i]);
+        r.sb[i + 4] = recomp_ssat8(b.sw[i]);
+    }
+    return r.q;
+}
+
+/** packuswb dst, src: dst's four signed words -> the low four bytes
+ * (unsigned-saturated), src's four words -> the high four. */
+static inline uint64_t MMX_PACKUSWB(uint64_t av, uint64_t bv) {
+    RecompMmxLanes a, b, r; int i;
+    a.q = av; b.q = bv;
+    for (i = 0; i < 4; ++i) {
+        r.b[i]     = recomp_usat8(a.sw[i]);
+        r.b[i + 4] = recomp_usat8(b.sw[i]);
+    }
+    return r.q;
+}
+
+/* -- unpack (interleave low or high half) -- */
+
+static inline uint64_t MMX_PUNPCKLBW(uint64_t av, uint64_t bv) {
+    RecompMmxLanes a, b, r; int i;
+    a.q = av; b.q = bv;
+    for (i = 0; i < 4; ++i) { r.b[2*i] = a.b[i]; r.b[2*i+1] = b.b[i]; }
+    return r.q;
+}
+static inline uint64_t MMX_PUNPCKHBW(uint64_t av, uint64_t bv) {
+    RecompMmxLanes a, b, r; int i;
+    a.q = av; b.q = bv;
+    for (i = 0; i < 4; ++i) { r.b[2*i] = a.b[i+4]; r.b[2*i+1] = b.b[i+4]; }
+    return r.q;
+}
+static inline uint64_t MMX_PUNPCKLWD(uint64_t av, uint64_t bv) {
+    RecompMmxLanes a, b, r;
+    a.q = av; b.q = bv;
+    r.w[0] = a.w[0]; r.w[1] = b.w[0]; r.w[2] = a.w[1]; r.w[3] = b.w[1];
+    return r.q;
+}
+static inline uint64_t MMX_PUNPCKHWD(uint64_t av, uint64_t bv) {
+    RecompMmxLanes a, b, r;
+    a.q = av; b.q = bv;
+    r.w[0] = a.w[2]; r.w[1] = b.w[2]; r.w[2] = a.w[3]; r.w[3] = b.w[3];
+    return r.q;
+}
+static inline uint64_t MMX_PUNPCKLDQ(uint64_t av, uint64_t bv) {
+    RecompMmxLanes a, b, r;
+    a.q = av; b.q = bv;
+    r.d[0] = a.d[0]; r.d[1] = b.d[0];
+    return r.q;
+}
+static inline uint64_t MMX_PUNPCKHDQ(uint64_t av, uint64_t bv) {
+    RecompMmxLanes a, b, r;
+    a.q = av; b.q = bv;
+    r.d[0] = a.d[1]; r.d[1] = b.d[1];
+    return r.q;
+}
+
+/* -- shifts --
+ * Real hardware: a shift count greater than the element width zeroes a
+ * logical shift's whole destination, or fills an arithmetic shift's
+ * destination with each lane's own sign bit. `count` is a runtime
+ * uint64_t -- the full width of an mm-register or m64 count operand,
+ * or a small immediate the caller widens -- so the "too large" check
+ * has to happen before it ever reaches a C shift operator. */
+
+static inline uint64_t MMX_PSLLW(uint64_t av, uint64_t count) {
+    RecompMmxLanes a, r; int i;
+    if (count > 15) return 0;
+    a.q = av;
+    for (i = 0; i < 4; ++i) r.w[i] = (uint16_t)(a.w[i] << count);
+    return r.q;
+}
+static inline uint64_t MMX_PSLLD(uint64_t av, uint64_t count) {
+    RecompMmxLanes a, r; int i;
+    if (count > 31) return 0;
+    a.q = av;
+    for (i = 0; i < 2; ++i) r.d[i] = a.d[i] << count;
+    return r.q;
+}
+static inline uint64_t MMX_PSLLQ(uint64_t av, uint64_t count) {
+    if (count > 63) return 0;
+    return av << count;
+}
+static inline uint64_t MMX_PSRLW(uint64_t av, uint64_t count) {
+    RecompMmxLanes a, r; int i;
+    if (count > 15) return 0;
+    a.q = av;
+    for (i = 0; i < 4; ++i) r.w[i] = (uint16_t)(a.w[i] >> count);
+    return r.q;
+}
+static inline uint64_t MMX_PSRLD(uint64_t av, uint64_t count) {
+    RecompMmxLanes a, r; int i;
+    if (count > 31) return 0;
+    a.q = av;
+    for (i = 0; i < 2; ++i) r.d[i] = a.d[i] >> count;
+    return r.q;
+}
+static inline uint64_t MMX_PSRLQ(uint64_t av, uint64_t count) {
+    if (count > 63) return 0;
+    return av >> count;
+}
+/** psraw: count clamped to 15 rather than branching to an explicit
+ * "fill with sign" path -- a 16-bit lane promotes to a 32-bit int for
+ * the shift, so its top 16 bits are already sign-extension, and
+ * shifting right by 15 (one less than the lane width) spreads the
+ * sign bit through every bit the lane will keep after truncation.
+ * Clamping instead of using the raw (possibly huge) count also keeps
+ * this a well-defined C shift. */
+static inline uint64_t MMX_PSRAW(uint64_t av, uint64_t count) {
+    RecompMmxLanes a, r; int i;
+    int c = (count > 15) ? 15 : (int)count;
+    a.q = av;
+    for (i = 0; i < 4; ++i) r.sw[i] = (int16_t)(a.sw[i] >> c);
+    return r.q;
+}
+/** psrad: same idea, but a 32-bit lane has no wider promotion to lean
+ * on, so the clamp itself (to 31, one less than the width) is what
+ * keeps the shift legal while still producing all-sign-bits. */
+static inline uint64_t MMX_PSRAD(uint64_t av, uint64_t count) {
+    RecompMmxLanes a, r; int i;
+    int c = (count > 31) ? 31 : (int)count;
+    a.q = av;
+    for (i = 0; i < 2; ++i) r.sd[i] = (int32_t)(a.sd[i] >> c);
+    return r.q;
+}
+
+/** pshufw dst, src, imm8: each 2-bit field of imm8 selects which of
+ * src's four words lands in the corresponding destination word. */
+static inline uint64_t MMX_PSHUFW(uint64_t av, uint32_t imm) {
+    RecompMmxLanes a, r;
+    a.q = av;
+    r.w[0] = a.w[(imm >> 0) & 3u];
+    r.w[1] = a.w[(imm >> 2) & 3u];
+    r.w[2] = a.w[(imm >> 4) & 3u];
+    r.w[3] = a.w[(imm >> 6) & 3u];
+    return r.q;
+}
+
+/** cvtps2pi: an xmm source's low two floats -> an mm destination's two
+ * signed 32-bit ints, round-to-nearest-even (the default FP rounding
+ * mode almost every title runs with; this runtime does not model
+ * MXCSR/FPU control-word rounding control). */
+static inline uint64_t MMX_CVTPS2PI(RecompXmm src) {
+    RecompMmxLanes r;
+    r.sd[0] = (int32_t)lrintf(src.f[0]);
+    r.sd[1] = (int32_t)lrintf(src.f[1]);
+    return r.q;
+}
+
+/** cvtpi2ps dst, src: an mm source's two signed 32-bit ints -> the low
+ * two lanes of xmm dst; the upper two lanes keep whatever dst already
+ * held, exactly like real hardware, so this takes and returns the
+ * whole xmm value. */
+static inline RecompXmm MMX_CVTPI2PS(RecompXmm dst, uint64_t src) {
+    RecompMmxLanes s;
+    s.q = src;
+    dst.f[0] = (float)s.sd[0];
+    dst.f[1] = (float)s.sd[1];
+    return dst;
+}
+
 /* ================================================================
  * Flag computation helpers
  *
@@ -588,6 +944,62 @@ static inline uint32_t BSWAP32(uint32_t v) {
 static inline uint16_t BSWAP16(uint16_t v) {
     return (uint16_t)((v >> 8) | (v << 8));
 }
+
+/* ================================================================
+ * rdtsc (Read Time-Stamp Counter)
+ *
+ * Xbox game code that hand-rolls high-resolution timing (movie
+ * playback pacing, async I/O poll/timeout loops) reads this directly
+ * instead of going through a kernel time call. Before this, the
+ * lifter had no case for it and fell through to the generic
+ * "unhandled instruction" path, which emits nothing -- eax/edx were
+ * left holding whatever value the surrounding code last put there,
+ * not a real counter. Any elapsed-time computation built on that
+ * ("now - start") either never advances or moves nonsensically, and
+ * a wait loop keyed on "has enough time passed" spins forever.
+ * Confirmed on Breakdown: the base.pak loader's async-read wait
+ * (0x00188EB0) hangs solid on exactly this pattern; the same rdtsc
+ * opcode also appears in the D3D and XMV (movie) code, so a real,
+ * monotonically increasing counter here is not just for this one
+ * call site.
+ *
+ * A real host TSC read (not scaled to the Xbox's 733.33MHz part) is
+ * used deliberately: guest code of this era self-calibrates a
+ * ticks-per-millisecond ratio against a wall-clock reference rather
+ * than assuming a fixed frequency, so any genuinely monotonic counter
+ * satisfies it. Where the host has no TSC, clock() is a strictly
+ * lower-resolution but still monotonically-increasing fallback --
+ * never the silent stale-register readback this replaces.
+ * ================================================================ */
+
+static inline uint64_t recomp_rdtsc64(void) {
+#if defined(__i386__) || defined(__x86_64__)
+    return __builtin_ia32_rdtsc();
+#else
+    return (uint64_t)clock();
+#endif
+}
+#define RECOMP_RDTSC64() recomp_rdtsc64()
+
+/* ================================================================
+ * Port I/O (IN / OUT)
+ *
+ * Same failure shape as rdtsc above: with no lifter case, IN fell
+ * through to the "unhandled instruction" path and emitted nothing,
+ * so `in al, dx` left AL holding whatever the surrounding code had
+ * last put in eax -- a garbage port value that changed with
+ * unrelated edits -- and OUT vanished entirely.
+ *
+ * The model lives in the kernel HAL rather than here because port
+ * space is hardware state, not translation: reads must answer with
+ * what the Xbox southbridge would return, and some of them change
+ * on every read.
+ *
+ * width is the access width in bytes (1, 2 or 4).
+ * ================================================================ */
+
+uint32_t recomp_port_in(uint16_t port, unsigned width);
+void     recomp_port_out(uint16_t port, uint32_t value, unsigned width);
 
 /* ================================================================
  * Indirect call dispatch
@@ -756,6 +1168,14 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 #define xmm5 g_xmm5
 #define xmm6 g_xmm6
 #define xmm7 g_xmm7
+#define mm0 g_mm0
+#define mm1 g_mm1
+#define mm2 g_mm2
+#define mm3 g_mm3
+#define mm4 g_mm4
+#define mm5 g_mm5
+#define mm6 g_mm6
+#define mm7 g_mm7
 /* ebp is NOT global - it's local in each function.
  * For __SEH_prolog/epilog, use g_seh_ebp to bridge. */
 #endif

@@ -29,7 +29,11 @@ else()
     target_compile_options(xbox_nv2a PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()
 
-target_link_libraries(xbox_nv2a PRIVATE platform)
+# nv2a_pgraph_d3d11.c rasterizes through the D3D8 layer's device
+# (xbox_GetD3DDevice), so this is a real dependency, not link-order tidiness.
+# It stayed invisible while nothing pulled pgraph into a link; the moment a
+# title calls nv2a_hook_init() it surfaces as an undefined reference.
+target_link_libraries(xbox_nv2a PRIVATE platform xbox_d3d8)
 if(WIN32)
     target_link_libraries(xbox_nv2a PRIVATE kernel32)
 endif()

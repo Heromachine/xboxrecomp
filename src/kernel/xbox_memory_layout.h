@@ -82,6 +82,27 @@ void xbox_SetTotalRam(size_t bytes);
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size);
 
 /**
+ * Switch the NV2A register aperture from plain RAM to a trapping region, so
+ * accesses fault into a VEH that can route them to real GPU emulation.
+ *
+ * By default the aperture is committed RAM plus a background thread that
+ * hand-acknowledges a short list of busy/idle bits (see NV2A_ACK / NV2A_IDLE
+ * in the .c). That models a title whose drawing is done by an HLE D3D8 layer.
+ * A title running its own D3D8 code against real register emulation needs the
+ * opposite: every access visible. Calling this stops the ack thread -- its
+ * direct writes would otherwise fault into the same handler and fight the
+ * register model -- and makes the aperture PAGE_NOACCESS.
+ *
+ * Calling it IS the opt-in; nothing else changes behaviour. Pair it with
+ * nv2a_hook_init() and route EXCEPTION_ACCESS_VIOLATION in the aperture to
+ * nv2a_hook_handle_mmio(), or the title will simply crash on its first GPU
+ * access.
+ *
+ * @return TRUE if the aperture now traps.
+ */
+BOOL xbox_Nv2aEnableTrapping(void);
+
+/**
  * Release the reserved Xbox memory layout.
  */
 void xbox_MemoryLayoutShutdown(void);
@@ -260,8 +281,31 @@ void xbox_init_fake_tib(void);
 #define XBOX_MIRROR_SIZE    0
 #define XBOX_GUARD_SIZE     0
 
-/** Number of 64 MB mirror views to pre-map (covers 1.75 GB of address space). */
-#define XBOX_NUM_MIRRORS    28
+/**
+ * Number of 64 MB mirror views to pre-map beyond the base region.
+ *
+ * Was 28 (1.75 GB), sized for the RenderWare/init-code wraparound this
+ * comment block already described. That left a gap: Breakdown's XMV movie
+ * codec computes an output address by OR-ing a real (low, in-RAM) offset
+ * with 0xF0000000 -- `ecx = ecx | 0xF0000000u;` in sub_001C6280, a bit
+ * pattern for tiled/aliased surface access. Every such address the OR can
+ * ever produce lands in [0xF0000000, 0xF4000000) (the OR only sets the top
+ * nibble; the low bits still span the 64 MB it aliases into), which sits
+ * completely outside the 28-mirror range and faulted with no backing page.
+ *
+ * The MMX lifter work that made this codec's writes real (previously a
+ * no-op, so nothing ever dereferenced the address) is what exposed this --
+ * see HeroLab, Xbox Recompiler project, 2026-09-06. The gap itself is
+ * general: real Xbox RAM mirrors modulo 64 MB across the *entire* 32-bit
+ * space, not just the first 1.75 GB, so any title using a similar
+ * high-bit-set alias would hit the same wall.
+ *
+ * 60 covers guest VA up to 0xF4000000 -- past the 0xF0000000 tiled range
+ * with room to spare -- while stopping well short of the NV2A aperture at
+ * 0xFD000000 and the MCPX apertures above it, which are mapped separately
+ * at fixed addresses and must not overlap a mirror view.
+ */
+#define XBOX_NUM_MIRRORS    60
 
 /**
  * Allocate from the Xbox heap. Returns an Xbox VA, or 0 on failure.

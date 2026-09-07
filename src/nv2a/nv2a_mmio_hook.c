@@ -273,83 +273,213 @@ static bool decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
         return true;
     }
 
-    /* ── CMP r/m, r (38/39) or CMP r, r/m (3A/3B) ── */
-    if (opcode[0] == 0x39 || opcode[0] == 0x38) {
-        if (opcode[0] == 0x38) access_size = 1;
+    /* ── ALU r/m,r and r,r/m: the classic eight (opcodes 0x00-0x3B) ──
+     *
+     * x86 encodes ADD/OR/ADC/SBB/AND/SUB/XOR/CMP as one regular block:
+     * opcode = op*8 + form, where form 0 = r/m8,r8   1 = r/m32,r32
+     *                             form 2 = r8,r/m8   3 = r32,r/m32.
+     * Forms 0/1 write memory (read-modify-write); forms 2/3 write the
+     * register; CMP writes neither. `(opcode & 7) <= 3` selects exactly the
+     * 32 ModRM-carrying opcodes and naturally excludes the imm-to-accumulator
+     * forms (op*8+4/5) and the segment/BCD one-byte opcodes (op*8+6/7).
+     *
+     * Handling the block as a block is deliberate. Adding these one opcode at
+     * a time is what made bringing the GPU up a sequence of crash-fix-rerun
+     * cycles: OR and AND r/m,r were present, so `MEM32(x) |= y` worked, while
+     * `xor r8d, [rcx+rax]` -- the same shape in the other direction -- took
+     * the process down.
+     *
+     * Note the 8-bit forms address al/cl/dl/bl only; without a REX prefix
+     * regs 4-7 would mean ah/ch/dh/bh, which ctx_reg64 cannot express. That
+     * limitation is shared with the MOV and MOVZX paths above and has not
+     * been hit, since the lifted code is compiled as x86-64.
+     */
+    if (opcode[0] < 0x40 && (opcode[0] & 0x07) <= 0x03) {
+        int op   = (opcode[0] >> 3) & 7;
+        int form = opcode[0] & 0x03;
+        int to_reg = (form >= 2);
         int modrm_len = decode_modrm_len(opcode + 1, rex_b);
         int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t mem_val = nv2a_mmio_read(nv2a, mmio_offset, access_size);
-        uint64_t reg_val = *ctx_reg64(ctx, reg);
+        uint64_t *rp = ctx_reg64(ctx, reg);
+        uint64_t cf_in = (ctx->EFlags & 0x0001) ? 1 : 0;
+        uint64_t mask, mem_val, reg_val, lhs, rhs, result;
+        int carry = 0;
 
-        if (access_size <= 4) {
-            mem_val &= (1ULL << (access_size * 8)) - 1;
-            reg_val &= (1ULL << (access_size * 8)) - 1;
+        if (form == 0 || form == 2) access_size = 1;
+        mask = (access_size >= 8) ? ~0ULL : ((1ULL << (access_size * 8)) - 1);
+
+        mem_val = nv2a_mmio_read(nv2a, mmio_offset, access_size) & mask;
+        reg_val = *rp & mask;
+        lhs = to_reg ? reg_val : mem_val;
+        rhs = to_reg ? mem_val : reg_val;
+
+        switch (op) {
+        case 0: result = lhs + rhs;         carry = ((result & mask) < lhs); break; /* ADD */
+        case 1: result = lhs | rhs;                                          break; /* OR  */
+        case 2: result = lhs + rhs + cf_in; carry = ((result & mask) < lhs); break; /* ADC */
+        case 3: result = lhs - rhs - cf_in; carry = (lhs < rhs + cf_in);     break; /* SBB */
+        case 4: result = lhs & rhs;                                          break; /* AND */
+        case 5: result = lhs - rhs;         carry = (lhs < rhs);             break; /* SUB */
+        case 6: result = lhs ^ rhs;                                          break; /* XOR */
+        default: result = lhs - rhs;        carry = (lhs < rhs);             break; /* CMP */
         }
+        result &= mask;
 
-        /* CMP r/m, r: compute r/m - r */
-        uint64_t result = mem_val - reg_val;
-        ctx->EFlags &= ~(0x0001 | 0x0040 | 0x0080 | 0x0800); /* CF, ZF, SF, OF */
-        if (result == 0) ctx->EFlags |= 0x0040; /* ZF */
-        if (mem_val < reg_val) ctx->EFlags |= 0x0001; /* CF */
-        if (result & (1ULL << (access_size * 8 - 1))) ctx->EFlags |= 0x0080; /* SF */
-
-        ctx->Rip += prefix_len + 1 + modrm_len;
-        g_mmio_read_count++;
-        return true;
-    }
-
-    if (opcode[0] == 0x3B || opcode[0] == 0x3A) {
-        if (opcode[0] == 0x3A) access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t mem_val = nv2a_mmio_read(nv2a, mmio_offset, access_size);
-        uint64_t reg_val = *ctx_reg64(ctx, reg);
-
-        if (access_size <= 4) {
-            mem_val &= (1ULL << (access_size * 8)) - 1;
-            reg_val &= (1ULL << (access_size * 8)) - 1;
-        }
-
-        /* CMP r, r/m: compute r - r/m */
-        uint64_t result = reg_val - mem_val;
         ctx->EFlags &= ~(0x0001 | 0x0040 | 0x0080 | 0x0800);
-        if (result == 0) ctx->EFlags |= 0x0040;
-        if (reg_val < mem_val) ctx->EFlags |= 0x0001;
-        if (result & (1ULL << (access_size * 8 - 1))) ctx->EFlags |= 0x0080;
+        if (result == 0) ctx->EFlags |= 0x0040;                              /* ZF */
+        if (result & (1ULL << (access_size * 8 - 1))) ctx->EFlags |= 0x0080; /* SF */
+        if (carry) ctx->EFlags |= 0x0001;                                    /* CF */
+
+        if (op == 7) {                       /* CMP: flags only */
+            g_mmio_read_count++;
+        } else if (to_reg) {
+            if (access_size == 1)      *rp = (*rp & ~0xFFULL)   | result;
+            else if (access_size == 2) *rp = (*rp & ~0xFFFFULL) | result;
+            else                       *rp = result;  /* 32-bit zero-extends */
+            g_mmio_read_count++;
+        } else {
+            nv2a_mmio_write(nv2a, mmio_offset, result, access_size);
+            g_mmio_write_count++;
+        }
 
         ctx->Rip += prefix_len + 1 + modrm_len;
-        g_mmio_read_count++;
         return true;
     }
 
-    /* ── OR r/m, r (08/09) - read-modify-write ── */
-    if (opcode[0] == 0x09 || opcode[0] == 0x08) {
-        if (opcode[0] == 0x08) access_size = 1;
+    /* ── Group 1: ALU r/m, imm (80 /r ib, 81 /r id, 83 /r ib sign-extended) ──
+     *
+     * The operation lives in the ModRM reg field, not the opcode. This is what
+     * `MEM32(reg) |= BIT` and `MEM32(reg) &= ~BIT` compile to, which makes it
+     * the single most common way lifted code drives a hardware register: every
+     * set-a-bit / wait-for-hardware-to-clear-it handshake goes through here.
+     * Its absence is why the very first NV2A access this title makes --
+     * `or dword [rdx+rcx], 4` at guest 0xFD001804 -- could not be decoded.
+     */
+    if (opcode[0] == 0x80 || opcode[0] == 0x81 || opcode[0] == 0x83) {
+        int op = (opcode[1] >> 3) & 7;
         int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t mem_val = nv2a_mmio_read(nv2a, mmio_offset, access_size);
-        uint64_t reg_val = *ctx_reg64(ctx, reg);
-        uint64_t result = mem_val | reg_val;
+        const uint8_t *imm_ptr = opcode + 1 + modrm_len;
+        int imm_len;
+        uint64_t imm;
 
-        nv2a_mmio_write(nv2a, mmio_offset, result, access_size);
-        ctx->Rip += prefix_len + 1 + modrm_len;
-        g_mmio_write_count++;
+        if (opcode[0] == 0x80) {
+            access_size = 1;
+            imm_len = 1;
+            imm = *imm_ptr;
+        } else if (opcode[0] == 0x83) {
+            /* imm8 sign-extended to the operand size */
+            imm_len = 1;
+            imm = (uint64_t)(int64_t)(int8_t)*imm_ptr;
+        } else if (access_size == 2) {
+            imm_len = 2;
+            imm = *(const uint16_t *)imm_ptr;
+        } else {
+            imm_len = 4;
+            imm = (uint64_t)(int64_t)*(const int32_t *)imm_ptr;
+        }
+
+        /* 1ULL << 64 is undefined, so build the mask without shifting by 64 */
+        uint64_t mask = (access_size >= 8) ? ~0ULL
+                                           : ((1ULL << (access_size * 8)) - 1);
+        uint64_t mem_val = nv2a_mmio_read(nv2a, mmio_offset, access_size) & mask;
+        uint64_t rhs = imm & mask;
+        uint64_t cf_in = (ctx->EFlags & 0x0001) ? 1 : 0;
+        uint64_t result;
+        int carry = 0;
+        int is_cmp = 0;
+
+        switch (op) {
+        case 0: result = mem_val + rhs;         carry = ((result & mask) < mem_val); break; /* ADD */
+        case 1: result = mem_val | rhs;                                              break; /* OR  */
+        case 2: result = mem_val + rhs + cf_in; carry = ((result & mask) < mem_val); break; /* ADC */
+        case 3: result = mem_val - rhs - cf_in; carry = (mem_val < rhs + cf_in);     break; /* SBB */
+        case 4: result = mem_val & rhs;                                              break; /* AND */
+        case 5: result = mem_val - rhs;         carry = (mem_val < rhs);             break; /* SUB */
+        case 6: result = mem_val ^ rhs;                                              break; /* XOR */
+        default: result = mem_val - rhs;        carry = (mem_val < rhs); is_cmp = 1; break; /* CMP */
+        }
+        result &= mask;
+
+        /* Logical ops clear CF and OF on x86; arithmetic ones get a real CF. */
+        ctx->EFlags &= ~(0x0001 | 0x0040 | 0x0080 | 0x0800);
+        if (result == 0) ctx->EFlags |= 0x0040;                          /* ZF */
+        if (result & (1ULL << (access_size * 8 - 1))) ctx->EFlags |= 0x0080; /* SF */
+        if (carry) ctx->EFlags |= 0x0001;                                /* CF */
+
+        if (is_cmp) {
+            g_mmio_read_count++;
+        } else {
+            nv2a_mmio_write(nv2a, mmio_offset, result, access_size);
+            g_mmio_write_count++;
+        }
+
+        ctx->Rip += prefix_len + 1 + modrm_len + imm_len;
         return true;
     }
 
-    /* ── AND r/m, r (20/21) ── */
-    if (opcode[0] == 0x21 || opcode[0] == 0x20) {
-        if (opcode[0] == 0x20) access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t mem_val = nv2a_mmio_read(nv2a, mmio_offset, access_size);
-        uint64_t reg_val = *ctx_reg64(ctx, reg);
-        uint64_t result = mem_val & reg_val;
+    /* ── Group 3: TEST/NOT/NEG r/m (F6 /0-/3 imm8, F7 /0-/3 imm32) ──
+     *
+     * Also selected by the ModRM reg field. `test [reg], BIT` is the read half
+     * of the same handshakes Group 1 writes -- the title sets a busy bit, then
+     * spins here waiting for the GPU to clear it. MUL/DIV (/4-/7) take EAX
+     * implicitly and are left to the decode-fail path; nothing drives a
+     * hardware register through them.
+     */
+    if (opcode[0] == 0xF6 || opcode[0] == 0xF7) {
+        int op = (opcode[1] >> 3) & 7;
 
-        nv2a_mmio_write(nv2a, mmio_offset, result, access_size);
-        ctx->Rip += prefix_len + 1 + modrm_len;
-        g_mmio_write_count++;
-        return true;
+        if (op <= 3) {
+            int modrm_len = decode_modrm_len(opcode + 1, rex_b);
+            const uint8_t *imm_ptr = opcode + 1 + modrm_len;
+            int imm_len = 0;
+            uint64_t imm = 0;
+
+            if (opcode[0] == 0xF6) access_size = 1;
+
+            if (op <= 1) {  /* TEST takes an immediate; NOT/NEG do not */
+                if (access_size == 1)      { imm_len = 1; imm = *imm_ptr; }
+                else if (access_size == 2) { imm_len = 2; imm = *(const uint16_t *)imm_ptr; }
+                else                       { imm_len = 4;
+                                             imm = (uint64_t)(int64_t)*(const int32_t *)imm_ptr; }
+            }
+
+            uint64_t mask = (access_size >= 8) ? ~0ULL
+                                               : ((1ULL << (access_size * 8)) - 1);
+            uint64_t mem_val = nv2a_mmio_read(nv2a, mmio_offset, access_size) & mask;
+            uint64_t result;
+            int writes_back = 0;
+            int carry = 0;
+            int set_flags = 1;
+
+            if (op <= 1) {
+                result = mem_val & (imm & mask);          /* TEST */
+            } else if (op == 2) {
+                result = (~mem_val) & mask;               /* NOT: no flags */
+                writes_back = 1;
+                set_flags = 0;
+            } else {
+                result = (0 - mem_val) & mask;            /* NEG */
+                writes_back = 1;
+                carry = (mem_val != 0);
+            }
+
+            if (set_flags) {
+                ctx->EFlags &= ~(0x0001 | 0x0040 | 0x0080 | 0x0800);
+                if (result == 0) ctx->EFlags |= 0x0040;                              /* ZF */
+                if (result & (1ULL << (access_size * 8 - 1))) ctx->EFlags |= 0x0080; /* SF */
+                if (carry) ctx->EFlags |= 0x0001;                                    /* CF */
+            }
+
+            if (writes_back) {
+                nv2a_mmio_write(nv2a, mmio_offset, result, access_size);
+                g_mmio_write_count++;
+            } else {
+                g_mmio_read_count++;
+            }
+
+            ctx->Rip += prefix_len + 1 + modrm_len + imm_len;
+            return true;
+        }
     }
 
     /* Unrecognized instruction */
@@ -394,6 +524,27 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 {
     /* Compute MMIO offset within NV2A register space */
     uint32_t mmio_offset = fault_xbox_va - NV2A_MMIO_BASE;
+
+    /* Periodic traffic summary. A title waiting on a bit that never changes
+     * spins on one offset forever, so the last offset seen names the stall
+     * outright -- the thing that was impossible to see while this aperture
+     * was plain RAM. Rate-limited, so a busy frame costs one line every 2s. */
+    {
+        static DWORD last_tick;
+        static uint64_t accesses;
+        DWORD now = GetTickCount();
+
+        accesses++;
+        if (last_tick == 0) last_tick = now;
+        if (now - last_tick >= 2000) {
+            fprintf(stderr, "[NV2A] mmio: %llu accesses (%d rd / %d wr), "
+                    "last offset 0x%06X (%s)\n",
+                    (unsigned long long)accesses, g_mmio_read_count,
+                    g_mmio_write_count, mmio_offset, is_write ? "write" : "read");
+            fflush(stderr);
+            last_tick = now;
+        }
+    }
 
     return decode_and_handle(ctx, mmio_offset, is_write);
 }

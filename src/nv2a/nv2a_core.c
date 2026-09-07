@@ -130,10 +130,34 @@ void pmc_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 
     switch (addr) {
     case NV_PMC_INTR_0:
+        /* Bounded trace: a registered ISR acknowledging an interrupt shows up
+         * here (write-1-to-clear). Silence means nothing is being serviced. */
+        {
+            static int logged;
+            if (logged < 8) {
+                logged++;
+                fprintf(stderr, "  [NV2A] PMC_INTR_0 write 0x%08X (pending was 0x%08X)\n",
+                        (uint32_t)val, d->pmc.pending_interrupts);
+                fflush(stderr);
+            }
+        }
         d->pmc.pending_interrupts &= ~val;
         nv2a_update_irq(d);
         break;
     case NV_PMC_INTR_EN_0:
+        /* The question this answers: does the title EVER enable GPU
+         * interrupts? sub_001C6890, the vblank ISR the delivery thread
+         * invokes at 60 Hz, returns FALSE immediately whenever this reads 0 --
+         * so if it is never written non-zero, that ISR is inert by design at
+         * this stage and the vblank -> DPC chain cannot fire for this title. */
+        {
+            static int logged;
+            if (logged < 8) {
+                logged++;
+                fprintf(stderr, "  [NV2A] PMC_INTR_EN_0 write 0x%08X\n", (uint32_t)val);
+                fflush(stderr);
+            }
+        }
         d->pmc.enabled_interrupts = val;
         nv2a_update_irq(d);
         break;
@@ -620,6 +644,27 @@ uint64_t pfifo_read(void *opaque, hwaddr addr, unsigned int size)
     case NV_PFIFO_INTR_EN_0:
         r = d->pfifo.enabled_interrupts;
         break;
+
+    /* Queue-empty status. LOW_MARK means "at or below the low water mark",
+     * i.e. drained. Nothing here queues runout entries or pushes methods into
+     * CACHE1, so empty is the truthful answer -- the same reasoning that makes
+     * the interrupt-pending registers read 0 because nothing raises
+     * interrupts, not a convenience.
+     *
+     * Falling through to the regs[] default instead returns 0, which reads as
+     * "not empty" forever and hangs any title that waits for the FIFO to
+     * drain. That is not hypothetical: it is why enabling the NV2A backend
+     * regressed Breakdown's boot on 2026-09-06. The ack thread in
+     * xbox_memory_layout.c (NV2A_IDLE) had been forcing these two bits set
+     * from outside, and trapping the aperture necessarily stops that thread,
+     * so the answer has to come from here instead. */
+    case NV_PFIFO_RUNOUT_STATUS:
+        r = NV_PFIFO_RUNOUT_STATUS_LOW_MARK;
+        break;
+    case NV_PFIFO_CACHE1_STATUS:
+        r = NV_PFIFO_CACHE1_STATUS_LOW_MARK;
+        break;
+
     default:
         r = d->pfifo.regs[addr];
         break;
@@ -670,6 +715,75 @@ void nv2a_stub_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 }
 
 /* ============================================================
+ * NV_USER - PFIFO channel push buffer pointers
+ *
+ * Software submits work by writing DMA_PUT, then spins reading DMA_GET until
+ * it matches: "you have consumed everything I submitted". Left as a stub this
+ * read 0 forever and any title driving its own push buffer hangs here --
+ * Breakdown does exactly that, spinning ~250,000 reads/second on 0x800044.
+ *
+ * Advancing GET to PUT reports the commands consumed WITHOUT executing them.
+ * Nothing here walks the push buffer yet, so this is an acknowledgement, not
+ * rendering -- the same claim the old NV2A_ACK thread in xbox_memory_layout.c
+ * made, moved into the register model where it belongs instead of a
+ * background thread poking RAM behind the emulation's back.
+ *
+ * When a real puller lands, GET must advance as methods are actually
+ * dispatched to pgraph rather than being slammed to PUT here.
+ * ============================================================ */
+
+#define NV_USER_DMA_PUT 0x40u
+#define NV_USER_DMA_GET 0x44u
+#define NV_USER_REF     0x48u
+
+uint64_t user_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    NV2AState *d = (NV2AState *)opaque;
+    uint32_t channel = (uint32_t)(addr / NV2A_USER_CHANNEL_SIZE);
+    uint32_t reg = (uint32_t)(addr % NV2A_USER_CHANNEL_SIZE);
+    uint64_t r = 0;
+
+    if (channel < NV2A_USER_NUM_CHANNELS) {
+        switch (reg) {
+        case NV_USER_DMA_PUT: r = d->user.dma_put[channel]; break;
+        case NV_USER_DMA_GET: r = d->user.dma_get[channel]; break;
+        case NV_USER_REF:     r = d->user.ref[channel];     break;
+        default: break;
+        }
+    }
+
+    nv2a_reg_log_read(NV_USER, addr, size, r);
+    return r;
+}
+
+void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
+{
+    NV2AState *d = (NV2AState *)opaque;
+    uint32_t channel = (uint32_t)(addr / NV2A_USER_CHANNEL_SIZE);
+    uint32_t reg = (uint32_t)(addr % NV2A_USER_CHANNEL_SIZE);
+
+    nv2a_reg_log_write(NV_USER, addr, size, val);
+
+    if (channel >= NV2A_USER_NUM_CHANNELS)
+        return;
+
+    switch (reg) {
+    case NV_USER_DMA_PUT:
+        d->user.dma_put[channel] = (uint32_t)val;
+        d->user.dma_get[channel] = (uint32_t)val;  /* consumed; see above */
+        break;
+    case NV_USER_DMA_GET:
+        d->user.dma_get[channel] = (uint32_t)val;
+        break;
+    case NV_USER_REF:
+        d->user.ref[channel] = (uint32_t)val;
+        break;
+    default:
+        break;
+    }
+}
+
+/* ============================================================
  * Block dispatch table (from xemu nv2a.c)
  * ============================================================ */
 
@@ -709,7 +823,7 @@ const NV2ABlockInfo blocktable[NV_NUM_BLOCKS] = {
     /* NV_PRAMIN = 19 */
     { .name = NULL },
     /* NV_USER = 20 */
-    STUB_ENTRY(USER,          0x800000, 0x800000),
+    ENTRY(USER,     user,     0x800000, 0x800000),
 };
 
 #undef ENTRY
@@ -747,6 +861,37 @@ void nv2a_mmio_write(NV2AState *d, hwaddr addr, uint64_t val, unsigned int size)
     }
     NV2A_DPRINTF("MMIO write unmapped: addr=0x%llx val=0x%llx\n",
                  (unsigned long long)addr, (unsigned long long)val);
+}
+
+/* ============================================================
+ * Vertical blank
+ *
+ * On real hardware the CRTC raises this ~60 times a second on its own. Here
+ * nothing did, and that left the two halves of interrupt handling telling a
+ * title different stories: the kernel's delivery thread invoked a registered
+ * ISR as though hardware had fired, while these registers still said nothing
+ * was pending. A correctly written ISR checks the hardware and returns "not
+ * mine" -- Breakdown's does exactly that (sub_001C6890 tests PMC_INTR_EN_0
+ * then PMC_INTR_0 & PCRTC), so its vblank -> KeInsertQueueDpc -> per-frame
+ * work chain could never fire no matter how faithfully the ISR was called.
+ *
+ * Raising the pending bits here is the missing half. The ISR acknowledges by
+ * writing INTR_0 (write-1-to-clear), which is why nothing needs to clear them
+ * on this side. Whoever calls this owns the rate; the caller is simulating
+ * the CRTC.
+ * ============================================================ */
+
+void nv2a_raise_vblank(void)
+{
+    NV2AState *d = g_nv2a;
+    if (!d) return;
+
+    /* Only the PCRTC-level bit is ours to set. nv2a_update_irq derives
+     * PMC_INTR_0's PCRTC bit from (pcrtc.pending & pcrtc.enabled), so setting
+     * it here as well would both duplicate that and bypass the enable gate --
+     * a title that has not enabled vblank must not see one pending. */
+    d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
+    nv2a_update_irq(d);
 }
 
 /* ============================================================

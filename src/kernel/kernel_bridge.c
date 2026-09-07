@@ -1009,11 +1009,38 @@ static void bridge_KeDelayExecutionThread(void)
     uint32_t wait_mode    = STACK_ARG(0);
     uint32_t alertable    = STACK_ARG(1);
     uint32_t interval_ptr = STACK_ARG(2);
+    PLARGE_INTEGER interval = (PLARGE_INTEGER)XBOX_TO_NATIVE(interval_ptr);
 
+    /* DIAGNOSTIC (2026-09-06): the title sometimes passes an Interval that is
+     * not a mapped guest address (~0xFFFD8F00 observed). xbox_nt_timeout_to_ms
+     * guards NULL but not validity, so it dereferences it and takes the whole
+     * process down -- about 2 runs in 5. Report the value and the guest caller
+     * so the ORIGIN can be found; the stdcall arg size for this ordinal is
+     * correct (12 bytes, 3 args), so this is a genuinely bad pointer rather
+     * than the esp-walking class of bug that bit ordinal 47.
+     *
+     * Substituting a ZERO interval, not NULL: NULL means "wait forever" in
+     * this API, so passing it would trade a crash for a parked thread. Zero
+     * means "do not wait", which cannot hang the caller. This is a stopgap to
+     * collect data, NOT a decision about what a bad Interval should mean. */
+    if (interval_ptr && !xbox_IsXboxAddress(interval_ptr)) {
+        static LARGE_INTEGER no_wait;   /* QuadPart == 0 -> 0 ms */
+        static int warned;
+
+        if (warned < 8) {
+            warned++;
+            fprintf(stderr, "  [KERNEL] KeDelayExecutionThread: Interval "
+                    "0x%08X is not a mapped guest address -- skipping the wait "
+                    "(guest caller 0x%08X, wait_mode=%u alertable=%u)\n",
+                    interval_ptr, g_esp ? BRIDGE_MEM32(g_esp - 4) : 0,
+                    wait_mode, alertable);
+            fflush(stderr);
+        }
+        interval = &no_wait;
+    }
 
     g_eax = (uint32_t)xbox_KeDelayExecutionThread(
-        (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
-        XBOX_TO_NATIVE(interval_ptr));
+        (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable, interval);
 }
 
 /* ── KeBugCheck (ordinal 95) / KeBugCheckEx (96) ─────────── */
@@ -1022,13 +1049,57 @@ static void bridge_KeDelayExecutionThread(void)
  * carried on into whatever the bug check was there to prevent, so the real
  * failure surfaced later somewhere unrelated. Report the code and stop
  * pretending the call succeeded.
+ *
+ * These must NOT return. Real KeBugCheck halts the machine, so a compiler
+ * treats everything after the call site as unreachable and freely places
+ * inter-function `int3` padding there. Returning walks the guest straight
+ * into that padding, which surfaces as a bare "wine: Unhandled illegal
+ * instruction" in a function with no relationship to the actual fault --
+ * exactly the false trail that cost HeroLab task 1c4b9a06 a session.
  */
+static void bridge_bugcheck_halt(void)
+{
+    fprintf(stderr, "  [KERNEL] bug check raised at guest VA 0x%08X -- halting "
+            "(real KeBugCheck never returns)\n",
+            g_esp ? BRIDGE_MEM32(g_esp - 4) : 0);
+
+    /* Walk the GUEST stack for plausible code addresses.
+     *
+     * The immediate caller alone is not enough here: this title's bug check
+     * comes from sub_001B0071, which is the CRT's doexit() -- so the title is
+     * deliberately EXITING, and the question is always "what decided to?".
+     * That answer is further up the chain. Filtering to the executable VA
+     * range turns the raw stack into a usable approximation of it.
+     *
+     * Approximate on purpose: guest stack slots holding data that happens to
+     * look like a code address will appear too. Read the list as candidates,
+     * not as a call stack. */
+    if (g_esp) {
+        int printed = 0;
+        uint32_t i;
+
+        fprintf(stderr, "  Guest stack, code-shaped values (candidates, "
+                        "innermost first):\n");
+        for (i = 0; i < 128 && printed < 12; i++) {
+            uint32_t v = BRIDGE_MEM32(g_esp + i * 4);
+            if (v >= 0x00011000u && v < 0x00210000u) {
+                fprintf(stderr, "    [%3u] 0x%08X\n", i, v);
+                printed++;
+            }
+        }
+        if (!printed)
+            fprintf(stderr, "    (none)\n");
+    }
+
+    fflush(stderr);
+    ExitProcess(1);
+}
+
 static void bridge_KeBugCheck(void)
 {
     fprintf(stderr, "  [KERNEL] *** KeBugCheck: code=0x%08X ***\n",
             STACK_ARG(0));
-    fflush(stderr);
-    g_eax = 0;
+    bridge_bugcheck_halt();
 }
 
 static void bridge_KeBugCheckEx(void)
@@ -1037,8 +1108,7 @@ static void bridge_KeBugCheckEx(void)
             "(0x%08X, 0x%08X, 0x%08X, 0x%08X) ***\n",
             STACK_ARG(0), STACK_ARG(1), STACK_ARG(2),
             STACK_ARG(3), STACK_ARG(4));
-    fflush(stderr);
-    g_eax = 0;
+    bridge_bugcheck_halt();
 }
 
 /* ── NtYieldExecution (ordinal 238) ──────────────────────── */
@@ -1153,20 +1223,80 @@ static void bridge_KeInitializeDpc(void)
     g_eax = 0;
 }
 
+/* ── KeInsertQueueDpc (ordinal 119) ───────────────────────
+ * BOOLEAN KeInsertQueueDpc(PKDPC Dpc, PVOID SystemArgument1, PVOID SystemArgument2)
+ *
+ * Real hardware queues the DPC to run later at DISPATCH_LEVEL. This used to
+ * be completely unbridged (silent "no bridge for ordinal 119" no-op) -- any
+ * title whose ISR depends on its DPC actually running got nothing past the
+ * ISR itself (see the interrupt-delivery thread above, and HeroLab task
+ * 1c4b9a06 for how this was found: a title's ISR called this every simulated
+ * vblank and the DeferredRoutine that was supposed to drive per-frame work
+ * never ran).
+ *
+ * Runs the DeferredRoutine synchronously, immediately, on the calling
+ * thread -- matches this bridge's existing preference for running a
+ * callback rather than modeling real scheduling (see
+ * bridge_PsCreateSystemThreadEx's own "must run synchronously" comment).
+ * The calling thread already has a valid guest stack (the interrupt-delivery
+ * thread above, or whatever thread is already running recompiled code if a
+ * title queues its own DPC outside interrupt context), so this nests an
+ * ordinary guest call rather than needing a stack of its own.
+ */
+static void bridge_KeInsertQueueDpc(void)
+{
+    uint32_t dpc_va   = STACK_ARG(0);
+    uint32_t sysarg1  = STACK_ARG(1);
+    uint32_t sysarg2  = STACK_ARG(2);
+    uint32_t routine  = BRIDGE_MEM32(dpc_va + 12);
+    uint32_t context  = BRIDGE_MEM32(dpc_va + 16);
+    recomp_func_t fn;
+
+    fn = recomp_lookup_manual(routine);
+    if (!fn) fn = recomp_lookup(routine);
+    if (!fn) {
+        fprintf(stderr, "  [KERNEL] KeInsertQueueDpc: DPC 0x%08X routine 0x%08X "
+                "not resolvable\n", dpc_va, routine);
+        g_eax = 0;
+        return;
+    }
+
+    /* VOID DeferredRoutine(PKDPC Dpc, PVOID DeferredContext,
+     *                       PVOID SystemArgument1, PVOID SystemArgument2);
+     * stdcall, so the callee's own "ret 16" restores g_esp fully. */
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = sysarg2;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = sysarg1;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;  /* dummy return address */
+    fn();
+
+    g_eax = 1;  /* TRUE: approximation -- we don't track already-queued state */
+}
+
 /* ── NV2A interrupt plumbing (ordinals 44, 98, 109) ───────
  *
  * The D3D8 library linked into a title installs an ISR for the GPU's vblank /
- * command-completion interrupt. There is no NV2A here and nothing ever raises
- * that interrupt, so these exist to let initialisation complete rather than to
- * deliver anything.
+ * command-completion interrupt. There is no NV2A here, so nothing raises
+ * that interrupt on its own -- KeConnectInterrupt below starts a dedicated
+ * delivery thread that actually invokes the registered ServiceRoutine
+ * periodically instead, simulating hardware raising it (see the delivery
+ * thread further down).
  *
- * KeConnectInterrupt reports success: reporting failure sends Halo's
- * rasterizer down an error path during preinitialize, and the goal is to get
- * past setup, not to pretend the hardware is broken.
+ * KeConnectInterrupt reports success unconditionally: reporting failure
+ * sends Halo's rasterizer down an error path during preinitialize, and the
+ * goal is to get past setup either way.
  *
- * ponytail: no interrupt is ever delivered. Code that *waits* on the ISR
- * rather than polling will hang here, and the fix for that is to bridge the
- * D3D8 entry point that owns the wait, not to synthesise NV2A interrupts.
+ * HISTORY: this used to be a pure no-op ("no interrupt is ever delivered"),
+ * which is correct for a title that only polls its status registers but
+ * left any title whose per-frame work is re-armed exclusively through this
+ * ISR -> KeInsertQueueDpc chain with NOTHING ever re-driving it after the
+ * first frame. Confirmed on one such title (HeroLab project "Xbox
+ * Recompiler", Breakdown task 1c4b9a06) via live caller-capture
+ * instrumentation, not guessed: KeConnectInterrupt was reached and reported
+ * success, the registered ISR's own KeInsertQueueDpc call was itself a
+ * silent no-op (see bridge_KeInsertQueueDpc below, previously unbridged),
+ * and nothing downstream of frame 1 ever ran again.
  */
 
 /* ULONG HalGetInterruptVector(ULONG BusInterruptLevel, PKIRQL Irql) */
@@ -1199,10 +1329,113 @@ static void bridge_KeInitializeInterrupt(void)
     g_eax = 0;
 }
 
+/* Delivery rate for the simulated interrupt below. 60 Hz is the NTSC vblank
+ * rate KeConnectInterrupt's real hardware counterpart would be tied to;
+ * measured ground truth on one title (xemu, real Xbox) put its actual
+ * observed dispatch rate at ~76/sec, so this is a reasonable approximation,
+ * not a verified-correct rate for every title -- revisit per-title if a
+ * title turns out to be timing-sensitive to the exact vblank rate. */
+#define INTERRUPT_DELIVERY_HZ 60
+
+/* A title can connect several interrupts (measured on one title: GPU vblank,
+ * plus separate audio/network-shaped ones at other vectors) -- one delivery
+ * thread per connected interrupt, up to this many. Not a general PIC (no
+ * priority, no masking, no real IRQL) -- just "make every registered
+ * ServiceRoutine actually run periodically," which is the piece that was
+ * missing entirely. */
+#define MAX_DELIVERED_INTERRUPTS 8
+static uint32_t g_connected_interrupts[MAX_DELIVERED_INTERRUPTS];
+static volatile LONG g_connected_interrupt_count = 0;
+
+static DWORD WINAPI interrupt_delivery_thread(LPVOID param)
+{
+    int slot;
+    uint32_t stack_top, routine, context, interrupt_va;
+
+    interrupt_va = (uint32_t)(uintptr_t)param;
+
+    slot = xbox_worker_stack_alloc();
+    if (slot < 0) {
+        fprintf(stderr, "  [KERNEL] interrupt delivery: no worker stack slice "
+                "available for interrupt 0x%08X, not started\n", interrupt_va);
+        return 0;
+    }
+    stack_top = XBOX_WORKER_STACK_TOP(slot);
+    /* Genuinely new native thread: RECOMP_TLS (g_esp etc.) starts zeroed and
+     * the fake TIB is per-thread too. Same one-time setup bridge_thread_main
+     * does for a spawned game thread. */
+    xbox_init_fake_tib();
+
+    routine = BRIDGE_MEM32(interrupt_va + 0);
+    context = BRIDGE_MEM32(interrupt_va + 4);
+
+    fprintf(stderr, "  [KERNEL] interrupt delivery: armed on interrupt 0x%08X, "
+            "routine=0x%08X context=0x%08X, %d Hz\n",
+            interrupt_va, routine, context, INTERRUPT_DELIVERY_HZ);
+    fflush(stderr);
+
+    for (;;) {
+        recomp_func_t fn;
+
+        Sleep(1000 / INTERRUPT_DELIVERY_HZ);
+
+        fn = recomp_lookup_manual(routine);
+        if (!fn) fn = recomp_lookup(routine);
+        if (!fn) continue;  /* not (yet) resolvable -- try again next tick */
+
+        /* BOOLEAN ServiceRoutine(PKINTERRUPT Interrupt, PVOID ServiceContext);
+         * stdcall, so the callee's own "ret 8" restores g_esp fully -- no
+         * cleanup needed here after fn() returns. */
+        g_esp = stack_top;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = interrupt_va;
+        g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;  /* dummy return address */
+        g_seh_ebp = g_esp;
+        fn();
+    }
+}
+
 /* BOOLEAN KeConnectInterrupt(PKINTERRUPT Interrupt) */
 static void bridge_KeConnectInterrupt(void)
 {
-    g_eax = 1;  /* connected -- see the note above */
+    uint32_t interrupt_va = STACK_ARG(0);
+    uint32_t routine = BRIDGE_MEM32(interrupt_va + 0);
+    recomp_func_t fn = recomp_lookup_manual(routine);
+    if (!fn) fn = recomp_lookup(routine);
+
+    /* Only deliver interrupts whose ServiceRoutine resolves to real,
+     * lifted code. One title measured connects several interrupts and at
+     * least one had a routine address that resolved to nothing (one past
+     * the end of an unrelated function, i.e. not a real entry point) --
+     * calling into that blind is how this crashed the first time this was
+     * tried. Reporting connected either way matches real hardware always
+     * connecting successfully; we just don't simulate hardware raising an
+     * interrupt whose handler we can't identify. */
+    if (fn) {
+        LONG idx = InterlockedIncrement(&g_connected_interrupt_count) - 1;
+        if (idx < MAX_DELIVERED_INTERRUPTS) {
+            HANDLE h;
+            g_connected_interrupts[idx] = interrupt_va;
+            h = CreateThread(NULL, 0, interrupt_delivery_thread,
+                              (LPVOID)(uintptr_t)interrupt_va, 0, NULL);
+            if (h) {
+                CloseHandle(h);
+            } else {
+                fprintf(stderr, "  [KERNEL] KeConnectInterrupt: failed to start "
+                        "delivery thread for interrupt 0x%08X\n", interrupt_va);
+            }
+        } else {
+            fprintf(stderr, "  [KERNEL] KeConnectInterrupt: interrupt 0x%08X exceeds "
+                    "MAX_DELIVERED_INTERRUPTS (%d), not delivered\n",
+                    interrupt_va, MAX_DELIVERED_INTERRUPTS);
+        }
+    } else {
+        fprintf(stderr, "  [KERNEL] KeConnectInterrupt: interrupt 0x%08X routine "
+                "0x%08X does not resolve to a function, not delivered\n",
+                interrupt_va, routine);
+    }
+
+    g_eax = 1;  /* connected */
 }
 
 /* ── MmClaimGpuInstanceMemory (ordinal 168) ───────────────
@@ -1358,6 +1591,36 @@ static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
 
     memcpy(path, (const char*)XBOX_TO_NATIVE(buf_va), len);
     path[len] = '\0';
+
+    /* A path built from corrupted memory arrives here as non-printable bytes.
+     * Dump the ANSI_STRING that produced it -- Length, MaximumLength, the
+     * buffer VA and its first bytes -- so "is the Length wrong or is the
+     * buffer contents wrong" is answerable without guessing. Bounded, and it
+     * only fires on a path that is already broken. */
+    {
+        uint16_t i;
+        for (i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)path[i];
+            if (c < 0x20 || c > 0x7E) {
+                static int dumped;
+                if (dumped++ < 6) {
+                    uint16_t maxlen = BRIDGE_MEM16(ansi_str_va + 2);
+                    const unsigned char *raw =
+                        (const unsigned char *)XBOX_TO_NATIVE(buf_va);
+                    uint16_t n = len < 32 ? len : 32, k;
+                    fprintf(stderr,
+                            "  [PATH] CORRUPT: ANSI_STRING@0x%08X Length=%u "
+                            "MaximumLength=%u Buffer=0x%08X bad byte at %u\n"
+                            "         raw:",
+                            ansi_str_va, len, maxlen, buf_va, i);
+                    for (k = 0; k < n; k++) fprintf(stderr, " %02X", raw[k]);
+                    fprintf(stderr, "\n");
+                    fflush(stderr);
+                }
+                break;
+            }
+        }
+    }
     return path;
 }
 
@@ -2137,6 +2400,23 @@ static void bridge_AvSendTVEncoderOption(void)
     g_eax = 0;
 }
 
+/* ── HalReadWritePCISpace (ordinal 46, 6 args)
+ * Writes bytes at a caller-supplied address only, so the marshalling is the
+ * safe kind: Buffer is the one pointer and XBOX_TO_NATIVE maps it. */
+static void bridge_HalReadWritePCISpace(void)
+{
+    fprintf(stderr, "  [KERNEL] HalReadWritePCISpace bus=%u slot=%u reg=0x%X len=%u %s"
+            " -- called from guest VA 0x%08X\n",
+            STACK_ARG(0), STACK_ARG(1), STACK_ARG(2), STACK_ARG(4),
+            STACK_ARG(5) ? "WRITE" : "READ",
+            g_esp ? BRIDGE_MEM32(g_esp - 4) : 0);
+    fflush(stderr);
+    xbox_HalReadWritePCISpace(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2),
+                              XBOX_TO_NATIVE(STACK_ARG(3)),
+                              STACK_ARG(4), (BOOLEAN)STACK_ARG(5));
+    g_eax = 0;
+}
+
 /* ── ExFreePool (ordinal 17, 1 arg)
  * Was resolving to a DATA address before the kernel_data_va_for_ordinal fix,
  * so the title was calling into kernel data. Even after that it was an
@@ -2643,6 +2923,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* DPC / Timer init */
     case 107: return bridge_KeInitializeDpc;
     case 113: return bridge_KeInitializeTimerEx;
+    case 119: return bridge_KeInsertQueueDpc;
 
     /* NV2A interrupt plumbing */
     case  44: return bridge_HalGetInterruptVector;
@@ -2725,9 +3006,43 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
      * Left in place rather than deleted: the wrappers are correct as argument
      * marshalling, and re-deriving them is the easy half of the work.
      */
-    /* case   1: bridge_AvGetSavedDataAddress */
-    /* case   2: bridge_AvSendTVEncoderOption */
+    /* Av 1/2 clear the memory-model bar the note above sets. AvSetSavedDataAddress
+     * (4, already bridged) stores a guest VA and AvGetSavedDataAddress hands the
+     * same value back, so nothing crosses the guest/host pointer boundary; the
+     * title was storing an address and reading back 0. AvSendTVEncoderOption only
+     * writes through the caller's Result pointer, which XBOX_TO_NATIVE maps.
+     *
+     * Unbridged, option 0x0A (QUERY_AVPACK) never wrote Result at all, so the
+     * title read "no AV pack connected" and skipped display setup entirely --
+     * AvSetDisplayMode (3) is bridged but was never once called in a 200s run. */
+    /* DELIBERATELY UNREGISTERED FOR NOW -- these two are correct, and that is
+     * exactly the problem. Bridged, AvSendTVEncoderOption answers the
+     * QUERY_AVPACK probe truthfully, the title stops believing no display is
+     * connected, and it walks into a display-init path this engine cannot yet
+     * finish: nothing executes the push buffer, there is no window/swapchain
+     * anywhere in the build, and the XMV codec is ~1,558 stubbed MMX
+     * instructions. Measured 2026-09-06 -- bridged, boot stops after
+     * dsstdfx.bin with 0 dispatch calls; unbridged, the title skips video and
+     * reaches D:\romdata\movie\namcologo.xmv with 9.4M dispatch calls in 60s.
+     *
+     * Re-register both as soon as the display path can actually complete;
+     * leaving the kernel lying about the AV pack is a stopgap, not the
+     * intended end state. The bridge functions above are written and correct.
+     * HeroLab: Xbox Recompiler project, tasks b7d706a3 / a7c305d1. */
+    /* Still unregistered, but the reason has moved on -- retested 2026-09-06
+     * with the NV2A backend enabled and healthy (PFIFO queue-empty bits and
+     * the general ALU decoder in place, 3.7M GPU accesses, zero decode
+     * failures). Bridged, the title STILL stops after dsstdfx.bin, and the
+     * next path it builds is garbage: `D:\<binary junk>` instead of a
+     * filename. So the display path's blocker is now a memory-corruption bug
+     * producing a bad string, NOT the GPU model being incapable -- a
+     * different and more tractable problem than when these were first
+     * disabled. Chase that, then re-register both; they are correct and the
+     * kernel should not be claiming there is no AV pack. */
+    /* case   1: return bridge_AvGetSavedDataAddress; */
+    /* case   2: return bridge_AvSendTVEncoderOption; */
     case  17: return bridge_ExFreePool;   /* guest-heap free -- see note above */
+    case  46: return bridge_HalReadWritePCISpace;  /* GPU discovery -- see kernel_hal.c */
     /* case  65: bridge_IoCreateDevice */
     /* case  97: bridge_KeCancelTimer */
     /* case 100: bridge_KeDisconnectInterrupt */
@@ -2853,8 +3168,9 @@ static void kernel_thunk_dispatch(void)
         static uint8_t warned[XBOX_KERNEL_THUNK_TABLE_SIZE];
         if (!warned[slot]) {
             warned[slot] = 1;
-            fprintf(stderr, "  [KERNEL] WARNING: no bridge for ordinal %u (slot %d), returning 0\n",
-                    ordinal, slot);
+            fprintf(stderr, "  [KERNEL] WARNING: no bridge for ordinal %u (slot %d), "
+                    "returning 0 -- called from guest VA 0x%08X\n",
+                    ordinal, slot, g_esp ? BRIDGE_MEM32(g_esp - 4) : 0);
             fflush(stderr);
         }
         g_eax = 0;
