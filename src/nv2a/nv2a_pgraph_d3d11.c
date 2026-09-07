@@ -503,15 +503,18 @@ static void vsh_constant_write(uint32_t method, uint32_t param)
              * lets the two be read side by side (which c[] registers a
              * shader reads, and what values actually landed there) instead
              * of guessing at a wrong transform from pixel output alone.
-             * Capped so it does not become the same 336k-line flood the
-             * bug report measured. */
+             * Deduped per-register (first value seen) rather than capped
+             * at N total writes: a handful of "hot" registers (object
+             * transforms) get rewritten every draw and would otherwise
+             * crowd out the ones only ever set once (e.g. a viewport-style
+             * scale/offset pair) long before this ever got to show them. */
             if (getenv("XBOXRECOMP_VSHDUMP")) {
-                static int shown = 0;
-                if (shown < 64) {
+                static int shown_reg[NV2A_VS_MAX_CONSTANTS];
+                if (!shown_reg[api_reg]) {
                     fprintf(stderr, "[PGRAPH-D3D11] VSH const c[%d] (hw %d) = "
                             "(%.4f, %.4f, %.4f, %.4f)\n",
                             api_reg, g_pg.vsh.const_load, f4[0], f4[1], f4[2], f4[3]);
-                    shown++;
+                    shown_reg[api_reg] = 1;
                 }
             }
         } else {
@@ -1083,7 +1086,23 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         /* 1=flat, 2=gouraud — we always use gouraud */
         return 1;
 
-    /* ── Viewport ── */
+    /* ── Viewport ──
+     * On real hardware these two methods don't just update pgraph state --
+     * they write DIRECTLY into fixed slots of the SAME constant register
+     * file a vertex program reads via c[] (see xemu pgraph.c's own
+     * SET_VIEWPORT_OFFSET/_SCALE handlers: `pg->vsh_constants[NV_IGRAPH_
+     * XF_XFCTX_VPOFF/_VPSCL][slot] = parameter`), bypassing the generic
+     * SET_TRANSFORM_CONSTANT load-pointer path entirely. Breakdown's own
+     * compiled vertex program reads c[NV_IGRAPH_XF_XFCTX_VPSCL] (=c[58])
+     * and c[NV_IGRAPH_XF_XFCTX_VPOFF] (=c[59]) directly to do exactly the
+     * `screen = ndc*scale + offset` transform a title doing this in
+     * fixed-function would get automatically -- confirmed via
+     * XBOXRECOMP_VSHDUMP: those two registers are never touched by any
+     * SET_TRANSFORM_CONSTANT write in this title at all, so without this
+     * mirror they silently stay at their zero-init default and every
+     * vertex collapses to (0,0,0,1) even though the shader itself is
+     * decoded and translated correctly. Mirroring into d3d8_vsh's
+     * constant array here reproduces that hardware behavior. */
     case NV097_SET_VIEWPORT_OFFSET:
     case NV097_SET_VIEWPORT_OFFSET + 4:
     case NV097_SET_VIEWPORT_OFFSET + 8:
@@ -1091,6 +1110,12 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
     {
         int idx = (method - NV097_SET_VIEWPORT_OFFSET) / 4;
         g_pg.vp_offset[idx] = u2f(param);
+        d3d8_vsh_set_constant(NV_IGRAPH_XF_XFCTX_VPOFF, g_pg.vp_offset, 1);
+        if (idx == 3 && getenv("XBOXRECOMP_VSHDUMP")) {
+            fprintf(stderr, "[PGRAPH-D3D11] VPOFF -> c[%d] = (%.4f, %.4f, %.4f, %.4f)\n",
+                    NV_IGRAPH_XF_XFCTX_VPOFF, g_pg.vp_offset[0], g_pg.vp_offset[1],
+                    g_pg.vp_offset[2], g_pg.vp_offset[3]);
+        }
         return 1;
     }
 
@@ -1101,6 +1126,12 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
     {
         int idx = (method - NV097_SET_VIEWPORT_SCALE) / 4;
         g_pg.vp_scale[idx] = u2f(param);
+        d3d8_vsh_set_constant(NV_IGRAPH_XF_XFCTX_VPSCL, g_pg.vp_scale, 1);
+        if (idx == 3 && getenv("XBOXRECOMP_VSHDUMP")) {
+            fprintf(stderr, "[PGRAPH-D3D11] VPSCL -> c[%d] = (%.4f, %.4f, %.4f, %.4f)\n",
+                    NV_IGRAPH_XF_XFCTX_VPSCL, g_pg.vp_scale[0], g_pg.vp_scale[1],
+                    g_pg.vp_scale[2], g_pg.vp_scale[3]);
+        }
         return 1;
     }
 

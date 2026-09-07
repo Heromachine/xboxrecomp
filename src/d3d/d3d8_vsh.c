@@ -31,171 +31,68 @@
 /* ================================================================
  * NV2A Instruction Bit Field Extraction
  *
- * Each instruction is 128 bits stored as 4 DWORDs (word[0..3]).
- * The following macros extract individual fields.
+ * Ported field-for-field from xemu's reference decoder (subprojects/
+ * nv2a_vsh_cpu/src/nv2a_vsh_disassembler.c) -- see the field-by-field
+ * documentation in d3d8_vsh.h above NV2AVshDstRegType for the full table
+ * and why the old flat-128-bit model here was wrong in two independent
+ * ways (word[0] unused, and operand fields scattered non-contiguously
+ * across words 1-3), not just a single off-by-N offset. Do not restate
+ * these positions from memory -- if a field is ever in doubt, re-open
+ * that file instead.
  *
- * Bit layout follows the envytools / xemu conventions:
- *
- * word[0] bits:
- *   [3:0]   = (unused / type marker)
- *   [24:21] = MAC opcode
- *   [28:25] = ILU opcode
- *   [20:13] = Constant register index
- *   [12:9]  = Input register index (v0-v15)
- *   [8]     = Source A negate
- *   [7:6]   = Source A register type
- *   [5:2]   = Source A temp register index (high bits)
- *
- * word[1] bits:
- *   [31:26] = Source A temp reg index (low bit) + swizzle X,Y
- *   [25:24] = Source A swizzle Z
- *   [23:22] = Source A swizzle W
- *   [21]    = Source B negate
- *   [20:19] = Source B register type
- *   [18:15] = Source B temp register index
- *   [14:13] = Source B swizzle X
- *   [12:11] = Source B swizzle Y
- *   [10:9]  = Source B swizzle Z
- *   [8:7]   = Source B swizzle W
- *   [6]     = Source C negate
- *   [5:4]   = Source C register type
- *   [3:0]   = Source C temp register index (high bits)
- *
- * word[2] bits:
- *   [31:28] = Source C temp reg index (low bits)
- *   [27:26] = Source C swizzle X
- *   [25:24] = Source C swizzle Y
- *   [23:22] = Source C swizzle Z
- *   [21:20] = Source C swizzle W
- *   [19:16] = MAC dest temp register index
- *   [15:12] = MAC dest write mask
- *   [11:3]  = MAC dest output register + mux
- *   [2:0]   = ILU dest fields (high bits)
- *
- * word[3] bits:
- *   [31:28] = ILU dest temp register index
- *   [27:24] = ILU dest write mask
- *   [23:14] = ILU dest output register + mux
- *   [13]    = Relative addressing flag (a0.x)
- *   ...
- *   [0]     = Final instruction flag
- *
- * NOTE: The exact bit positions below are derived from the xemu
- * NV2A vertex shader decoder. Different references may number
- * bits differently (MSB-first vs LSB-first within the 128-bit
- * word). We use the convention where word[0] bit 0 is the LSB.
+ * `EXTRACT(insn, word, start, size)` mirrors xemu's own macro exactly:
+ * word `word` of the 4-DWORD instruction, bits [start, start+size).
  * ================================================================ */
 
-/*
- * We use a helper to extract arbitrary bit fields from the 128-bit
- * instruction. Bits are numbered 0..127 where bit 0 is word[0] bit 0.
- */
-static inline uint32_t vsh_extract(const DWORD *insn, int start, int count)
+#define VSH_EXTRACT(insn, word, start, size) \
+    (((insn)[(word)] >> (start)) & ((uint32_t)(1u << (size)) - 1u))
+
+/* Word 1 */
+static inline uint32_t vsh_a_swizzle_w(const DWORD *t) { return VSH_EXTRACT(t, 1, 0, 2); }
+static inline uint32_t vsh_a_swizzle_z(const DWORD *t) { return VSH_EXTRACT(t, 1, 2, 2); }
+static inline uint32_t vsh_a_swizzle_y(const DWORD *t) { return VSH_EXTRACT(t, 1, 4, 2); }
+static inline uint32_t vsh_a_swizzle_x(const DWORD *t) { return VSH_EXTRACT(t, 1, 6, 2); }
+static inline uint32_t vsh_a_negate(const DWORD *t)    { return VSH_EXTRACT(t, 1, 8, 1); }
+static inline uint32_t vsh_input_reg(const DWORD *t)   { return VSH_EXTRACT(t, 1, 9, 4); }
+static inline uint32_t vsh_const_reg(const DWORD *t)   { return VSH_EXTRACT(t, 1, 13, 8); }
+static inline uint32_t vsh_mac_opcode(const DWORD *t)  { return VSH_EXTRACT(t, 1, 21, 4); }
+static inline uint32_t vsh_ilu_opcode(const DWORD *t)  { return VSH_EXTRACT(t, 1, 25, 3); }
+
+/* Word 2 */
+static inline uint32_t vsh_c_temp_hi(const DWORD *t)   { return VSH_EXTRACT(t, 2, 0, 2); }
+static inline uint32_t vsh_c_swizzle_w(const DWORD *t) { return VSH_EXTRACT(t, 2, 2, 2); }
+static inline uint32_t vsh_c_swizzle_z(const DWORD *t) { return VSH_EXTRACT(t, 2, 4, 2); }
+static inline uint32_t vsh_c_swizzle_y(const DWORD *t) { return VSH_EXTRACT(t, 2, 6, 2); }
+static inline uint32_t vsh_c_swizzle_x(const DWORD *t) { return VSH_EXTRACT(t, 2, 8, 2); }
+static inline uint32_t vsh_c_negate(const DWORD *t)    { return VSH_EXTRACT(t, 2, 10, 1); }
+static inline uint32_t vsh_b_type(const DWORD *t)      { return VSH_EXTRACT(t, 2, 11, 2); }
+static inline uint32_t vsh_b_temp(const DWORD *t)      { return VSH_EXTRACT(t, 2, 13, 4); }
+static inline uint32_t vsh_b_swizzle_w(const DWORD *t) { return VSH_EXTRACT(t, 2, 17, 2); }
+static inline uint32_t vsh_b_swizzle_z(const DWORD *t) { return VSH_EXTRACT(t, 2, 19, 2); }
+static inline uint32_t vsh_b_swizzle_y(const DWORD *t) { return VSH_EXTRACT(t, 2, 21, 2); }
+static inline uint32_t vsh_b_swizzle_x(const DWORD *t) { return VSH_EXTRACT(t, 2, 23, 2); }
+static inline uint32_t vsh_b_negate(const DWORD *t)    { return VSH_EXTRACT(t, 2, 25, 1); }
+static inline uint32_t vsh_a_type(const DWORD *t)      { return VSH_EXTRACT(t, 2, 26, 2); }
+static inline uint32_t vsh_a_temp(const DWORD *t)      { return VSH_EXTRACT(t, 2, 28, 4); }
+
+/* Word 3 */
+static inline uint32_t vsh_final(const DWORD *t)            { return VSH_EXTRACT(t, 3, 0, 1); }
+static inline uint32_t vsh_rel_addr(const DWORD *t)          { return VSH_EXTRACT(t, 3, 1, 1); }
+static inline uint32_t vsh_out_is_ilu(const DWORD *t)        { return VSH_EXTRACT(t, 3, 2, 1); }
+static inline uint32_t vsh_out_index(const DWORD *t)         { return VSH_EXTRACT(t, 3, 3, 8); }
+static inline uint32_t vsh_out_is_output(const DWORD *t)     { return VSH_EXTRACT(t, 3, 11, 1); }
+static inline uint32_t vsh_out_writemask(const DWORD *t)     { return VSH_EXTRACT(t, 3, 12, 4); }
+static inline uint32_t vsh_ilu_temp_writemask(const DWORD *t) { return VSH_EXTRACT(t, 3, 16, 4); }
+static inline uint32_t vsh_out_temp_reg(const DWORD *t)      { return VSH_EXTRACT(t, 3, 20, 4); }
+static inline uint32_t vsh_mac_temp_writemask(const DWORD *t) { return VSH_EXTRACT(t, 3, 24, 4); }
+static inline uint32_t vsh_c_type(const DWORD *t)            { return VSH_EXTRACT(t, 3, 28, 2); }
+static inline uint32_t vsh_c_temp_lo(const DWORD *t)         { return VSH_EXTRACT(t, 3, 30, 2); }
+
+static inline uint32_t vsh_c_temp_reg(const DWORD *t)
 {
-    int word_idx = start / 32;
-    int bit_ofs  = start % 32;
-    uint32_t mask = (count == 32) ? 0xFFFFFFFF : ((1u << count) - 1);
-
-    if (bit_ofs + count <= 32) {
-        return (insn[word_idx] >> bit_ofs) & mask;
-    }
-    /* Field spans two words */
-    uint32_t lo = insn[word_idx] >> bit_ofs;
-    uint32_t hi = insn[word_idx + 1] << (32 - bit_ofs);
-    return (lo | hi) & mask;
+    /* Genuinely split across two words -- see the header comment. */
+    return ((vsh_c_temp_hi(t) & 3u) << 2) | (vsh_c_temp_lo(t) & 3u);
 }
-
-/*
- * NV2A instruction field positions (bit offsets within 128-bit instruction).
- *
- * These follow the xemu vsh_decode() ordering. The 128-bit instruction
- * is stored as DWORD[0] = bits [31:0], DWORD[1] = bits [63:32], etc.
- *
- * However, NV2A documentation typically describes the instruction in
- * big-endian bit order. We define fields from the xemu-style extraction
- * where the 128-bit word is treated as a single integer with bit 0 at
- * the LSB of word[0].
- */
-
-/* Word 0 fields */
-#define VSH_FIELD_ILU_OP_START      25
-#define VSH_FIELD_ILU_OP_SIZE       4
-#define VSH_FIELD_MAC_OP_START      21
-#define VSH_FIELD_MAC_OP_SIZE       4
-#define VSH_FIELD_CONST_IDX_START   13
-#define VSH_FIELD_CONST_IDX_SIZE    8
-#define VSH_FIELD_INPUT_IDX_START   9
-#define VSH_FIELD_INPUT_IDX_SIZE    4
-
-/* Source A (spans word 0 and word 1) */
-#define VSH_FIELD_SRC_A_NEG_START   8
-#define VSH_FIELD_SRC_A_NEG_SIZE    1
-#define VSH_FIELD_SRC_A_TYPE_START  6
-#define VSH_FIELD_SRC_A_TYPE_SIZE   2
-#define VSH_FIELD_SRC_A_IDX_START   2
-#define VSH_FIELD_SRC_A_IDX_SIZE    4
-#define VSH_FIELD_SRC_A_SWZ_X_START 38  /* word 1 bit 6 = abs bit 38 */
-#define VSH_FIELD_SRC_A_SWZ_X_SIZE  2
-#define VSH_FIELD_SRC_A_SWZ_Y_START 36
-#define VSH_FIELD_SRC_A_SWZ_Y_SIZE  2
-#define VSH_FIELD_SRC_A_SWZ_Z_START 34
-#define VSH_FIELD_SRC_A_SWZ_Z_SIZE  2
-#define VSH_FIELD_SRC_A_SWZ_W_START 32
-#define VSH_FIELD_SRC_A_SWZ_W_SIZE  2
-
-/* Source B (word 1) */
-#define VSH_FIELD_SRC_B_NEG_START   55
-#define VSH_FIELD_SRC_B_NEG_SIZE    1
-#define VSH_FIELD_SRC_B_TYPE_START  53
-#define VSH_FIELD_SRC_B_TYPE_SIZE   2
-#define VSH_FIELD_SRC_B_IDX_START   49
-#define VSH_FIELD_SRC_B_IDX_SIZE    4
-#define VSH_FIELD_SRC_B_SWZ_X_START 47
-#define VSH_FIELD_SRC_B_SWZ_X_SIZE  2
-#define VSH_FIELD_SRC_B_SWZ_Y_START 45
-#define VSH_FIELD_SRC_B_SWZ_Y_SIZE  2
-#define VSH_FIELD_SRC_B_SWZ_Z_START 43
-#define VSH_FIELD_SRC_B_SWZ_Z_SIZE  2
-#define VSH_FIELD_SRC_B_SWZ_W_START 41
-#define VSH_FIELD_SRC_B_SWZ_W_SIZE  2
-
-/* Source C (word 1/2 boundary) */
-#define VSH_FIELD_SRC_C_NEG_START   40
-#define VSH_FIELD_SRC_C_NEG_SIZE    1
-#define VSH_FIELD_SRC_C_TYPE_START  66
-#define VSH_FIELD_SRC_C_TYPE_SIZE   2
-#define VSH_FIELD_SRC_C_IDX_START   62
-#define VSH_FIELD_SRC_C_IDX_SIZE    4
-#define VSH_FIELD_SRC_C_SWZ_X_START 60
-#define VSH_FIELD_SRC_C_SWZ_X_SIZE  2
-#define VSH_FIELD_SRC_C_SWZ_Y_START 58
-#define VSH_FIELD_SRC_C_SWZ_Y_SIZE  2
-#define VSH_FIELD_SRC_C_SWZ_Z_START 56
-#define VSH_FIELD_SRC_C_SWZ_Z_SIZE  2
-#define VSH_FIELD_SRC_C_SWZ_W_START 68
-#define VSH_FIELD_SRC_C_SWZ_W_SIZE  2
-
-/* MAC destination (word 2) */
-#define VSH_FIELD_MAC_DST_TEMP_START   76
-#define VSH_FIELD_MAC_DST_TEMP_SIZE    4
-#define VSH_FIELD_MAC_DST_MASK_START   72
-#define VSH_FIELD_MAC_DST_MASK_SIZE    4
-#define VSH_FIELD_MAC_DST_OUT_START    70
-#define VSH_FIELD_MAC_DST_OUT_SIZE     8  /* mux field for output reg select */
-
-/* ILU destination (word 3) */
-#define VSH_FIELD_ILU_DST_TEMP_START   108
-#define VSH_FIELD_ILU_DST_TEMP_SIZE    4
-#define VSH_FIELD_ILU_DST_MASK_START   104
-#define VSH_FIELD_ILU_DST_MASK_SIZE    4
-#define VSH_FIELD_ILU_DST_OUT_START    96
-#define VSH_FIELD_ILU_DST_OUT_SIZE     8
-
-/* Misc flags */
-#define VSH_FIELD_REL_ADDR_START   109  /* relative addressing flag (a0.x) */
-#define VSH_FIELD_REL_ADDR_SIZE    1
-#define VSH_FIELD_FINAL_START      0    /* bit 0 of word 3, but stored at bit 96 abs */
-#define VSH_FIELD_FINAL_BIT        96   /* Actually stored at a specific position */
 
 /* ================================================================
  * Module State
@@ -246,50 +143,16 @@ static uint32_t fnv1a_hash(const void *data, size_t len)
  * Microcode Parser
  * ================================================================ */
 
-static void parse_source(const DWORD *insn,
-                          int neg_start, int type_start, int idx_start,
-                          int swz_x_start, int swz_y_start,
-                          int swz_z_start, int swz_w_start,
-                          int input_index, int const_index,
-                          NV2AVshSrcOperand *src)
+static NV2AVshOutputReg decode_output_mux(uint32_t out_index)
 {
-    uint32_t reg_type = vsh_extract(insn, type_start, 2);
-    uint32_t reg_idx  = vsh_extract(insn, idx_start, 4);
-
-    src->negate   = vsh_extract(insn, neg_start, 1);
-    src->swizzle.x = (uint8_t)vsh_extract(insn, swz_x_start, 2);
-    src->swizzle.y = (uint8_t)vsh_extract(insn, swz_y_start, 2);
-    src->swizzle.z = (uint8_t)vsh_extract(insn, swz_z_start, 2);
-    src->swizzle.w = (uint8_t)vsh_extract(insn, swz_w_start, 2);
-    src->rel_addr = 0;
-
-    switch (reg_type) {
-    case 0: /* Temp register */
-        src->reg_type  = NV2A_VSH_REG_TEMP;
-        src->reg_index = (int)reg_idx;
-        break;
-    case 1: /* Input register v# */
-        src->reg_type  = NV2A_VSH_REG_INPUT;
-        src->reg_index = input_index;
-        break;
-    case 2: /* Constant register c# */
-        src->reg_type  = NV2A_VSH_REG_CONST;
-        src->reg_index = const_index;
-        break;
-    default:
-        /* Treat as temp */
-        src->reg_type  = NV2A_VSH_REG_TEMP;
-        src->reg_index = 0;
-        break;
-    }
-}
-
-static NV2AVshOutputReg decode_output_mux(uint32_t mux_val)
-{
-    /* The output register mux field encodes which output register.
-     * The low nibble gives the output type. */
-    uint32_t out_idx = mux_val & 0xF;
-    switch (out_idx) {
+    /* Cross-checked directly against out_reg_name[] in xemu's
+     * hw/xbox/nv2a/pgraph/glsl/vsh-prog.c -- indices 1,2,13,14 are
+     * reserved ("???" there) and 15 is "A0.x" (an alternate a0 write path
+     * this translator does not model); only the low nibble of the 8-bit
+     * field is ever meaningful. This table was already correct before
+     * this rewrite -- the bug was in how the surrounding bits were
+     * located, not in this mapping. */
+    switch (out_index & 0xF) {
     case 0:  return NV2A_VSH_OUT_POS;
     case 3:  return NV2A_VSH_OUT_D0;
     case 4:  return NV2A_VSH_OUT_D1;
@@ -305,12 +168,186 @@ static NV2AVshOutputReg decode_output_mux(uint32_t mux_val)
     }
 }
 
+/* Decode operands A, B, C into `raw[0..2]`, unconditionally -- every
+ * field is read regardless of what either opcode will end up using.
+ * Ported directly from nv2a_vsh_disassembler.c's parse_inputs()/
+ * process_input(). Deliberately NOT yet filtered by opcode: that
+ * filtering happens in the caller (mirroring nv2a_vsh_parse_step()'s own
+ * two-phase structure) so it can be shared between MAC's up-to-3-operand
+ * selection and ILU's fixed "always C" rule without duplicating the
+ * per-operand decode itself. */
+static void parse_raw_operands(const DWORD *insn, int input_index, int const_index,
+                                NV2AVshSrcOperand raw[3])
+{
+    uint32_t rel = vsh_rel_addr(insn);  /* word 3 bit 1 -- shared a0.x flag */
+
+    /* Operand A: type/temp-reg in word 2, swizzle/negate in word 1. */
+    raw[0].reg_type = (NV2AVshRegType)vsh_a_type(insn);
+    raw[0].negate    = (int)vsh_a_negate(insn);
+    raw[0].swizzle.x = (uint8_t)vsh_a_swizzle_x(insn);
+    raw[0].swizzle.y = (uint8_t)vsh_a_swizzle_y(insn);
+    raw[0].swizzle.z = (uint8_t)vsh_a_swizzle_z(insn);
+    raw[0].swizzle.w = (uint8_t)vsh_a_swizzle_w(insn);
+
+    /* Operand B: type/temp-reg and swizzle/negate both in word 2. */
+    raw[1].reg_type = (NV2AVshRegType)vsh_b_type(insn);
+    raw[1].negate    = (int)vsh_b_negate(insn);
+    raw[1].swizzle.x = (uint8_t)vsh_b_swizzle_x(insn);
+    raw[1].swizzle.y = (uint8_t)vsh_b_swizzle_y(insn);
+    raw[1].swizzle.z = (uint8_t)vsh_b_swizzle_z(insn);
+    raw[1].swizzle.w = (uint8_t)vsh_b_swizzle_w(insn);
+
+    /* Operand C: type in word 3, temp-reg split across words 2 and 3,
+     * swizzle/negate in word 2. */
+    raw[2].reg_type = (NV2AVshRegType)vsh_c_type(insn);
+    raw[2].negate    = (int)vsh_c_negate(insn);
+    raw[2].swizzle.x = (uint8_t)vsh_c_swizzle_x(insn);
+    raw[2].swizzle.y = (uint8_t)vsh_c_swizzle_y(insn);
+    raw[2].swizzle.z = (uint8_t)vsh_c_swizzle_z(insn);
+    raw[2].swizzle.w = (uint8_t)vsh_c_swizzle_w(insn);
+
+    {
+        int s;
+        uint32_t temp_regs[3] = { vsh_a_temp(insn), vsh_b_temp(insn), vsh_c_temp_reg(insn) };
+        for (s = 0; s < 3; s++) {
+            raw[s].rel_addr = 0;
+            switch (raw[s].reg_type) {
+            case NV2A_VSH_REG_TEMP:
+                raw[s].reg_index = (int)temp_regs[s];
+                break;
+            case NV2A_VSH_REG_INPUT:
+                raw[s].reg_index = input_index;  /* shared v# for the instruction */
+                break;
+            case NV2A_VSH_REG_CONST:
+                raw[s].reg_index = const_index;  /* shared c#/context# */
+                raw[s].rel_addr  = (int)rel;
+                break;
+            case NV2A_VSH_REG_NONE:
+            default:
+                raw[s].reg_index = 0;
+                break;
+            }
+        }
+    }
+}
+
+/* Select which of the 3 raw operands each unit's opcode actually reads,
+ * mirroring nv2a_vsh_parse_step()'s two switches in
+ * nv2a_vsh_disassembler.c exactly -- including the real-hardware quirk
+ * that MAC_ADD reads A and C (raw[2]), not A and B. Leaving an unused
+ * input slot at NV2A_VSH_REG_NONE (the memset in d3d8_vsh_parse() already
+ * did this) is what keeps inputs_read from picking up phantom v#
+ * registers whenever an operand slot an opcode doesn't use happens to
+ * decode with type INPUT. */
+static void select_mac_inputs(NV2AVshInstruction *inst, const NV2AVshSrcOperand raw[3])
+{
+    if (inst->mac.opcode == NV2A_VSH_MAC_NOP)
+        return;
+
+    inst->mac.inputs[0] = raw[0];
+    switch (inst->mac.opcode) {
+    case NV2A_VSH_MAC_MOV:
+    case NV2A_VSH_MAC_ARL:
+        break;  /* A only */
+    case NV2A_VSH_MAC_MUL:
+    case NV2A_VSH_MAC_DP3:
+    case NV2A_VSH_MAC_DP4:
+    case NV2A_VSH_MAC_DPH:
+    case NV2A_VSH_MAC_DST:
+    case NV2A_VSH_MAC_MIN:
+    case NV2A_VSH_MAC_MAX:
+    case NV2A_VSH_MAC_SGE:
+    case NV2A_VSH_MAC_SLT:
+        inst->mac.inputs[1] = raw[1];
+        break;
+    case NV2A_VSH_MAC_MAD:
+        inst->mac.inputs[1] = raw[1];
+        inst->mac.inputs[2] = raw[2];
+        break;
+    case NV2A_VSH_MAC_ADD:
+        inst->mac.inputs[1] = raw[2];  /* A + C, not A + B -- see comment above */
+        break;
+    default:
+        break;
+    }
+}
+
+static void select_ilu_input(NV2AVshInstruction *inst, const NV2AVshSrcOperand raw[3])
+{
+    /* Real hardware only ever gives ILU operand C, regardless of opcode
+     * (the RCP/RCC/RSQ/EXP/LOG scalar-replicate behavior is applied at
+     * HLSL emission time by emit_scalar_swizzle(), not here). */
+    if (inst->ilu.opcode != NV2A_VSH_ILU_NOP)
+        inst->ilu.inputs[0] = raw[2];
+}
+
+/* Destination decode: a single shared temp-register write-target and a
+ * single shared "real output or constant/context write-back" target,
+ * distributed between MAC and ILU by the bits below -- NOT two
+ * independent per-unit destination-mux fields. Ported directly from
+ * nv2a_vsh_disassembler.c's parse_outputs(), including the paired-ILU-
+ * forced-to-R1 hardware quirk. */
+static void parse_destinations(NV2AVshInstruction *inst, const DWORD *insn)
+{
+    uint32_t out_temp_reg       = vsh_out_temp_reg(insn);        /* word3[20:23] */
+    uint32_t temp_writemask_mac = vsh_mac_temp_writemask(insn);  /* word3[24:27] */
+    uint32_t temp_writemask_ilu = vsh_ilu_temp_writemask(insn);  /* word3[16:19] */
+    uint32_t out_writemask      = vsh_out_writemask(insn);       /* word3[12:15] */
+
+    if (temp_writemask_mac) {
+        inst->mac.outputs[0].dst_type   = NV2A_VSH_DST_TEMP;
+        inst->mac.outputs[0].reg_index  = (int)out_temp_reg;
+        inst->mac.outputs[0].write_mask = (uint8_t)temp_writemask_mac;
+    }
+
+    if (temp_writemask_ilu) {
+        inst->ilu.outputs[0].dst_type = NV2A_VSH_DST_TEMP;
+        inst->ilu.outputs[0].reg_index = (inst->mac.opcode != NV2A_VSH_MAC_NOP)
+            ? 1                    /* paired with an active MAC op -> forced to R1 */
+            : (int)out_temp_reg;   /* solo ILU temp write -> real decoded index */
+        inst->ilu.outputs[0].write_mask = (uint8_t)temp_writemask_ilu;
+    }
+
+    if (out_writemask) {
+        NV2AVshDstOperand *dst;
+        int is_ilu = (int)vsh_out_is_ilu(insn);       /* word3[2] */
+        int is_output = (int)vsh_out_is_output(insn); /* word3[11] */
+        uint32_t out_index = vsh_out_index(insn);     /* word3[3:10] */
+
+        dst = is_ilu ? &inst->ilu.outputs[0] : &inst->mac.outputs[0];
+        if (dst->dst_type != NV2A_VSH_DST_NONE)
+            dst++;  /* slot 0 already claimed by the temp write above */
+
+        if (is_output) {
+            dst->dst_type  = NV2A_VSH_DST_OUTPUT;
+            dst->reg_index = (int)decode_output_mux(out_index);
+        } else {
+            /* Constant/context write-back -- decoded, not modeled. See
+             * emit_one_dest()'s NV2A_VSH_DST_CONST case. */
+            dst->dst_type  = NV2A_VSH_DST_CONST;
+            dst->reg_index = (int)out_index;
+        }
+        dst->write_mask = (uint8_t)out_writemask;
+    }
+
+    if (inst->mac.opcode == NV2A_VSH_MAC_ARL) {
+        /* ARL's destination is the address register, emitted specially by
+         * emit_mac_op() without going through emit_one_dest() -- recorded
+         * here mainly for consistency with real hardware (which treats
+         * this as a conflict if outputs[0] was already claimed above; we
+         * don't detect that rare conflict, we just let ARL win, since
+         * nothing currently observed relies on it). */
+        inst->mac.outputs[0].dst_type   = NV2A_VSH_DST_ADDRESS;
+        inst->mac.outputs[0].reg_index  = 0;
+        inst->mac.outputs[0].write_mask = 0;
+    }
+}
+
 void d3d8_vsh_parse(const DWORD *microcode, int num_insns,
                      NV2AVshProgram *program)
 {
     int i;
     memset(program, 0, sizeof(*program));
-    program->inputs_read = 0;
 
     if (num_insns > NV2A_VS_MAX_INSTRUCTIONS)
         num_insns = NV2A_VS_MAX_INSTRUCTIONS;
@@ -318,126 +355,58 @@ void d3d8_vsh_parse(const DWORD *microcode, int num_insns,
     for (i = 0; i < num_insns; i++) {
         const DWORD *insn = &microcode[i * 4];
         NV2AVshInstruction *inst = &program->insns[i];
+        NV2AVshSrcOperand raw[3];
+        int const_index, input_index;
 
-        /* Extract opcodes */
-        inst->mac_op = (NV2AVshMacOp)vsh_extract(insn, VSH_FIELD_MAC_OP_START,
-                                                   VSH_FIELD_MAC_OP_SIZE);
-        inst->ilu_op = (NV2AVshIluOp)vsh_extract(insn, VSH_FIELD_ILU_OP_START,
-                                                   VSH_FIELD_ILU_OP_SIZE);
+        memset(inst, 0, sizeof(*inst));
 
-        /* Shared constant and input register indices */
-        inst->const_index = (int)vsh_extract(insn, VSH_FIELD_CONST_IDX_START,
-                                              VSH_FIELD_CONST_IDX_SIZE);
-        inst->input_index = (int)vsh_extract(insn, VSH_FIELD_INPUT_IDX_START,
-                                              VSH_FIELD_INPUT_IDX_SIZE);
+        /* Opcodes -- word 1, NOT word 0 (see the header comment: this was
+         * the single bug that made every instruction decode as a NOP).
+         * ILU is 3 bits, not 4. */
+        inst->mac.opcode = (NV2AVshMacOp)vsh_mac_opcode(insn);
+        inst->ilu.opcode = (NV2AVshIluOp)vsh_ilu_opcode(insn);
 
-        /* Clamp indices to valid ranges */
-        if (inst->const_index >= NV2A_VS_MAX_CONSTANTS)
-            inst->const_index = 0;
-        if (inst->input_index >= NV2A_VS_MAX_INPUTS)
-            inst->input_index = 0;
+        /* Shared constant and input register indices (word 1). */
+        const_index = (int)vsh_const_reg(insn);
+        input_index = (int)vsh_input_reg(insn);
+        if (const_index >= NV2A_VS_MAX_CONSTANTS)
+            const_index = 0;
+        if (input_index >= NV2A_VS_MAX_INPUTS)
+            input_index = 0;
 
-        /* Parse source operands A, B, C */
-        parse_source(insn,
-                     VSH_FIELD_SRC_A_NEG_START, VSH_FIELD_SRC_A_TYPE_START,
-                     VSH_FIELD_SRC_A_IDX_START,
-                     VSH_FIELD_SRC_A_SWZ_X_START, VSH_FIELD_SRC_A_SWZ_Y_START,
-                     VSH_FIELD_SRC_A_SWZ_Z_START, VSH_FIELD_SRC_A_SWZ_W_START,
-                     inst->input_index, inst->const_index,
-                     &inst->mac_src[0]);
+        parse_raw_operands(insn, input_index, const_index, raw);
+        select_mac_inputs(inst, raw);
+        select_ilu_input(inst, raw);
+        parse_destinations(inst, insn);
 
-        parse_source(insn,
-                     VSH_FIELD_SRC_B_NEG_START, VSH_FIELD_SRC_B_TYPE_START,
-                     VSH_FIELD_SRC_B_IDX_START,
-                     VSH_FIELD_SRC_B_SWZ_X_START, VSH_FIELD_SRC_B_SWZ_Y_START,
-                     VSH_FIELD_SRC_B_SWZ_Z_START, VSH_FIELD_SRC_B_SWZ_W_START,
-                     inst->input_index, inst->const_index,
-                     &inst->mac_src[1]);
+        inst->is_final = (int)vsh_final(insn);
 
-        parse_source(insn,
-                     VSH_FIELD_SRC_C_NEG_START, VSH_FIELD_SRC_C_TYPE_START,
-                     VSH_FIELD_SRC_C_IDX_START,
-                     VSH_FIELD_SRC_C_SWZ_X_START, VSH_FIELD_SRC_C_SWZ_Y_START,
-                     VSH_FIELD_SRC_C_SWZ_Z_START, VSH_FIELD_SRC_C_SWZ_W_START,
-                     inst->input_index, inst->const_index,
-                     &inst->mac_src[2]);
-
-        /* ILU source = source C */
-        inst->ilu_src = inst->mac_src[2];
-
-        /* Check for relative addressing */
-        {
-            uint32_t rel = vsh_extract(insn, VSH_FIELD_REL_ADDR_START,
-                                        VSH_FIELD_REL_ADDR_SIZE);
-            if (rel) {
-                /* Mark const-type sources as relatively addressed */
-                int s;
-                for (s = 0; s < 3; s++) {
-                    if (inst->mac_src[s].reg_type == NV2A_VSH_REG_CONST)
-                        inst->mac_src[s].rel_addr = 1;
-                }
-                if (inst->ilu_src.reg_type == NV2A_VSH_REG_CONST)
-                    inst->ilu_src.rel_addr = 1;
-            }
-        }
-
-        /* MAC destination */
-        {
-            uint32_t temp_idx = vsh_extract(insn, VSH_FIELD_MAC_DST_TEMP_START,
-                                             VSH_FIELD_MAC_DST_TEMP_SIZE);
-            uint32_t mask     = vsh_extract(insn, VSH_FIELD_MAC_DST_MASK_START,
-                                             VSH_FIELD_MAC_DST_MASK_SIZE);
-            uint32_t out_mux  = vsh_extract(insn, VSH_FIELD_MAC_DST_OUT_START,
-                                             VSH_FIELD_MAC_DST_OUT_SIZE);
-
-            if (inst->mac_op != NV2A_VSH_MAC_NOP) {
-                inst->mac_dst.temp_reg   = (int)temp_idx;
-                inst->mac_dst.write_mask = (uint8_t)mask;
-                inst->mac_dst.output_reg = decode_output_mux(out_mux);
-            } else {
-                inst->mac_dst.temp_reg   = -1;
-                inst->mac_dst.write_mask = 0;
-                inst->mac_dst.output_reg = NV2A_VSH_OUT_NONE;
-            }
-        }
-
-        /* ILU destination */
-        {
-            uint32_t temp_idx = vsh_extract(insn, VSH_FIELD_ILU_DST_TEMP_START,
-                                             VSH_FIELD_ILU_DST_TEMP_SIZE);
-            uint32_t mask     = vsh_extract(insn, VSH_FIELD_ILU_DST_MASK_START,
-                                             VSH_FIELD_ILU_DST_MASK_SIZE);
-            uint32_t out_mux  = vsh_extract(insn, VSH_FIELD_ILU_DST_OUT_START,
-                                             VSH_FIELD_ILU_DST_OUT_SIZE);
-
-            if (inst->ilu_op != NV2A_VSH_ILU_NOP) {
-                inst->ilu_dst.temp_reg   = (int)temp_idx;
-                inst->ilu_dst.write_mask = (uint8_t)mask;
-                inst->ilu_dst.output_reg = decode_output_mux(out_mux);
-            } else {
-                inst->ilu_dst.temp_reg   = -1;
-                inst->ilu_dst.write_mask = 0;
-                inst->ilu_dst.output_reg = NV2A_VSH_OUT_NONE;
-            }
-        }
-
-        /* Final instruction flag (bit 0 of word 3) */
-        inst->is_final = (insn[3] & 1) ? 1 : 0;
-
-        /* Track input register usage */
+        /* Track v# registers actually read. Safe to trust every populated
+         * slot here (unlike blindly decoding all 3 raw operands): select_
+         * mac_inputs()/select_ilu_input() only ever populate the slots the
+         * real opcode reads, leaving the rest at NV2A_VSH_REG_NONE. */
         {
             int s;
             for (s = 0; s < 3; s++) {
-                if (inst->mac_src[s].reg_type == NV2A_VSH_REG_INPUT)
-                    program->inputs_read |= (1u << inst->mac_src[s].reg_index);
+                if (inst->mac.inputs[s].reg_type == NV2A_VSH_REG_INPUT)
+                    program->inputs_read |= (1u << inst->mac.inputs[s].reg_index);
+                if (inst->mac.inputs[s].reg_type == NV2A_VSH_REG_CONST &&
+                    (inst->mac.inputs[s].reg_index == NV2A_VS_VPSCL_REG ||
+                     inst->mac.inputs[s].reg_index == NV2A_VS_VPOFF_REG))
+                    program->uses_viewport_ctx = 1;
             }
-            if (inst->ilu_src.reg_type == NV2A_VSH_REG_INPUT)
-                program->inputs_read |= (1u << inst->ilu_src.reg_index);
+            if (inst->ilu.inputs[0].reg_type == NV2A_VSH_REG_INPUT)
+                program->inputs_read |= (1u << inst->ilu.inputs[0].reg_index);
+            if (inst->ilu.inputs[0].reg_type == NV2A_VSH_REG_CONST &&
+                (inst->ilu.inputs[0].reg_index == NV2A_VS_VPSCL_REG ||
+                 inst->ilu.inputs[0].reg_index == NV2A_VS_VPOFF_REG))
+                program->uses_viewport_ctx = 1;
         }
 
         program->length = i + 1;
 
-        /* Stop at final instruction */
+        /* Stop at final instruction -- matches real execution (see
+         * nv2a_vsh_emulator.c, which halts on step->is_final too). */
         if (inst->is_final)
             break;
     }
@@ -584,34 +553,36 @@ static const char *output_reg_name(NV2AVshOutputReg reg)
 }
 
 /**
- * Emit a destination assignment (temp and/or output register write).
+ * Emit one destination write (a single outputs[] slot).
  *
- * The NV2A can write to both a temp register and an output register
- * simultaneously from the same operation. We emit two assignments
- * when both are active.
- *
- * @param prefix  The destination: temp register name
- * @param dst     The destination operand
- * @param rhs     The HLSL expression to assign (right-hand side)
+ * Real hardware has no independent "temp dest" vs "output dest" fields --
+ * outputs[0]/outputs[1] are just "up to two writes this op makes," each
+ * independently typed (see NV2AVshDstRegType and parse_destinations() in
+ * the parser above). Called once per populated slot, each with its own
+ * write mask -- unlike the old single-shared-mask model, MAC/ILU can (and
+ * do) write a temp register and a real output with different masks in
+ * the same instruction.
  */
-static void emit_dest_assign(StrBuf *sb, const NV2AVshDstOperand *dst,
-                              const char *rhs)
+static void emit_one_dest(StrBuf *sb, const NV2AVshDstOperand *dst,
+                           const char *rhs)
 {
-    /* Write to temp register if valid */
-    if (dst->temp_reg >= 0 && dst->write_mask != 0) {
-        if (dst->temp_reg == 12)
+    if (dst->write_mask == 0)
+        return;
+
+    switch (dst->dst_type) {
+    case NV2A_VSH_DST_TEMP:
+        if (dst->reg_index == 12)
             sb_append(sb, "    R12");
         else
-            sb_append(sb, "    R%d", dst->temp_reg);
+            sb_append(sb, "    R%d", dst->reg_index);
         emit_write_mask(sb, dst->write_mask);
         sb_append(sb, " = (%s)", rhs);
         emit_write_mask(sb, dst->write_mask);
         sb_append(sb, ";\n");
-    }
+        return;
 
-    /* Write to output register if specified */
-    if (dst->output_reg != NV2A_VSH_OUT_NONE && dst->write_mask != 0) {
-        const char *name = output_reg_name(dst->output_reg);
+    case NV2A_VSH_DST_OUTPUT: {
+        const char *name = output_reg_name((NV2AVshOutputReg)dst->reg_index);
         if (name) {
             sb_append(sb, "    %s", name);
             emit_write_mask(sb, dst->write_mask);
@@ -619,7 +590,39 @@ static void emit_dest_assign(StrBuf *sb, const NV2AVshDstOperand *dst,
             emit_write_mask(sb, dst->write_mask);
             sb_append(sb, ";\n");
         }
+        return;
     }
+
+    case NV2A_VSH_DST_CONST:
+        /* Real hardware can write a computed value back into a constant/
+         * context register (used by context-switch microcode -- see
+         * NV097_SET_TRANSFORM_PROGRAM_CXT_WRITE_EN). Not modeled: this
+         * translator runs each vertex independently and stateless, and
+         * the constant buffer is read-only from the shader's own
+         * perspective -- there is nowhere a mid-shader write could go
+         * that would affect anything else, so it is decoded (for
+         * correctness of everything else in the instruction) but silently
+         * dropped here rather than guessed at. Flag if a title is ever
+         * seen actually depending on it. */
+        return;
+
+    case NV2A_VSH_DST_ADDRESS:
+        /* ARL's a0 write is emitted directly by emit_mac_op()'s ARL case,
+         * not through here -- see parse_destinations()'s comment. */
+        return;
+
+    case NV2A_VSH_DST_NONE:
+    default:
+        return;
+    }
+}
+
+/* Emit both possible destination writes for one MAC or ILU operation. */
+static void emit_dest_assign(StrBuf *sb, const NV2AVshDstOperand outputs[2],
+                              const char *rhs)
+{
+    emit_one_dest(sb, &outputs[0], rhs);
+    emit_one_dest(sb, &outputs[1], rhs);
 }
 
 /**
@@ -631,97 +634,98 @@ static void emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
     char expr_buf[512];
     sb_init(&expr, expr_buf, sizeof(expr_buf));
 
-    switch (inst->mac_op) {
+    switch (inst->mac.opcode) {
     case NV2A_VSH_MAC_NOP:
         return;
 
     case NV2A_VSH_MAC_MOV:
         /* dst = A */
-        emit_source(&expr, &inst->mac_src[0], 0);
+        emit_source(&expr, &inst->mac.inputs[0], 0);
         break;
 
     case NV2A_VSH_MAC_MUL:
         /* dst = A * B */
         sb_append(&expr, "(");
-        emit_source(&expr, &inst->mac_src[0], 0);
+        emit_source(&expr, &inst->mac.inputs[0], 0);
         sb_append(&expr, " * ");
-        emit_source(&expr, &inst->mac_src[1], 0);
+        emit_source(&expr, &inst->mac.inputs[1], 0);
         sb_append(&expr, ")");
         break;
 
     case NV2A_VSH_MAC_ADD:
-        /* dst = A + C */
+        /* dst = A + C (select_mac_inputs() already put C into inputs[1]
+         * for ADD -- see that function's comment). */
         sb_append(&expr, "(");
-        emit_source(&expr, &inst->mac_src[0], 0);
+        emit_source(&expr, &inst->mac.inputs[0], 0);
         sb_append(&expr, " + ");
-        emit_source(&expr, &inst->mac_src[2], 0);
+        emit_source(&expr, &inst->mac.inputs[1], 0);
         sb_append(&expr, ")");
         break;
 
     case NV2A_VSH_MAC_MAD:
         /* dst = A * B + C */
         sb_append(&expr, "(");
-        emit_source(&expr, &inst->mac_src[0], 0);
+        emit_source(&expr, &inst->mac.inputs[0], 0);
         sb_append(&expr, " * ");
-        emit_source(&expr, &inst->mac_src[1], 0);
+        emit_source(&expr, &inst->mac.inputs[1], 0);
         sb_append(&expr, " + ");
-        emit_source(&expr, &inst->mac_src[2], 0);
+        emit_source(&expr, &inst->mac.inputs[2], 0);
         sb_append(&expr, ")");
         break;
 
     case NV2A_VSH_MAC_DP3:
         /* dst.xyzw = dot(A.xyz, B.xyz) replicated */
         sb_append(&expr, "dot(");
-        emit_source(&expr, &inst->mac_src[0], 0);
+        emit_source(&expr, &inst->mac.inputs[0], 0);
         sb_append(&expr, ".xyz, ");
-        emit_source(&expr, &inst->mac_src[1], 0);
+        emit_source(&expr, &inst->mac.inputs[1], 0);
         sb_append(&expr, ".xyz).xxxx");
         break;
 
     case NV2A_VSH_MAC_DPH:
         /* dst = dot(float4(A.xyz, 1.0), B) */
         sb_append(&expr, "dot(float4(");
-        emit_source(&expr, &inst->mac_src[0], 0);
+        emit_source(&expr, &inst->mac.inputs[0], 0);
         sb_append(&expr, ".xyz, 1.0), ");
-        emit_source(&expr, &inst->mac_src[1], 0);
+        emit_source(&expr, &inst->mac.inputs[1], 0);
         sb_append(&expr, ").xxxx");
         break;
 
     case NV2A_VSH_MAC_DP4:
         /* dst.xyzw = dot(A, B) replicated */
         sb_append(&expr, "dot(");
-        emit_source(&expr, &inst->mac_src[0], 0);
+        emit_source(&expr, &inst->mac.inputs[0], 0);
         sb_append(&expr, ", ");
-        emit_source(&expr, &inst->mac_src[1], 0);
+        emit_source(&expr, &inst->mac.inputs[1], 0);
         sb_append(&expr, ").xxxx");
         break;
 
     case NV2A_VSH_MAC_DST:
         /* dst = float4(1.0, A.y * B.y, A.z, B.w) */
         sb_append(&expr, "float4(1.0, ");
-        emit_source(&expr, &inst->mac_src[0], 0);
+        emit_source(&expr, &inst->mac.inputs[0], 0);
         sb_append(&expr, ".y * ");
-        emit_source(&expr, &inst->mac_src[1], 0);
+        emit_source(&expr, &inst->mac.inputs[1], 0);
         sb_append(&expr, ".y, ");
-        emit_source(&expr, &inst->mac_src[0], 0);
+        emit_source(&expr, &inst->mac.inputs[0], 0);
         sb_append(&expr, ".z, ");
-        emit_source(&expr, &inst->mac_src[1], 0);
+        emit_source(&expr, &inst->mac.inputs[1], 0);
         sb_append(&expr, ".w)");
         break;
 
     case NV2A_VSH_MAC_MIN:
         sb_append(&expr, "min(");
-        emit_source(&expr, &inst->mac_src[0], 0);
+        emit_source(&expr, &inst->mac.inputs[0], 0);
         sb_append(&expr, ", ");
-        emit_source(&expr, &inst->mac_src[1], 0);
+        emit_source(&expr, &inst->mac.inputs[1], 0);
         sb_append(&expr, ")");
         break;
 
     case NV2A_VSH_MAC_MAX:
         sb_append(&expr, "max(");
-        emit_source(&expr, &inst->mac_src[0], 0);
+        emit_source(&expr, &inst->mac.inputs[0], 0);
         sb_append(&expr, ", ");
-        emit_source(&expr, &inst->mac_src[1], 0);
+        emit_source(&expr, &inst->mac.inputs[1], 0);
         sb_append(&expr, ")");
         break;
 
@@ -731,9 +735,9 @@ static void emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
          * Equivalent to: step(a, b) where a < b yields 1
          * Using explicit form for clarity: */
         sb_append(&expr, "(1.0 - step(");
-        emit_source(&expr, &inst->mac_src[1], 0);
+        emit_source(&expr, &inst->mac.inputs[1], 0);
         sb_append(&expr, ", ");
-        emit_source(&expr, &inst->mac_src[0], 0);
+        emit_source(&expr, &inst->mac.inputs[0], 0);
         sb_append(&expr, "))");
         break;
 
@@ -741,16 +745,16 @@ static void emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
         /* dst = (A >= B) ? 1.0 : 0.0
          * step(edge, x) returns 1 if x >= edge, 0 otherwise */
         sb_append(&expr, "step(");
-        emit_source(&expr, &inst->mac_src[1], 0);
+        emit_source(&expr, &inst->mac.inputs[1], 0);
         sb_append(&expr, ", ");
-        emit_source(&expr, &inst->mac_src[0], 0);
+        emit_source(&expr, &inst->mac.inputs[0], 0);
         sb_append(&expr, ")");
         break;
 
     case NV2A_VSH_MAC_ARL:
         /* a0 = floor(A.x) - special: writes address register, not a float reg */
         sb_append(sb, "    a0 = (int)floor(");
-        emit_source(sb, &inst->mac_src[0], 0);
+        emit_source(sb, &inst->mac.inputs[0], 0);
         sb_append(sb, ".x);\n");
         return; /* No destination register write */
 
@@ -758,7 +762,7 @@ static void emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
         return;
     }
 
-    emit_dest_assign(sb, &inst->mac_dst, expr_buf);
+    emit_dest_assign(sb, inst->mac.outputs, expr_buf);
 }
 
 /**
@@ -770,40 +774,40 @@ static void emit_ilu_op(StrBuf *sb, const NV2AVshInstruction *inst)
     char expr_buf[512];
     sb_init(&expr, expr_buf, sizeof(expr_buf));
 
-    switch (inst->ilu_op) {
+    switch (inst->ilu.opcode) {
     case NV2A_VSH_ILU_NOP:
         return;
 
     case NV2A_VSH_ILU_MOV:
         /* dst = C */
-        emit_source(&expr, &inst->ilu_src, 0);
+        emit_source(&expr, &inst->ilu.inputs[0], 0);
         break;
 
     case NV2A_VSH_ILU_RCP:
         /* dst = (1.0 / C.x).xxxx */
         sb_append(&expr, "(1.0 / ");
-        emit_source(&expr, &inst->ilu_src, 1);
+        emit_source(&expr, &inst->ilu.inputs[0], 1);
         sb_append(&expr, ").xxxx");
         break;
 
     case NV2A_VSH_ILU_RCC:
         /* dst = clamp(1.0/C.x, 5.42101e-36, 1.884467e+19).xxxx */
         sb_append(&expr, "clamp(1.0 / ");
-        emit_source(&expr, &inst->ilu_src, 1);
+        emit_source(&expr, &inst->ilu.inputs[0], 1);
         sb_append(&expr, ", 5.42101e-36, 1.884467e+19).xxxx");
         break;
 
     case NV2A_VSH_ILU_RSQ:
         /* dst = (1.0 / sqrt(abs(C.x))).xxxx */
         sb_append(&expr, "rsqrt(abs(");
-        emit_source(&expr, &inst->ilu_src, 1);
+        emit_source(&expr, &inst->ilu.inputs[0], 1);
         sb_append(&expr, ")).xxxx");
         break;
 
     case NV2A_VSH_ILU_EXP:
         /* dst = exp2(C.x).xxxx */
         sb_append(&expr, "exp2(");
-        emit_source(&expr, &inst->ilu_src, 1);
+        emit_source(&expr, &inst->ilu.inputs[0], 1);
         sb_append(&expr, ").xxxx");
         break;
 
@@ -811,7 +815,7 @@ static void emit_ilu_op(StrBuf *sb, const NV2AVshInstruction *inst)
         /* dst = log2(abs(C.x)).xxxx
          * Guard against log2(0) which is -inf on NV2A -> clamp to large negative */
         sb_append(&expr, "log2(max(abs(");
-        emit_source(&expr, &inst->ilu_src, 1);
+        emit_source(&expr, &inst->ilu.inputs[0], 1);
         sb_append(&expr, "), 1.175494e-38)).xxxx");
         break;
     }
@@ -826,13 +830,13 @@ static void emit_ilu_op(StrBuf *sb, const NV2AVshInstruction *inst)
          * We emit a helper call. The lit() HLSL intrinsic has similar but
          * not identical semantics, so we use an inline expansion. */
         sb_append(&expr, "float4(1.0, max(");
-        emit_source(&expr, &inst->ilu_src, 0);
+        emit_source(&expr, &inst->ilu.inputs[0], 0);
         sb_append(&expr, ".x, 0.0), (");
-        emit_source(&expr, &inst->ilu_src, 0);
+        emit_source(&expr, &inst->ilu.inputs[0], 0);
         sb_append(&expr, ".x > 0.0) ? exp2(clamp(");
-        emit_source(&expr, &inst->ilu_src, 0);
+        emit_source(&expr, &inst->ilu.inputs[0], 0);
         sb_append(&expr, ".w, -128.0, 128.0) * log2(max(");
-        emit_source(&expr, &inst->ilu_src, 0);
+        emit_source(&expr, &inst->ilu.inputs[0], 0);
         sb_append(&expr, ".y, 0.0) + 1e-30)) : 0.0, 1.0)");
         break;
     }
@@ -841,7 +845,7 @@ static void emit_ilu_op(StrBuf *sb, const NV2AVshInstruction *inst)
         return;
     }
 
-    emit_dest_assign(sb, &inst->ilu_dst, expr_buf);
+    emit_dest_assign(sb, inst->ilu.outputs, expr_buf);
 }
 
 /**
@@ -967,18 +971,45 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         sb_append(&sb, "\n    /* Instruction %d */\n", i);
 
         /* MAC operation */
-        if (inst->mac_op != NV2A_VSH_MAC_NOP)
+        if (inst->mac.opcode != NV2A_VSH_MAC_NOP)
             emit_mac_op(&sb, inst);
 
         /* ILU operation (executes in parallel with MAC on hardware;
          * in HLSL they are sequential but semantically equivalent
          * because ILU reads source C, not MAC destinations) */
-        if (inst->ilu_op != NV2A_VSH_ILU_NOP)
+        if (inst->ilu.opcode != NV2A_VSH_ILU_NOP)
             emit_ilu_op(&sb, inst);
     }
 
     /* Undo the R12 alias */
     sb_append(&sb, "\n    #undef R12\n\n");
+
+    /* Undo NV2A's device-space bake-in (see NV2A_VS_VPSCL_REG/_VPOFF_REG's
+     * comment in d3d8_vsh.h): a program following the standard compiled-
+     * vertex-shader epilogue convention leaves oPos in pixel/device space,
+     * not the pre-divide clip space D3D11's rasterizer requires from
+     * SV_POSITION. Reversing it with the exact same c[VPSCL]/c[VPOFF] the
+     * program itself used, rather than hardcoding a viewport size, keeps
+     * this correct regardless of what resolution/viewport the title
+     * programmed. Gated on uses_viewport_ctx (set during parsing) so a
+     * program that never actually reads those two registers -- and so
+     * must be producing clip-space output some other way -- doesn't get
+     * a transform applied that was never part of its own instructions.
+     * Guarded against a zero VPSCL (no SET_VIEWPORT_SCALE seen yet) so an
+     * early draw divides by nothing rather than by zero. */
+    if (program->uses_viewport_ctx) {
+        sb_append(&sb,
+            "    /* Undo NV2A's viewport bake-in -> D3D11 clip space */\n"
+            "    if (c[%d].x != 0.0 && c[%d].y != 0.0) {\n"
+            "        oPos.xy = (oPos.xy - c[%d].xy) / c[%d].xy;\n"
+            "    }\n"
+            "    if (c[%d].z != 0.0) {\n"
+            "        oPos.z = oPos.z / c[%d].z;\n"
+            "    }\n"
+            "    oPos.w = 1.0;\n\n",
+            NV2A_VS_VPSCL_REG, NV2A_VS_VPSCL_REG, NV2A_VS_VPOFF_REG, NV2A_VS_VPSCL_REG,
+            NV2A_VS_VPSCL_REG, NV2A_VS_VPSCL_REG);
+    }
 
     /* Populate output structure */
     sb_append(&sb,
@@ -1009,25 +1040,38 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
  * to the ATTR# semantics declared in the generated HLSL.
  *
  * The mapping from NV2A v# registers to vertex data depends on the
- * game's vertex stream setup. We use a simple mapping:
+ * game's vertex stream setup. We use a simple mapping, matching the real
+ * NV2A vertex attribute slot numbering exactly (NV2A_VERTEX_ATTR_* in
+ * nv2a_regs.h -- this file has no dependency on that header, since it
+ * predates and is decoupled from the pgraph method-address layer, but the
+ * numeric slot values below must still agree with it):
  *
- *   v0  -> ATTR0  -> POSITION (float4, offset 0)
+ *   v0  -> ATTR0  -> POSITION (float3)
  *   v1  -> ATTR1  -> BLENDWEIGHT (float4)
- *   v2  -> ATTR2  -> NORMAL (float4)
- *   v3  -> ATTR3  -> DIFFUSE (float4 / D3DCOLOR)
- *   v4  -> ATTR4  -> SPECULAR (float4 / D3DCOLOR)
- *   v5  -> ATTR5  -> FOG (float4)
- *   v6  -> ATTR6  -> POINTSIZE / BACKDIFFUSE (float4)
- *   v7  -> ATTR7  -> BACKSPECULAR (float4)
- *   v8  -> ATTR8  -> TEXCOORD0 (float4)
- *   v9  -> ATTR9  -> TEXCOORD1 (float4)
- *   v10 -> ATTR10 -> TEXCOORD2 (float4)
- *   v11 -> ATTR11 -> TEXCOORD3 (float4)
- *   v12-v15 -> ATTR12-15 -> additional
+ *   v2  -> ATTR2  -> NORMAL (float3)
+ *   v3  -> ATTR3  -> DIFFUSE (D3DCOLOR)
+ *   v4  -> ATTR4  -> SPECULAR (D3DCOLOR)
+ *   v5  -> ATTR5  -> FOG (float)
+ *   v6  -> ATTR6  -> POINT SIZE (float)
+ *   v7  -> ATTR7  -> BACK DIFFUSE (D3DCOLOR)
+ *   v8  -> ATTR8  -> BACK SPECULAR (D3DCOLOR)
+ *   v9  -> ATTR9  -> TEXCOORD0 (float2)
+ *   v10 -> ATTR10 -> TEXCOORD1 (float2)
+ *   v11 -> ATTR11 -> TEXCOORD2 (float2)
+ *   v12 -> ATTR12 -> TEXCOORD3 (float2)
+ *   v13-v15 -> ATTR13-15 -> reserved/additional
  *
- * The actual format (float2/3/4, D3DCOLOR, etc.) is determined at
- * draw time from the active stream source FVF/stride. For now, we
- * create a layout assuming the standard Xbox vertex attribute mapping.
+ * This table previously started TEXCOORD0 at v8 and had no slot at all
+ * for BACK DIFFUSE, silently shifting every slot from 7 up by one
+ * relative to real hardware -- harmless for texcoords specifically (v8-
+ * v11 there all shared the same float2 format v9-v12 use here, so no
+ * title that only reads texcoords through this table was ever affected),
+ * but wrong for slot 8 (BACK SPECULAR, a packed color) which read as a
+ * texcoord-shaped float2 instead of D3DCOLOR, and wrong for slot 12
+ * (real TEXCOORD3) which fell through to the 16-byte generic default
+ * instead of float2. Not otherwise exercised until this rewrite, since
+ * nothing fed this translator real microcode before now (see the parser
+ * above) -- caught alongside that bug, not a regression of it.
  * ================================================================ */
 
 /**
@@ -1044,12 +1088,13 @@ DXGI_FORMAT d3d8_vsh_default_input_format(int vreg)
     case 4:  return DXGI_FORMAT_R8G8B8A8_UNORM;      /* Specular (D3DCOLOR) */
     case 5:  return DXGI_FORMAT_R32_FLOAT;            /* Fog */
     case 6:  return DXGI_FORMAT_R32_FLOAT;            /* Point size */
-    case 7:  return DXGI_FORMAT_R8G8B8A8_UNORM;      /* Back specular */
-    case 8:  return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 0 */
-    case 9:  return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 1 */
-    case 10: return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 2 */
-    case 11: return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 3 */
-    default: return DXGI_FORMAT_R32G32B32A32_FLOAT;   /* Generic */
+    case 7:  return DXGI_FORMAT_R8G8B8A8_UNORM;      /* Back diffuse */
+    case 8:  return DXGI_FORMAT_R8G8B8A8_UNORM;      /* Back specular */
+    case 9:  return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 0 */
+    case 10: return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 1 */
+    case 11: return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 2 */
+    case 12: return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 3 */
+    default: return DXGI_FORMAT_R32G32B32A32_FLOAT;   /* Generic (13-15) */
     }
 }
 

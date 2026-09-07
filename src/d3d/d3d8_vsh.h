@@ -76,43 +76,131 @@ extern "C" {
 /** Shader cache size (hashed microcode -> compiled shader). */
 #define NV2A_VS_CACHE_SIZE          64
 
+/**
+ * Fixed hardware constant-file slots for the viewport scale/offset, NOT
+ * chosen by this translator -- these are where real NV2A hardware itself
+ * writes SET_VIEWPORT_SCALE/_OFFSET (see NV_IGRAPH_XF_XFCTX_VPSCL/_VPOFF
+ * in nv2a_regs.h, and xemu's pgraph.c SET_VIEWPORT_SCALE/_OFFSET method
+ * handlers, which write these exact indices directly into the same
+ * constant array a vertex program reads via c[], bypassing the generic
+ * SET_TRANSFORM_CONSTANT path entirely). Compiled Xbox vertex programs
+ * read them as a matter of course: the Xbox SDK/nxdk vertex shader
+ * compiler appends a standard "multiply by VPSCL, optionally divide by w,
+ * add VPOFF" epilogue to every compiled program, because real NV2A
+ * hardware has no separate post-vertex-shader viewport-transform stage --
+ * a program's oPos output IS already device/pixel space by the time it
+ * leaves the vertex unit. D3D11 has no such flexibility (SV_POSITION is
+ * always pre-divide clip space, mapped to the viewport by fixed-function
+ * hardware afterwards), so d3d8_vsh_generate_hlsl() undoes this bake-in
+ * generically at the end of every generated shader using these same two
+ * registers, rather than guessing at it per-shader or leaving oPos in the
+ * wrong coordinate space. The caller must keep these mirrored into the
+ * constant array whenever SET_VIEWPORT_SCALE/_OFFSET fire -- see
+ * nv2a_pgraph_d3d11.c's handlers for those methods. */
+#define NV2A_VS_VPSCL_REG           0x3a  /* NV_IGRAPH_XF_XFCTX_VPSCL, c[58] */
+#define NV2A_VS_VPOFF_REG           0x3b  /* NV_IGRAPH_XF_XFCTX_VPOFF, c[59] */
+
 /* ================================================================
  * NV2A VS Instruction Encoding (128 bits = 4 DWORDs)
  *
- * Each instruction is composed of 4 x 32-bit words:
+ * Ported field-for-field from xemu's own reference decoder,
+ * subprojects/nv2a_vsh_cpu/src/nv2a_vsh_disassembler.c (its `parse_*`
+ * functions and `EXTRACT(token, word, start, size)` macro), cross-checked
+ * against hw/xbox/nv2a/pgraph/glsl/vsh-prog.c's `out_reg_name[]` table.
+ * Do not restate these offsets from memory or re-derive them -- the
+ * previous version of this comment (and the VSH_FIELD_* table it
+ * described) was invented locally, claimed to follow "xemu/envytools
+ * conventions" without actually having been checked against either, and
+ * was wrong in every field that mattered: it treated the instruction as a
+ * single flat 128-bit value with word[0] holding the opcodes, when real
+ * hardware never reads word[0] AT ALL -- every field lives in word[1],
+ * [2], or [3]. That bug made every MAC/ILU opcode decode as 0 (NOP) for
+ * this title's actual microcode, so oPos was never written by any
+ * instruction and stayed at its default (0,0,0,1) for every vertex --
+ * wiring the translator in (see nv2a_pgraph_d3d11.c) correctly produced
+ * an all-black frame, because the decoder underneath it had never been
+ * exercised by real microcode until then.
  *
- * Word 0 (ILU/misc):
- *   [31:29] - Reserved / type
- *   [28:25] - ILU opcode (4 bits)
- *   [24:21] - MAC opcode (4 bits)
- *   [20:13] - Const index (8 bits) - constant register selector
- *   [12:9]  - Input reg (v#) (4 bits) - which v0-v15 register
+ * `EXTRACT(token, index, start, size)` below always means: word `index`
+ * of the 4-DWORD instruction, bits [start, start+size).
+ *
+ * Word 0: entirely unused. Real NV2A hardware does not read it for
+ *         anything this decoder needs.
+ *
+ * Word 1:
+ *   [0:1]   - Source A swizzle W
+ *   [2:3]   - Source A swizzle Z
+ *   [4:5]   - Source A swizzle Y
+ *   [6:7]   - Source A swizzle X
  *   [8]     - Source A negate
- *   [7:4]   - Source A register type + index (mux field A)
- *   [3:0]   - Source A swizzle X component (2 bits in combined field)
+ *   [9:12]  - Input register (v#) -- SHARED: whichever operand(s) decode
+ *             as type INPUT this instruction all read this one v#.
+ *   [13:20] - Constant/context register index -- SHARED the same way for
+ *             type CONST/CONTEXT operands.
+ *   [21:24] - MAC opcode (4 bits)
+ *   [25:27] - ILU opcode (3 bits, NOT 4 -- the old table's most literal
+ *             single-bit bug: NV2AVshIluOp only ever has 8 values, but
+ *             the old code read a 4th bit that belongs to something else)
  *
- * Word 1 (Source A/B):
- *   [31:24] - Source A swizzle (Y, Z, W components) + remaining bits
- *   [23:16] - Source B register select + negate + type
- *   [15:0]  - Source B swizzle + remaining fields
+ * Word 2:
+ *   [0:1]   - Source C temp register index, HIGH 2 bits (see word 3 [30:31]
+ *             for the low 2 bits -- this field is genuinely split across
+ *             two words, not a typo)
+ *   [2:3]   - Source C swizzle W
+ *   [4:5]   - Source C swizzle Z
+ *   [6:7]   - Source C swizzle Y
+ *   [8:9]   - Source C swizzle X
+ *   [10]    - Source C negate
+ *   [11:12] - Source B register type (0=none,1=temp,2=input,3=const)
+ *   [13:16] - Source B temp register index
+ *   [17:18] - Source B swizzle W
+ *   [19:20] - Source B swizzle Z
+ *   [21:22] - Source B swizzle Y
+ *   [23:24] - Source B swizzle X
+ *   [25]    - Source B negate
+ *   [26:27] - Source A register type
+ *   [28:31] - Source A temp register index
  *
- * Word 2 (Source C / MAC dest):
- *   [31:16] - Source C register select + negate + swizzle
- *   [15:12] - MAC dest temp register index
- *   [11:8]  - MAC dest write mask (xyzw)
- *   [7:3]   - MAC dest output register mux
- *   [2:0]   - Remaining source C bits
+ *   Note operand A's type/temp-index (here, word 2) and its swizzle/
+ *   negate (word 1, above) are NOT adjacent -- each logical operand's
+ *   fields are scattered across whichever words had room, not laid out
+ *   as one contiguous block per operand. This is the second way the old
+ *   flat-128-bit model was structurally wrong, independent of any single
+ *   offset being off: no reshuffling of start positions within that model
+ *   could have produced a correct decode.
  *
- * Word 3 (ILU dest / final):
- *   [31:28] - ILU dest temp register index
- *   [27:24] - ILU dest write mask (xyzw)
- *   [23:19] - ILU dest output register mux
- *   [18:1]  - Reserved / other fields
+ * Word 3:
  *   [0]     - Final instruction flag (1 = last instruction in program)
+ *   [1]     - Relative-addressing flag (a0.x offsets the CONST/CONTEXT
+ *             register above) -- applies to whichever operand(s) are
+ *             CONST type, same shared-field pattern as the v#/c# indices.
+ *   [2]     - 1 = the single shared "real output/context write" below
+ *             belongs to the ILU op; 0 = it belongs to MAC.
+ *   [3:10]  - That shared output/context register index (8 bits, but
+ *             only the low nibble is ever meaningful -- see
+ *             decode_output_mux()/out_reg_name[] in vsh-prog.c: index 0 =
+ *             oPos, 3=oD0, 4=oD1, 5=oFog, 6=oPts, 7=oB0, 8=oB1, 9-12=oT0-3,
+ *             others reserved/unused).
+ *   [11]    - 1 = that write targets a real output register; 0 = it
+ *             writes back into a constant/context register instead (a
+ *             genuine but rare hardware feature for context-switch
+ *             microcode; not modeled here -- see emit_one_dest()).
+ *   [12:15] - Write mask for the shared output/context write above.
+ *   [16:19] - Write mask for a temp-register write from the ILU op.
+ *   [20:23] - Temp register index -- SHARED between MAC and ILU temp
+ *             writes below (same physical destination register slot).
+ *   [24:27] - Write mask for a temp-register write from the MAC op.
+ *   [28:29] - Source C register type.
+ *   [30:31] - Source C temp register index, LOW 2 bits (see word 2 [0:1]).
  *
- * NOTE: The exact bit layout follows the xemu/envytools conventions.
- * The fields below are extracted using shift-and-mask operations
- * matching the NV2A hardware encoding.
+ * MAC and ILU can each independently write the shared temp register
+ * (with their own separate write masks), and/or one of them can claim the
+ * single shared "real output" write per instruction (bit [2] above says
+ * which) -- there are no independent per-unit destination-mux fields the
+ * way the old model assumed. One more real-hardware quirk carried over
+ * from xemu's decoder: if BOTH units write the temp register in the same
+ * instruction, the ILU write is hard-wired to R1 regardless of the
+ * decoded temp index -- see parse_outputs() in d3d8_vsh.c.
  * ================================================================ */
 
 /* ================================================================
@@ -165,13 +253,19 @@ typedef enum NV2AVshIluOp {
 /**
  * Source operand register types.
  *
- * Each source operand selects from one of three register banks.
+ * Values match the raw 2-bit hardware type field directly (see
+ * parse_a_type/parse_b_type/parse_c_type in nv2a_vsh_disassembler.c) so
+ * decoding is a plain cast, not a lookup table: 0=none, 1=temp, 2=input,
+ * 3=const. NONE is a real, common case -- most opcodes only read 1 or 2
+ * of the 3 possible operand slots (see parse_source()'s per-opcode
+ * switch), and the unused slot(s) decode with whatever type bits happen
+ * to be there; leaving them at NONE keeps them out of inputs_read.
  */
 typedef enum NV2AVshRegType {
-    NV2A_VSH_REG_TEMP   = 0,  /* R0-R11 (R12 = oPos alias) */
-    NV2A_VSH_REG_INPUT  = 1,  /* v0-v15 */
-    NV2A_VSH_REG_CONST  = 2,  /* c0-c191 (may be indexed via a0) */
-    NV2A_VSH_REG_COUNT  = 3,
+    NV2A_VSH_REG_NONE   = 0,  /* Operand slot unused by this opcode */
+    NV2A_VSH_REG_TEMP   = 1,  /* R0-R11 (R12 = oPos alias) */
+    NV2A_VSH_REG_INPUT  = 2,  /* v0-v15 */
+    NV2A_VSH_REG_CONST  = 3,  /* c0-c191 (may be indexed via a0) */
 } NV2AVshRegType;
 
 /**
@@ -223,13 +317,62 @@ typedef struct NV2AVshSrcOperand {
 } NV2AVshSrcOperand;
 
 /**
- * A fully decoded destination operand.
+ * What kind of register a destination write targets.
+ *
+ * Unlike source operands, this is NOT the raw hardware bit pattern --
+ * real hardware only has an is_output/is_context bit (word 3 [11]) for
+ * the single shared "real" write, plus separate temp-writemask fields.
+ * This enum names the four outcomes parse_outputs() can produce for one
+ * destination slot, matching the shape of xemu's Nv2aVshRegisterType
+ * (NV2ART_NONE/TEMPORARY/OUTPUT/CONTEXT/ADDRESS) closely enough to port
+ * parse_outputs() against directly.
+ */
+typedef enum NV2AVshDstRegType {
+    NV2A_VSH_DST_NONE    = 0,  /* Slot unused */
+    NV2A_VSH_DST_TEMP,         /* R0-R11 (R12 = oPos alias) */
+    NV2A_VSH_DST_OUTPUT,       /* A real output register -- reg_index holds
+                                 * an NV2AVshOutputReg value */
+    NV2A_VSH_DST_CONST,        /* Write back into a constant/context
+                                 * register (context-switch microcode).
+                                 * Decoded but not modeled -- see
+                                 * emit_one_dest() in d3d8_vsh.c. */
+    NV2A_VSH_DST_ADDRESS,      /* a0 (ARL's implicit destination only) */
+} NV2AVshDstRegType;
+
+/**
+ * A fully decoded destination write.
  */
 typedef struct NV2AVshDstOperand {
-    int               temp_reg;    /* Temp register index (0-12), or -1 if none */
-    NV2AVshOutputReg  output_reg;  /* Output register, or NV2A_VSH_OUT_NONE */
+    NV2AVshDstRegType dst_type;
+    int               reg_index;   /* Meaning depends on dst_type: temp#,
+                                     * NV2AVshOutputReg, or raw const/
+                                     * context register#. Unused for
+                                     * NONE/ADDRESS. */
     uint8_t           write_mask;  /* Bitmask: bit3=x, bit2=y, bit1=z, bit0=w */
 } NV2AVshDstOperand;
+
+/**
+ * The MAC unit's decoded operation: opcode, up to 3 source operands (A,
+ * B, C -- unused slots per select_mac_inputs()'s per-opcode switch stay
+ * type NONE), and up to 2 destination writes (a temp-register write
+ * and/or the single shared real-output/context write -- see
+ * parse_destinations()).
+ */
+typedef struct NV2AVshMacOperation {
+    NV2AVshMacOp      opcode;
+    NV2AVshSrcOperand inputs[3];
+    NV2AVshDstOperand outputs[2];
+} NV2AVshMacOperation;
+
+/**
+ * The ILU unit's decoded operation. Real hardware only ever gives ILU one
+ * input (source C -- see select_ilu_input()), unlike MAC's up to three.
+ */
+typedef struct NV2AVshIluOperation {
+    NV2AVshIluOp      opcode;
+    NV2AVshSrcOperand inputs[1];
+    NV2AVshDstOperand outputs[2];
+} NV2AVshIluOperation;
 
 /**
  * A fully decoded NV2A vertex shader instruction.
@@ -239,21 +382,8 @@ typedef struct NV2AVshDstOperand {
  * may be NOP.
  */
 typedef struct NV2AVshInstruction {
-    /* MAC unit */
-    NV2AVshMacOp    mac_op;
-    NV2AVshSrcOperand mac_src[3];  /* A, B, C */
-    NV2AVshDstOperand mac_dst;
-
-    /* ILU unit */
-    NV2AVshIluOp    ilu_op;
-    NV2AVshSrcOperand ilu_src;     /* C (ILU only reads source C) */
-    NV2AVshDstOperand ilu_dst;
-
-    /* Constant register index (shared) */
-    int             const_index;
-
-    /* Input register index v# (shared) */
-    int             input_index;
+    NV2AVshMacOperation mac;
+    NV2AVshIluOperation ilu;
 
     /* Final instruction flag */
     int             is_final;
@@ -269,6 +399,16 @@ typedef struct NV2AVshProgram {
     /* Bitmask of input registers read (v0-v15). Bit N = vN is used.
      * Used to determine the required input layout. */
     uint16_t            inputs_read;
+
+    /* True if any instruction reads c[NV2A_VS_VPSCL_REG] or
+     * c[NV2A_VS_VPOFF_REG] -- i.e. this program follows the standard Xbox
+     * SDK/nxdk compiled-vertex-shader epilogue convention and its oPos
+     * output is in NV2A device/pixel space, not D3D11 clip space. Gates
+     * d3d8_vsh_generate_hlsl()'s undo-the-bake-in epilogue so a program
+     * that never reads those registers (and so must already be producing
+     * genuine clip-space output some other way) is left alone rather than
+     * having a transform applied that was never in its own instructions. */
+    int                 uses_viewport_ctx;
 } NV2AVshProgram;
 
 /* ================================================================
