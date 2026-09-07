@@ -25,6 +25,10 @@
 
 #include "nv2a_pgraph_d3d11.h"
 #include "nv2a_regs.h"
+#include "nv2a_state.h"  /* nv2a_get_guest_ram() -- see the texture upload
+                          * section below for why a texture offset resolves
+                          * through the exact same base/size the push
+                          * buffer puller uses, not a second copy of it. */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -35,12 +39,37 @@
 #include "../d3d/d3d8_xbox.h"
 extern IDirect3DDevice8 *xbox_GetD3DDevice(void);
 
+/* d3d8_internal.h defines COBJMACROS before its own <d3d11.h> include, which
+ * is what turns on the ID3D11Foo_Bar(...) call-style macros used throughout
+ * this file's texture/pixel-shader section below. It must come before ANY
+ * other header that pulls in <d3d11.h> -- d3d8_vsh.h does exactly that, so
+ * this has to be included first or <d3d11.h>'s own include guard silently
+ * keeps COBJMACROS from ever taking effect (this bit twice while writing
+ * the section below: every ID3D11*_* call failed as an implicit-declaration
+ * error until the order was fixed here, not there). */
+#include "../d3d/d3d8_internal.h"
+#include <d3dcompiler.h>
+#pragma comment(lib, "d3dcompiler.lib")
+
 /* NV2A programmable vertex shader translator (microcode -> HLSL). See the
  * "Programmable vertex shader" block below for why this file now feeds it:
  * every draw in this title uses SET_TRANSFORM_PROGRAM/_CONSTANT, never the
  * fixed-function pipeline, and this translator already existed but nothing
  * upstream of it ever called in from the raw NV2A pushbuffer path. */
 #include "../d3d/d3d8_vsh.h"
+
+/* d3d8_GetD3D11Device()/_Context() (declared in d3d8_internal.h, included
+ * above) -- needed directly (not through the D3D8 vtable) to create
+ * textures/samplers and bind a pixel shader for the VSH draw path. See the
+ * "Texture upload + pixel shader" section below for why that path needs
+ * its own PS at all: d3d8_shaders_prepare_draw() (the FFP fallback that
+ * already handles real texture sampling) only runs when d3d8_vsh_prepare_
+ * draw() FAILS, and d3d8_combiners_prepare_draw() only activates once
+ * something has called SetPixelShader() -- Breakdown does neither, since
+ * it drives raw NV2A pushbuffer methods for the pixel stage too, not the
+ * D3D8 API. So for every one of our draws, no pixel shader has ever been
+ * (re)bound at all; whatever the device happened to have left over from
+ * setup is what has been producing the uniform white. */
 
 /* Global.txd texture lookup */
 /* Game-specific texture lookup - only available when GAME_HAS_FONT_ATLAS is defined */
@@ -168,14 +197,45 @@ static struct {
     VertexAttrFmt vattr[16];
 
     /* "Current" diffuse color, for draws where NV2A_VERTEX_ATTR_DIFFUSE is
-     * not one of the enabled attributes (observed to be the common case --
-     * these titles set color once via NV097_SET_DIFFUSE_COLOR4UB rather
-     * than per vertex). Defaults to opaque white. Real NV2A hardware
-     * defaults an unset vertex attribute to (0,0,0,1) -- opaque BLACK --
-     * which through this translator's MODULATE texture stage would zero
-     * out every textured draw; if colors still look wrong after this fix,
-     * check whether the title actually calls SET_DIFFUSE_COLOR4UB for
-     * these draws before assuming this default is the right one. */
+     * not one of the enabled attributes. Defaults to opaque white.
+     *
+     * Real NV2A hardware defaults an unset vertex attribute to (0,0,0,1)
+     * -- opaque black -- and this WAS suspected as the leading cause of
+     * the whole-frame uniform white this title was producing once its
+     * vertex program started running (see the VSH decoder/viewport-
+     * epilogue work elsewhere in this file). It was tried, together with
+     * the texture-upload path below, and measured directly: the frame
+     * dump went from 307,200/307,200 white pixels to 307,200/307,200
+     * BLACK pixels -- one uniform color swapped for another, not a fix.
+     * That is because the texture-upload path (see resolve_texture_stage()
+     * and the "Texture upload + pixel shader" section) is verified wired
+     * correctly -- real D3D11 textures get created, the pixel shader
+     * compiles and binds, and per-draw resolution picks a real cached
+     * texture for the large majority of draws -- but every byte read back
+     * from guest RAM at every texture offset observed, across a 100+
+     * second run with live-vs-cached comparison ruling out a read-before-
+     * write race, is 0x00. So the pixels this default currently controls
+     * -- the untextured fallback draws -- are what's actually painting
+     * the visible frame, and MODULATE against an all-zero-alpha texture
+     * sample contributes nothing either way regardless of what this is
+     * set to. Confirmed NOT called at all this session: NV097_SET_
+     * DIFFUSE_COLOR4UB never fires, and NV2A_VERTEX_ATTR_DIFFUSE's
+     * per-vertex count never goes non-zero either -- diffuse really does
+     * come from nowhere but this static default for every draw observed.
+     *
+     * Left at white deliberately. Flip this back to black ONLY once real
+     * (non-zero) texture bytes are confirmed reaching resolve_texture_
+     * stage() -- either because the boot sequence has progressed further
+     * (still sitting at namcologo.xmv as of this note) or because NV2A's
+     * real texture DMA-object resolution (SET_CONTEXT_DMA_A/_B -> a RAMIN
+     * descriptor lookup, xemu's nv_dma_map() in pgraph/texture.c) turns
+     * out to matter here and gets implemented -- this recomp currently
+     * has NO tracking of SET_CONTEXT_DMA_A/_B at all (they fall into
+     * "truly unhandled"), unlike the push buffer object, which explicitly
+     * documented ITS OWN "whole of RAM, zero base" shortcut as verified
+     * for that one object specifically (see nv2a_core.c's pfifo_pull()
+     * comment) -- that verification was never extended to textures, and
+     * this is now a real, live candidate for why theirs read as blank. */
     uint32_t current_diffuse;
 
     /* Clear state */
@@ -268,11 +328,29 @@ static struct {
                                      * END that follows) misclassifies draws. */
     } vsh;
 
-    /* Texture state per stage (4 stages) */
+    /* Texture state per stage (4 stages). Addresses per nv2a_regs.h --
+     * the old control0 comment here said 0x1B08, which is actually
+     * SET_TEXTURE_ADDRESS; SET_TEXTURE_CONTROL0 is 0x1B0C. The CODE
+     * already used the symbolic NV097_SET_TEXTURE_CONTROL0 constant, so
+     * this was a stale comment, not a live bug -- fixed while adding the
+     * two registers below it needed for real texture upload. */
     struct {
-        uint32_t offset;     /* NV2A VRAM offset (method 0x1B00) */
-        uint32_t format;     /* Format register (method 0x1B04) */
-        uint32_t control0;   /* Control0 register (method 0x1B08) */
+        uint32_t offset;     /* NV2A guest-RAM offset (SET_TEXTURE_OFFSET,
+                               * 0x1B00) -- physical address, same "whole
+                               * of RAM, zero base" DMA object convention
+                               * the push buffer puller uses (see nv2a_
+                               * core.c's pfifo_pull() comment). */
+        uint32_t format;     /* Format register (SET_TEXTURE_FORMAT, 0x1B04) */
+        uint32_t control0;   /* Control0 register (SET_TEXTURE_CONTROL0, 0x1B0C) */
+        uint32_t control1;   /* Pitch, for LINEAR formats only (SET_TEXTURE_
+                               * CONTROL1, 0x1B10) -- SWIZZLED/compressed
+                               * formats are always tightly packed and
+                               * don't use this. */
+        uint32_t image_rect; /* Width/height, for LINEAR formats only
+                               * (SET_TEXTURE_IMAGE_RECT, 0x1B1C) --
+                               * SWIZZLED formats get their (power-of-two)
+                               * dimensions from the FORMAT register's
+                               * BASE_SIZE_U/V log2 fields instead. */
         int enabled;         /* Decoded from control0 bit 30 */
     } tex[4];
 
@@ -584,6 +662,390 @@ static void convert_vsh_vertex(const uint8_t *src_vb, const uint32_t src_offset[
         }
         dst_off += size;
     }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * Texture upload + pixel shader (VSH draw path only)
+ *
+ * Format support is deliberately narrow, matched to what Breakdown was
+ * measured (XBOXRECOMP_TEXDUMP=1) actually programming: every texture
+ * seen is NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8 (0x12, plain
+ * 32bpp UI/icon textures) or _LC_IMAGE_CR8YB8CB8YA8 (0x24, a packed YUV
+ * format -- almost certainly the namcologo.xmv movie decode texture,
+ * given the boot sequence is still there). Both are LINEAR (the "LU_"/
+ * "LC_" prefix in nv2a_regs.h, as opposed to "SZ_" for swizzled) --
+ * nothing swizzled or DXT-compressed was ever observed, so no de-swizzle
+ * or block-decompression is implemented here. A8R8G8B8 is handled below;
+ * the YUV format is decoded (dimensions/pitch tracked) but not unpacked
+ * to RGB -- see resolve_texture_stage()'s default case. If a future
+ * title needs SWIZZLED or compressed formats, that is real additional
+ * work (de-swizzle is a Z-order/Morton walk, not a memcpy) and should be
+ * scoped separately rather than guessed at here.
+ *
+ * UV space: confirmed against xemu's hw/xbox/nv2a/pgraph/glsl/psh.c line
+ * ~127 (`state->rect_tex[i] = f.linear`) -- LINEAR-format NV2A textures
+ * are sampled with UNNORMALIZED (texel-space) coordinates on real
+ * hardware, not the usual normalized [0,1] every D3D/GL sampler expects
+ * by default. That is exactly why the measured UVs for this title span
+ * 0.53-640.53 / 0.53-448.53 rather than 0-1: the NV2A vertex program's
+ * oT0 output IS the real device-space value, same as oPos was before the
+ * VPSCL/VPOFF epilogue fix. xemu's pixel shader generator normalizes by
+ * dividing by the sampled texture's real size (psh.c ~line 1421); the
+ * shader below does the same thing, in the same place (the pixel shader,
+ * not the vertex shader) for the same reason -- only the pixel shader
+ * knows which texture is actually bound to a given stage.
+ * ══════════════════════════════════════════════════════════════════════ */
+
+/* Only the two formats actually observed; anything else falls through to
+ * "unsupported" (NULL SRV -> diffuse-only shading) rather than a guess. */
+#define NV2A_TEX_COLOR_A8R8G8B8_LINEAR  0x12
+#define NV2A_TEX_COLOR_YUV_CR8YB8CB8YA8 0x24
+#define NV2A_TEX_COLOR_YUV_YB8CR8YA8CB8 0x25
+
+#define TEX_CACHE_SIZE 16
+typedef struct {
+    uint32_t key;                 /* hash of offset/format/control1/image_rect */
+    int      in_use;
+    ID3D11Texture2D          *tex2d;
+    ID3D11ShaderResourceView *srv;
+    float    width, height;       /* real texel dimensions, for UV normalization */
+} TexCacheEntry;
+
+static TexCacheEntry g_tex_cache[TEX_CACHE_SIZE];
+static ID3D11SamplerState *g_tex_sampler;   /* lazy-created, shared by all stages */
+static ID3D11PixelShader  *g_tex_ps;        /* lazy-compiled, shared by all draws */
+static ID3D11Buffer       *g_tex_ps_cb;     /* texSize0/hasTexture constant buffer */
+
+/* Generic pixel shader for the VSH draw path. `hasTexture` is a uniform
+ * (whole-draw) flag, not a per-pixel value, so the branch below compiles
+ * to real dynamic branching rather than always sampling -- when no
+ * supported texture is bound this never touches tex0/samp0, matching the
+ * existing D3DFVF-path's SELECTARG1-vs-MODULATE choice, just implemented
+ * as a real shader instead of a fixed-function texture-stage state (see
+ * the file comment above this section for why the FFP/combiner paths
+ * that would normally provide this are unreachable here). */
+static const char *k_tex_ps_src =
+    "Texture2D tex0 : register(t0);\n"
+    "SamplerState samp0 : register(s0);\n"
+    "cbuffer PSInfo : register(b0) {\n"
+    "    float2 texSize0;\n"
+    "    float  hasTexture;\n"
+    "    float  pad0;\n"
+    "};\n"
+    "struct PS_IN {\n"
+    "    float4 pos   : SV_POSITION;\n"
+    "    float4 color : COLOR0;\n"
+    "    float4 tex0  : TEXCOORD0;\n"
+    "};\n"
+    "float4 main(PS_IN input) : SV_TARGET {\n"
+    "    float4 c = input.color;\n"
+    "    if (hasTexture > 0.5) {\n"
+    /* Undo NV2A's texel-space UV, same reasoning as oPos's VPSCL/VPOFF
+     * epilogue in d3d8_vsh.c -- see this section's file comment. */
+    "        float2 uv = input.tex0.xy / texSize0;\n"
+    "        c = tex0.Sample(samp0, uv) * input.color;\n"
+    "    }\n"
+    "    return c;\n"
+    "}\n";
+
+static ID3D11PixelShader *get_tex_pixel_shader(void)
+{
+    ID3DBlob *code = NULL, *errors = NULL;
+    HRESULT hr;
+
+    if (g_tex_ps)
+        return g_tex_ps;
+
+    hr = D3DCompile(k_tex_ps_src, strlen(k_tex_ps_src), "nv2a_tex_ps",
+                    NULL, NULL, "main", "ps_5_0",
+                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[PGRAPH-D3D11] TEX: pixel shader compile failed: %s\n",
+                errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "unknown");
+        if (errors) ID3D10Blob_Release(errors);
+        return NULL;
+    }
+    if (errors) ID3D10Blob_Release(errors);
+
+    hr = ID3D11Device_CreatePixelShader(d3d8_GetD3D11Device(),
+        ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code),
+        NULL, &g_tex_ps);
+    ID3D10Blob_Release(code);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[PGRAPH-D3D11] TEX: CreatePixelShader failed: 0x%08lX\n", hr);
+        return NULL;
+    }
+
+    /* Constant buffer for texSize0/hasTexture, updated per draw. */
+    D3D11_BUFFER_DESC cbd;
+    memset(&cbd, 0, sizeof(cbd));
+    cbd.ByteWidth = 16;  /* float2 + float + float, 16-byte aligned */
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &cbd, NULL, &g_tex_ps_cb);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[PGRAPH-D3D11] TEX: CreateBuffer (PSInfo) failed: 0x%08lX\n", hr);
+        return NULL;
+    }
+
+    fprintf(stderr, "[PGRAPH-D3D11] TEX: pixel shader compiled\n");
+    return g_tex_ps;
+}
+
+static ID3D11SamplerState *get_tex_sampler(void)
+{
+    D3D11_SAMPLER_DESC sd;
+    HRESULT hr;
+
+    if (g_tex_sampler)
+        return g_tex_sampler;
+
+    memset(&sd, 0, sizeof(sd));
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    /* CLAMP, not WRAP: we divide by the real texture size to normalize a
+     * texel-space UV (see the file comment above), so a UV that lands
+     * exactly on the texture's edge should clamp there, not wrap -- WRAP
+     * would only be correct if the source UV were already meant to tile,
+     * which nothing here has established. */
+    sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+
+    hr = ID3D11Device_CreateSamplerState(d3d8_GetD3D11Device(), &sd, &g_tex_sampler);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[PGRAPH-D3D11] TEX: CreateSamplerState failed: 0x%08lX\n", hr);
+        return NULL;
+    }
+    return g_tex_sampler;
+}
+
+static uint32_t tex_cache_key(int stage)
+{
+    /* Everything that changes what bytes we'd read/how we'd interpret
+     * them. Doesn't need to be cryptographic -- just distinct enough
+     * that a title swapping textures across these fields gets a fresh
+     * upload instead of stale cached bytes. */
+    uint32_t h = 0x811c9dc5u;
+    uint32_t vals[4] = { g_pg.tex[stage].offset, g_pg.tex[stage].format,
+                          g_pg.tex[stage].control1, g_pg.tex[stage].image_rect };
+    int i;
+    for (i = 0; i < 4; i++) {
+        h ^= vals[i];
+        h *= 0x01000193u;
+    }
+    return h ? h : 1u;  /* reserve 0 for "empty slot" */
+}
+
+/* Resolve (uploading/caching as needed) the texture bound to `stage`.
+ * Returns NULL if the stage is disabled, or programmed with a format
+ * this translator doesn't decode (see the file comment above) -- either
+ * way the caller falls back to diffuse-only shading, never a guess at
+ * texture content. */
+static TexCacheEntry *resolve_texture_stage(int stage)
+{
+    uint32_t key, color;
+    int i, free_slot;
+    uint32_t width, height, pitch;
+    const uint8_t *guest_ram;
+    uint32_t guest_ram_size;
+    const uint8_t *src;
+    TexCacheEntry *entry;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SUBRESOURCE_DATA sd;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvd;
+    HRESULT hr;
+
+    if (stage < 0 || stage >= 4 || !g_pg.tex[stage].enabled)
+        return NULL;
+
+    color = (g_pg.tex[stage].format & NV097_SET_TEXTURE_FORMAT_COLOR) >> 8;
+    if (color != NV2A_TEX_COLOR_A8R8G8B8_LINEAR) {
+        /* YUV movie texture and anything else: not decoded yet (see file
+         * comment). Warn once per stage so this is visible without being
+         * a flood -- 40k+ draws would otherwise repeat it every frame. */
+        static int warned[4];
+        if (!warned[stage]) {
+            fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: color format 0x%02X not "
+                    "decoded (only A8R8G8B8/0x12 is) -- falling back to "
+                    "diffuse-only for this stage\n", stage, color);
+            warned[stage] = 1;
+
+            /* Diagnostic-only peek at the raw bytes (no texture created):
+             * tells apart "this format just isn't decoded yet" from "the
+             * memory behind it isn't real data anyway" -- same question
+             * being asked of the A8R8G8B8 path below, useful to know
+             * before deciding whether YUV decode is worth the added
+             * scope. Not gated on XBOXRECOMP_TEXDUMP separately since
+             * it's a one-shot per stage either way. */
+            if (getenv("XBOXRECOMP_TEXDUMP")) {
+                uint32_t sz;
+                const uint8_t *ram = nv2a_get_guest_ram(&sz);
+                if (ram && sz && (sz & (sz - 1)) == 0) {
+                    const uint8_t *p = ram + (g_pg.tex[stage].offset & (sz - 1));
+                    fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: (YUV, undecoded) raw "
+                            "bytes at offset=0x%08X: %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                            stage, g_pg.tex[stage].offset,
+                            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+                }
+            }
+        }
+        return NULL;
+    }
+
+    width  = (g_pg.tex[stage].image_rect & NV097_SET_TEXTURE_IMAGE_RECT_WIDTH) >> 16;
+    height = (g_pg.tex[stage].image_rect & NV097_SET_TEXTURE_IMAGE_RECT_HEIGHT);
+    pitch  = (g_pg.tex[stage].control1 & NV097_SET_TEXTURE_CONTROL1_IMAGE_PITCH) >> 16;
+    if (width == 0 || height == 0)
+        return NULL;  /* IMAGE_RECT not programmed yet */
+    if (pitch == 0)
+        pitch = width * 4;  /* A8R8G8B8 is 4 bytes/texel; tightly packed if unset */
+
+    key = tex_cache_key(stage);
+
+    /* Cache lookup */
+    free_slot = -1;
+    for (i = 0; i < TEX_CACHE_SIZE; i++) {
+        if (g_tex_cache[i].in_use && g_tex_cache[i].key == key) {
+            /* TEMPORARY: peek the CURRENT live bytes (bypassing the
+             * cached upload) and compare against what got cached, to
+             * tell apart "this memory is permanently blank" from "we
+             * cached it before the game finished writing it" -- a race
+             * the cache-once design would otherwise hide forever. Only
+             * reads 4 bytes and only under XBOXRECOMP_TEXDUMP; strip
+             * once the guest-RAM timing question is settled. */
+            if (getenv("XBOXRECOMP_TEXDUMP")) {
+                static uint32_t last_live[4];
+                uint32_t sz2;
+                const uint8_t *ram2 = nv2a_get_guest_ram(&sz2);
+                if (ram2 && sz2 && (sz2 & (sz2 - 1)) == 0) {
+                    const uint8_t *p2 = ram2 + (g_pg.tex[stage].offset & (sz2 - 1));
+                    uint32_t live;
+                    memcpy(&live, p2, 4);
+                    if (live != last_live[stage]) {
+                        fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: live bytes at "
+                                "offset=0x%08X changed: 0x%08X -> 0x%08X "
+                                "(cached upload was from an earlier read)\n",
+                                stage, g_pg.tex[stage].offset, last_live[stage], live);
+                        last_live[stage] = live;
+                    }
+                }
+            }
+            return &g_tex_cache[i];
+        }
+        if (free_slot < 0 && !g_tex_cache[i].in_use)
+            free_slot = i;
+    }
+
+    /* Cache miss: resolve guest RAM and upload. SET_TEXTURE_OFFSET is a
+     * physical address under the same "whole of RAM, zero base" DMA
+     * object convention nv2a_core.c's push buffer puller uses for its
+     * own reads -- nv2a_get_guest_ram() reads back the exact base/size
+     * that convention resolved to, rather than this file keeping a
+     * second copy of it (see nv2a_state.h's comment on that accessor). */
+    guest_ram = nv2a_get_guest_ram(&guest_ram_size);
+    if (!guest_ram) {
+        static int warned_ram;
+        if (!warned_ram) {
+            fprintf(stderr, "[PGRAPH-D3D11] TEX: guest RAM not armed yet "
+                    "(nv2a_set_guest_ram not called) -- skipping upload\n");
+            warned_ram = 1;
+        }
+        return NULL;
+    }
+    if (guest_ram_size == 0 || (guest_ram_size & (guest_ram_size - 1)) != 0) {
+        /* pb_read32()-style masking below assumes a power-of-two size,
+         * same as nv2a_core.c's own pb_read32(); guard rather than
+         * silently reading the wrong bytes if that assumption ever
+         * stops holding. */
+        return NULL;
+    }
+    src = guest_ram + (g_pg.tex[stage].offset & (guest_ram_size - 1));
+
+    if (free_slot < 0) {
+        /* Evict slot 0. Simple and rare in practice: Breakdown's own
+         * texture set (icons + one movie frame texture, per XBOXRECOMP_
+         * TEXDUMP) is well under TEX_CACHE_SIZE, so eviction under normal
+         * play would mean something is churning through many distinct
+         * textures -- worth another look if that count climbs, but not
+         * a correctness issue either way. */
+        free_slot = 0;
+        if (g_tex_cache[0].srv)   ID3D11ShaderResourceView_Release(g_tex_cache[0].srv);
+        if (g_tex_cache[0].tex2d) ID3D11Texture2D_Release(g_tex_cache[0].tex2d);
+        memset(&g_tex_cache[0], 0, sizeof(g_tex_cache[0]));
+    }
+    entry = &g_tex_cache[free_slot];
+
+    memset(&td, 0, sizeof(td));
+    td.Width = width;
+    td.Height = height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    /* A8R8G8B8 in NV2A's naming is byte order B,G,R,A in memory (same as
+     * D3DFMT_A8R8G8B8) -- DXGI_FORMAT_B8G8R8A8_UNORM is the exact same
+     * memory layout, so this is a straight copy, no channel repacking. */
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    memset(&sd, 0, sizeof(sd));
+    sd.pSysMem = src;
+    sd.SysMemPitch = pitch;
+
+    hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, &sd, &entry->tex2d);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: CreateTexture2D failed: 0x%08lX "
+                "(%ux%u, pitch=%u, offset=0x%08X)\n",
+                stage, hr, width, height, pitch, g_pg.tex[stage].offset);
+        memset(entry, 0, sizeof(*entry));
+        return NULL;
+    }
+
+    memset(&srvd, 0, sizeof(srvd));
+    srvd.Format = td.Format;
+    srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvd.Texture2D.MipLevels = 1;
+    hr = ID3D11Device_CreateShaderResourceView(d3d8_GetD3D11Device(),
+        (ID3D11Resource *)entry->tex2d, &srvd, &entry->srv);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: CreateShaderResourceView failed: "
+                "0x%08lX\n", stage, hr);
+        ID3D11Texture2D_Release(entry->tex2d);
+        memset(entry, 0, sizeof(*entry));
+        return NULL;
+    }
+
+    entry->key = key;
+    entry->in_use = 1;
+    entry->width = (float)width;
+    entry->height = (float)height;
+
+    fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: uploaded %ux%u A8R8G8B8 from "
+            "offset=0x%08X pitch=%u (cache slot %d)\n",
+            stage, width, height, g_pg.tex[stage].offset, pitch, free_slot);
+
+    if (getenv("XBOXRECOMP_TEXDUMP")) {
+        /* Raw bytes actually read, so "the upload path is wired but the
+         * source bytes are genuinely blank/uninitialized" can be told
+         * apart from "the offset/pitch math is reading the wrong place."
+         * A handful of texels from the first row plus one from mid-image
+         * (pitch bytes in) is enough to tell solid-color from real data
+         * without dumping the whole texture. */
+        fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: first row: "
+                "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X "
+                "... mid-image (row %u): %02X%02X%02X%02X\n",
+                stage,
+                src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
+                src[8], src[9], src[10], src[11], src[12], src[13], src[14], src[15],
+                height / 2,
+                src[(size_t)pitch * (height / 2) + 0], src[(size_t)pitch * (height / 2) + 1],
+                src[(size_t)pitch * (height / 2) + 2], src[(size_t)pitch * (height / 2) + 3]);
+    }
+
+    return entry;
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -965,6 +1427,68 @@ static void submit_draw(void)
     }
 #endif
 
+    if (use_vsh) {
+        /* The SetTexture()/SetTextureStageState() calls just above are
+         * D3D8 API state, but nothing reads it for this path -- neither
+         * d3d8_shaders_prepare_draw() nor d3d8_combiners_prepare_draw()
+         * ever runs here (see the "Texture upload + pixel shader" file
+         * comment above for why). Bind a real texture and our own pixel
+         * shader directly instead, so they're authoritative for VSH
+         * draws regardless of what that dead D3D8 state says. */
+        ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+        ID3D11PixelShader *ps = get_tex_pixel_shader();
+        TexCacheEntry *te = resolve_texture_stage(0);
+
+        if (ctx && ps && g_tex_ps_cb) {
+            D3D11_MAPPED_SUBRESOURCE mapped;
+
+            ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
+
+            if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_tex_ps_cb,
+                    0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+                float *f = (float *)mapped.pData;
+                f[0] = te ? te->width  : 1.0f;  /* texSize0.x */
+                f[1] = te ? te->height : 1.0f;  /* texSize0.y */
+                f[2] = te ? 1.0f : 0.0f;         /* hasTexture */
+                f[3] = 0.0f;                      /* pad */
+                ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_tex_ps_cb, 0);
+            }
+            ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &g_tex_ps_cb);
+
+            if (te) {
+                ID3D11SamplerState *samp = get_tex_sampler();
+                ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &te->srv);
+                if (samp)
+                    ID3D11DeviceContext_PSSetSamplers(ctx, 0, 1, &samp);
+            } else {
+                /* Unbind stage 0 explicitly rather than leaving whatever
+                 * a previous draw's SRV was -- resolve_texture_stage()
+                 * returning NULL (disabled stage, or an unsupported
+                 * format like the YUV movie texture) must mean "no
+                 * texture," not "reuse the last one". */
+                ID3D11ShaderResourceView *null_srv = NULL;
+                ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &null_srv);
+            }
+        }
+
+        /* Opt-in, same env var as the rest of this file's texture
+         * diagnostics: how many VSH draws actually had a real texture
+         * bound vs fell back to diffuse-only, so "textures upload fine
+         * but the screen doesn't change" can be told apart from "stage 0
+         * just isn't enabled for whichever draws end up visible." */
+        if (getenv("XBOXRECOMP_TEXDUMP")) {
+            static uint32_t textured_draws, untextured_draws;
+            if (te) textured_draws++; else untextured_draws++;
+            if ((textured_draws + untextured_draws) <= 10 ||
+                (textured_draws + untextured_draws) % 2000 == 0) {
+                fprintf(stderr, "[PGRAPH-D3D11] TEX draw stats: textured=%u "
+                        "untextured=%u (this draw: stage0 enabled=%d te=%p)\n",
+                        textured_draws, untextured_draws,
+                        g_pg.tex[0].enabled, (void *)te);
+            }
+        }
+    }
+
     /* Begin scene if needed */
     dev->lpVtbl->BeginScene(dev);
 
@@ -987,6 +1511,67 @@ static void submit_draw(void)
                 g_pg.stats.draw_calls, num_verts, actual_prim_type, prim_count,
                 use_vsh ? "yes" : "no", use_vsh ? vsh_stride : (unsigned)sizeof(OutputVertex));
     }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * Texture state diagnostic (temporary, opt-in)
+ *
+ * Real texture upload (format decode, swizzle, mip handling) is not
+ * implemented yet -- this dumps decoded texture-stage state, once per
+ * distinct value seen per stage, so what Breakdown actually programs
+ * (swizzled vs linear, which COLOR code, dimensions, pitch) can be read
+ * directly instead of guessed at before committing to an implementation.
+ * Same pattern as XBOXRECOMP_VSHDUMP: env-gated, off by default, safe to
+ * leave in. Field masks/shifts are NV097_SET_TEXTURE_* from nv2a_regs.h,
+ * not restated from memory.
+ * ══════════════════════════════════════════════════════════════════════ */
+static void texdump_stage(int stage)
+{
+    static uint32_t last_offset[4], last_format[4], last_control0[4],
+                     last_control1[4], last_image_rect[4];
+    static int have_last[4];
+
+    if (!getenv("XBOXRECOMP_TEXDUMP"))
+        return;
+    if (stage < 0 || stage >= 4)
+        return;
+
+    if (have_last[stage] &&
+        last_offset[stage]     == g_pg.tex[stage].offset &&
+        last_format[stage]     == g_pg.tex[stage].format &&
+        last_control0[stage]   == g_pg.tex[stage].control0 &&
+        last_control1[stage]   == g_pg.tex[stage].control1 &&
+        last_image_rect[stage] == g_pg.tex[stage].image_rect)
+        return;  /* Nothing changed since the last dump for this stage */
+
+    last_offset[stage]     = g_pg.tex[stage].offset;
+    last_format[stage]     = g_pg.tex[stage].format;
+    last_control0[stage]   = g_pg.tex[stage].control0;
+    last_control1[stage]   = g_pg.tex[stage].control1;
+    last_image_rect[stage] = g_pg.tex[stage].image_rect;
+    have_last[stage] = 1;
+
+    uint32_t fmt = g_pg.tex[stage].format;
+    uint32_t color = (fmt & NV097_SET_TEXTURE_FORMAT_COLOR) >> 8;
+    uint32_t dim   = (fmt & NV097_SET_TEXTURE_FORMAT_DIMENSIONALITY) >> 4;
+    uint32_t mips  = (fmt & NV097_SET_TEXTURE_FORMAT_MIPMAP_LEVELS) >> 16;
+    uint32_t szu   = (fmt & NV097_SET_TEXTURE_FORMAT_BASE_SIZE_U) >> 20;
+    uint32_t szv   = (fmt & NV097_SET_TEXTURE_FORMAT_BASE_SIZE_V) >> 24;
+    uint32_t szp   = (fmt & NV097_SET_TEXTURE_FORMAT_BASE_SIZE_P) >> 28;
+    uint32_t cube  = (fmt & NV097_SET_TEXTURE_FORMAT_CUBEMAP_ENABLE) ? 1u : 0u;
+    uint32_t c0    = g_pg.tex[stage].control0;
+    uint32_t c1    = g_pg.tex[stage].control1;
+    uint32_t rect  = g_pg.tex[stage].image_rect;
+    uint32_t pitch = (c1 & NV097_SET_TEXTURE_CONTROL1_IMAGE_PITCH) >> 16;
+    uint32_t rect_w = (rect & NV097_SET_TEXTURE_IMAGE_RECT_WIDTH) >> 16;
+    uint32_t rect_h = (rect & NV097_SET_TEXTURE_IMAGE_RECT_HEIGHT);
+
+    fprintf(stderr, "[PGRAPH-D3D11] TEX[%d] offset=0x%08X format=0x%08X "
+            "(color=0x%02X dim=%u mips=%u log2_u=%u log2_v=%u log2_p=%u cube=%u) "
+            "control0=0x%08X (enable=%u) control1=0x%08X (pitch=%u) "
+            "image_rect=0x%08X (w=%u h=%u)\n",
+            stage, g_pg.tex[stage].offset, fmt, color, dim, mips, szu, szv, szp,
+            cube, c0, (c0 >> 30) & 1, c1, pitch, rect, rect_w, rect_h);
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -1151,6 +1736,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
     {
         int stage = (method - NV097_SET_TEXTURE_OFFSET) / 0x40;
         g_pg.tex[stage].offset = param;
+        texdump_stage(stage);
         return 1;
     }
     case NV097_SET_TEXTURE_FORMAT:
@@ -1160,6 +1746,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
     {
         int stage = (method - NV097_SET_TEXTURE_FORMAT) / 0x40;
         g_pg.tex[stage].format = param;
+        texdump_stage(stage);
         return 1;
     }
     case NV097_SET_TEXTURE_CONTROL0:
@@ -1170,6 +1757,37 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         int stage = (method - NV097_SET_TEXTURE_CONTROL0) / 0x40;
         g_pg.tex[stage].control0 = param;
         g_pg.tex[stage].enabled = (param >> 30) & 1;
+        texdump_stage(stage);
+        return 1;
+    }
+
+    /* CONTROL1 (pitch) and IMAGE_RECT (width/height) only matter for
+     * LINEAR formats -- SWIZZLED/compressed ones are tightly packed and
+     * get their (power-of-two) dimensions from FORMAT's BASE_SIZE_U/V log2
+     * fields instead (see the g_pg.tex[] struct comment above). Both used
+     * to fall into the 0x1B00-0x1C00 ignore range; tracked now because
+     * real texture upload needs them for whichever formats turn out to be
+     * LINEAR -- see texdump_stage() below for how that's being determined
+     * before committing to an upload implementation. */
+    case NV097_SET_TEXTURE_CONTROL1:
+    case NV097_SET_TEXTURE_CONTROL1 + 0x40:
+    case NV097_SET_TEXTURE_CONTROL1 + 0x80:
+    case NV097_SET_TEXTURE_CONTROL1 + 0xC0:
+    {
+        int stage = (method - NV097_SET_TEXTURE_CONTROL1) / 0x40;
+        g_pg.tex[stage].control1 = param;
+        texdump_stage(stage);
+        return 1;
+    }
+
+    case NV097_SET_TEXTURE_IMAGE_RECT:
+    case NV097_SET_TEXTURE_IMAGE_RECT + 0x40:
+    case NV097_SET_TEXTURE_IMAGE_RECT + 0x80:
+    case NV097_SET_TEXTURE_IMAGE_RECT + 0xC0:
+    {
+        int stage = (method - NV097_SET_TEXTURE_IMAGE_RECT) / 0x40;
+        g_pg.tex[stage].image_rect = param;
+        texdump_stage(stage);
         return 1;
     }
 
@@ -1204,6 +1822,14 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
          * intentionally not read here. */
         uint32_t fmt = param & NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE;
         uint32_t cnt = (param & NV097_SET_VERTEX_DATA_ARRAY_FORMAT_SIZE) >> 4;
+        /* TEMPORARY diagnostic (XBOXRECOMP_TEXDUMP): is per-vertex diffuse
+         * ever actually part of the stream for any draw, independent of
+         * both texturing and the current_diffuse default question? */
+        if (getenv("XBOXRECOMP_TEXDUMP") && slot == NV2A_VERTEX_ATTR_DIFFUSE &&
+            cnt != g_pg.vattr[slot].count) {
+            fprintf(stderr, "[PGRAPH-D3D11] vattr[DIFFUSE] count: %u -> %u\n",
+                    g_pg.vattr[slot].count, cnt);
+        }
         g_pg.vattr[slot].format = fmt;
         g_pg.vattr[slot].count = cnt;
         switch (fmt) {
@@ -1230,6 +1856,14 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
      * function (neither a case nor inside the ignore list), so it was
      * counted as "truly unhandled" and dropped. */
     case NV097_SET_DIFFUSE_COLOR4UB:
+        /* TEMPORARY diagnostic (XBOXRECOMP_TEXDUMP): does this title ever
+         * actually call this at all, or does every draw run on the static
+         * default the whole session? Deduped by value so it doesn't flood
+         * if the title does call it frequently with the same color. */
+        if (getenv("XBOXRECOMP_TEXDUMP") && param != g_pg.current_diffuse) {
+            fprintf(stderr, "[PGRAPH-D3D11] SET_DIFFUSE_COLOR4UB: 0x%08X -> 0x%08X\n",
+                    g_pg.current_diffuse, param);
+        }
         g_pg.current_diffuse = param;
         return 1;
 

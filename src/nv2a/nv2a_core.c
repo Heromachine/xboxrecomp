@@ -782,6 +782,34 @@ void nv2a_set_guest_ram(void *base, uint32_t size)
     fflush(stderr);
 }
 
+/* Accessor for anything else that needs guest RAM's base and size, so the
+ * 0x80000000/64MB convention lives in one place rather than being copied.
+ * Returns NULL if guest RAM was never handed over (nv2a_set_guest_ram()
+ * not yet called).
+ *
+ * CAUTION: this is the base the PUSH BUFFER uses, and "whole of RAM, zero
+ * base" is scoped to that object alone -- see the pfifo_pull() comment. It
+ * does NOT generalise to textures. That was measured the hard way: every
+ * byte read through here at a SET_TEXTURE_OFFSET address came back 0x00,
+ * for both formats this title uses, with a live-vs-cached comparison ruling
+ * out a read-before-write race. Real texture addressing is DMA-object base
+ * plus offset, the object chosen by a field in the format register
+ * (xemu pgraph/texture.c:85-99):
+ *     dma_select = GET_MASK(fmt, NV_PGRAPH_TEXFMT0_CONTEXT_DMA);
+ *     data = nv_dma_map(d, dma_select ? pg->dma_b : pg->dma_a, &len);
+ *     data += offset;
+ * This fork tracks neither SET_CONTEXT_DMA_A (0x0184) nor _B (0x0188).
+ * And nv_dma_map() above resolves against d->vram_ptr, a private
+ * VirtualAlloc block disconnected from guest RAM -- on real hardware there
+ * is no separate VRAM, GPU memory IS system memory -- so that path wants
+ * pointing at guest RAM before it can return anything real either. */
+const uint8_t *nv2a_get_guest_ram(uint32_t *out_size)
+{
+    if (out_size)
+        *out_size = g_guest_ram_size;
+    return g_guest_ram;
+}
+
 /* Read one push buffer dword.
  *
  * The Xbox memory controller drives a 26-bit address bus, so every physical

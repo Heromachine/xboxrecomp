@@ -246,6 +246,13 @@ void nv2a_raise_vblank(void);
  */
 void nv2a_set_guest_ram(void *base, uint32_t size);
 
+/* Read back the base/size nv2a_set_guest_ram() was given, for anything
+ * else that needs to resolve a physical guest-RAM address the same way
+ * the push buffer puller does (e.g. a texture DMA object's offset --
+ * see nv2a_pgraph_d3d11.c's texture upload). Returns NULL/leaves *out_size
+ * unset if guest RAM hasn't been armed yet. */
+const uint8_t *nv2a_get_guest_ram(uint32_t *out_size);
+
 /* ============================================================
  * Public API
  * ============================================================ */
