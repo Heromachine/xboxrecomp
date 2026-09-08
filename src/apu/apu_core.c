@@ -440,6 +440,41 @@ static void *mcpx_apu_frame_thread(void *arg)
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
+
+        /*
+         * Raise the APU interrupt. Ported from xemu apu.c:271-286, which this
+         * frame thread otherwise mirrors; the port had kept the three terms
+         * above but dropped the interrupt half of what they are for, so
+         * update_irq() ended up with a single call site -- the guest's own
+         * ISTS acknowledge -- and could therefore never raise anything the
+         * guest had not already been told about.
+         *
+         * The consequence was an inert ISR. Breakdown registers an APU
+         * interrupt routine and the kernel delivers it at 60 Hz; it reads
+         * NV_PAPU_ISTS, finds GINTSTS clear, and returns, every time. That is
+         * what left the intro movie unable to advance (HeroLab task 31bb489a).
+         *
+         * set_notify_status() in apu_vp.c already sets d->set_irq when a voice
+         * completes a notify -- the voice-completion path was fully present,
+         * with nothing anywhere to consume the flag. This is that consumer.
+         *
+         * !apu_active is exactly xemu's condition (XCNTMODE_OFF, or FECTL
+         * TRAPPED, or FECTL HALTED), reusing the terms already computed above.
+         *
+         * No bql_lock()/unlock() pair around update_irq() as xemu has: that is
+         * QEMU's big lock, which does not exist here. update_irq() touches
+         * only d->regs through qatomic ops and pci_irq_assert(), a no-op stub
+         * in qemu_shim.h, so calling it under d->lock is safe. The real
+         * delivery is not a PCI IRQ line at all -- it is the kernel's existing
+         * 60 Hz ISR dispatch reading an ISTS that is finally truthful.
+         */
+        if (!apu_active) {
+            d->set_irq = true;
+        }
+        if (d->set_irq) {
+            update_irq(d);
+            d->set_irq = false;
+        }
     }
 
     qemu_mutex_unlock(&d->lock);
@@ -531,6 +566,26 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread",
                        mcpx_apu_frame_thread, d, QEMU_THREAD_JOINABLE);
     mcpx_apu_wait_for_idle(d);
+
+    /*
+     * Let the frame thread actually run.
+     *
+     * d->pause_requested starts true and wait_for_idle() above re-asserts it,
+     * so at this point the thread is parked in qemu_cond_wait(). In xemu
+     * something always takes it back out: mcpx_apu_reset_hold() does
+     * wait_for_idle -> reset -> resume, and mcpx_apu_vm_state_change() resumes
+     * when the VM starts running. A standalone build has neither a device
+     * reset nor a VM state machine, and this port kept only ONE resume call --
+     * inside mcpx_apu_play_test_tone(), a debug helper. So unless someone
+     * played the test tone, the APU frame thread stayed parked from init for
+     * the life of the process: no voice processing, no notify completions, no
+     * interrupt sources, no audio.
+     *
+     * This is the standalone equivalent of "the VM is now running", and it
+     * mirrors the wait_for_idle -> resume order xemu's reset path uses.
+     * HeroLab task 31bb489a.
+     */
+    mcpx_apu_resume(d);
     qemu_mutex_unlock(&d->lock);
 
     fprintf(stderr, "[APU] MCPX APU initialized (standalone)\n");
