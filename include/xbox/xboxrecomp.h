@@ -49,6 +49,7 @@
 #include "dsound_xbox.h"        /* DirectSound compatibility */
 #include "xinput_xbox.h"        /* XInput compatibility */
 #include "apu.h"                /* MCPX APU public API */
+#include "apu_mmio_hook.h"      /* APU MMIO trapping / VEH integration */
 
 /* NV2A headers */
 #include "nv2a_state.h"         /* NV2A GPU state */

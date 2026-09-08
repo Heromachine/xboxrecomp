@@ -74,6 +74,14 @@ static void *g_nv2a_memory = NULL;
 /* MCPX southbridge register span: APU 0xFE800000 through NIC 0xFEF00000. */
 #define XBOX_MCPX_BASE 0xFE800000u
 #define XBOX_MCPX_SIZE (8u * 1024u * 1024u)
+/* The trapping APU window: the general + FE registers (0x00000-0x1FFFF) and
+ * the VP region (0x20000-0x2FFFF), which are the only parts src/apu actually
+ * models. GP (0x30000) and EP (0x50000) are unmodelled scratch MEMORY that the
+ * title memcpys through, so they stay plain RAM along with the rest of the
+ * MCPX aperture (AC97 +0x400000, USB +0x500000, NIC +0x700000).
+ * Must equal APU_MMIO_SIZE in apu_mmio_hook.h, which is the range the VEH
+ * dispatches on; see the fuller note there. */
+#define XBOX_APU_SIZE  0x00030000u
 static void *g_mcpx_memory = NULL;
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
@@ -273,6 +281,36 @@ static void xbox_Nv2aAckStart(void)
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
     }
+}
+
+/*
+ * Stop the ack thread, and wait for it to actually be gone.
+ *
+ * The thread writes NV2A_ACK / NV2A_IDLE registers through the NV2A aperture
+ * and MCPX_COUNTERS / MCPX_IDLE through the MCPX one, all as plain stores. The
+ * moment either aperture traps, those stores become faults -- and servicing
+ * them would push a background thread's guesses through the very MMIO path the
+ * register model now owns. Whatever those registers need has to come from the
+ * handlers instead.
+ *
+ * Both xbox_Nv2aEnableTrapping() and xbox_ApuEnableTrapping() call this, so
+ * neither depends on the other running first. That matters for the APU in
+ * particular: MCPX_COUNTERS[0] is offset 0x020010, which is inside the 512 KB
+ * the APU traps, so an ack thread left alive would fault against the APU model
+ * on every loop iteration.
+ *
+ * Safe to call when no thread is running, and safe to call twice.
+ */
+static void xbox_Nv2aAckStop(void)
+{
+    if (!g_nv2a_ack_thread) return;
+
+    InterlockedExchange(&g_nv2a_ack_stop, 1);
+    WaitForSingleObject(g_nv2a_ack_thread, 1000);
+    CloseHandle(g_nv2a_ack_thread);
+    g_nv2a_ack_thread = NULL;
+    fprintf(stderr, "  NV2A busy-bit ack thread stopped "
+            "(register semantics now come from device emulation)\n");
 }
 
 /* Separate allocation for Xbox kernel address space (0x80010000+).
@@ -925,19 +963,8 @@ BOOL xbox_Nv2aEnableTrapping(void)
         return FALSE;
     }
 
-    /* Stop the ack thread first. It writes NV2A_ACK / NV2A_IDLE registers
-     * through the aperture directly, so once the pages trap those writes
-     * become faults -- servicing them would push a background thread's guesses
-     * through the same MMIO path the register model owns. Whatever those
-     * registers need must come from the handlers now. */
-    if (g_nv2a_ack_thread) {
-        InterlockedExchange(&g_nv2a_ack_stop, 1);
-        WaitForSingleObject(g_nv2a_ack_thread, 1000);
-        CloseHandle(g_nv2a_ack_thread);
-        g_nv2a_ack_thread = NULL;
-        fprintf(stderr, "  NV2A busy-bit ack thread stopped "
-                "(register semantics now come from GPU emulation)\n");
-    }
+    /* Stop the ack thread first -- see xbox_Nv2aAckStop(). */
+    xbox_Nv2aAckStop();
 
     if (!VirtualProtect(g_nv2a_memory, XBOX_NV2A_SIZE,
                         PAGE_NOACCESS, &old_protect)) {
@@ -950,6 +977,45 @@ BOOL xbox_Nv2aEnableTrapping(void)
     fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA 0x%08X now "
             "TRAPPING (routed to GPU emulation)\n",
             XBOX_NV2A_SIZE / (1024 * 1024), XBOX_NV2A_BASE);
+    return TRUE;
+}
+
+/*
+ * Trap the APU register window so accesses route to the xemu-derived MCPX APU
+ * model in src/apu/ instead of reading and writing zeroed RAM.
+ *
+ * Only the first 512 KB of the 8 MB MCPX aperture moves. Everything above it
+ * -- AC97, USB, NIC -- keeps the plain-RAM treatment the aperture comment in
+ * xbox_MemoryLayoutInit() describes, because nothing models those and a read
+ * of zero there is survivable where a fault is not.
+ *
+ * PAGE_NOACCESS rather than the NV2A-adjacent alternative of trapping writes
+ * only: this model has to serve READS as well. The whole reason the aperture
+ * is being trapped is a guest busy-wait that polls for a completion value, and
+ * a poll that keeps reading back stale RAM never terminates no matter how
+ * faithfully the writes are handled.
+ */
+BOOL xbox_ApuEnableTrapping(void)
+{
+    DWORD old_protect = 0;
+
+    if (!g_mcpx_regs) {
+        fprintf(stderr, "  APU: no MCPX aperture to trap\n");
+        return FALSE;
+    }
+
+    xbox_Nv2aAckStop();
+
+    if (!VirtualProtect(g_mcpx_regs, XBOX_APU_SIZE,
+                        PAGE_NOACCESS, &old_protect)) {
+        fprintf(stderr, "  APU: failed to trap register window (error %lu); "
+                "falling back to plain RAM\n", GetLastError());
+        return FALSE;
+    }
+
+    fprintf(stderr, "  APU register window: %u KB at Xbox VA 0x%08X now "
+            "TRAPPING (routed to MCPX APU emulation)\n",
+            XBOX_APU_SIZE / 1024, XBOX_MCPX_BASE);
     return TRUE;
 }
 

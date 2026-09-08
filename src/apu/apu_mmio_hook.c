@@ -5,7 +5,7 @@
  * but routes reads/writes through the MCPX APU register handlers.
  */
 
-#include "apu.h"
+#include "apu_mmio_hook.h"
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -20,9 +20,8 @@ MCPXAPUState *g_apu_state = NULL;
 #if defined(_WIN32)
 #include <windows.h>
 
-/* APU MMIO base in Xbox VA space */
-#define APU_MMIO_BASE  0xFE800000u
-#define APU_MMIO_SIZE  0x00080000u  /* 512KB */
+/* APU_MMIO_BASE / APU_MMIO_SIZE now live in apu_mmio_hook.h, so the VEH
+ * caller ranges on exactly the values this decoder subtracts. */
 
 /* (g_apu_state is defined above, outside the Win32 guard) */
 
@@ -237,6 +236,148 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
         ctx->Rip += prefix_len + 1 + modrm_len;
         g_apu_mmio_write_count++;
         return true;
+    }
+
+    /* ── Group 1: ADD/OR/ADC/SBB/AND/SUB/XOR/CMP r/m, imm (80/81/83) ──
+     *
+     * Ported from nv2a_mmio_hook.c, which had both this and Group 3 while this
+     * decoder had neither. The operation lives in the ModRM reg field, not the
+     * opcode. This is what `MEM32(reg) |= BIT` and `MEM32(reg) &= ~BIT` compile
+     * to, which makes it the most common way lifted code drives a hardware
+     * register: every set-a-bit / wait-for-hardware-to-clear-it handshake goes
+     * through here. On the GPU side its absence was why the very first NV2A
+     * access could not be decoded, so it is included here pre-emptively rather
+     * than waiting for the same crash on the audio side.
+     */
+    if (opcode[0] == 0x80 || opcode[0] == 0x81 || opcode[0] == 0x83) {
+        int op = (opcode[1] >> 3) & 7;
+        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
+        const uint8_t *imm_ptr = opcode + 1 + modrm_len;
+        int imm_len;
+        uint64_t imm;
+
+        if (opcode[0] == 0x80) {
+            access_size = 1;
+            imm_len = 1;
+            imm = *imm_ptr;
+        } else if (opcode[0] == 0x83) {
+            /* imm8 sign-extended to the operand size */
+            imm_len = 1;
+            imm = (uint64_t)(int64_t)(int8_t)*imm_ptr;
+        } else if (access_size == 2) {
+            imm_len = 2;
+            imm = *(const uint16_t *)imm_ptr;
+        } else {
+            imm_len = 4;
+            imm = (uint64_t)(int64_t)*(const int32_t *)imm_ptr;
+        }
+
+        /* 1ULL << 64 is undefined, so build the mask without shifting by 64 */
+        uint64_t mask = (access_size >= 8) ? ~0ULL
+                                           : ((1ULL << (access_size * 8)) - 1);
+        uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size) & mask;
+        uint64_t rhs = imm & mask;
+        uint64_t cf_in = (ctx->EFlags & 0x0001) ? 1 : 0;
+        uint64_t result;
+        int carry = 0;
+        int is_cmp = 0;
+
+        switch (op) {
+        case 0: result = mem_val + rhs;         carry = ((result & mask) < mem_val); break; /* ADD */
+        case 1: result = mem_val | rhs;                                              break; /* OR  */
+        case 2: result = mem_val + rhs + cf_in; carry = ((result & mask) < mem_val); break; /* ADC */
+        case 3: result = mem_val - rhs - cf_in; carry = (mem_val < rhs + cf_in);     break; /* SBB */
+        case 4: result = mem_val & rhs;                                              break; /* AND */
+        case 5: result = mem_val - rhs;         carry = (mem_val < rhs);             break; /* SUB */
+        case 6: result = mem_val ^ rhs;                                              break; /* XOR */
+        default: result = mem_val - rhs;        carry = (mem_val < rhs); is_cmp = 1; break; /* CMP */
+        }
+        result &= mask;
+
+        /* Logical ops clear CF and OF on x86; arithmetic ones get a real CF. */
+        ctx->EFlags &= ~(0x0001 | 0x0040 | 0x0080 | 0x0800);
+        if (result == 0) ctx->EFlags |= 0x0040;                              /* ZF */
+        if (result & (1ULL << (access_size * 8 - 1))) ctx->EFlags |= 0x0080; /* SF */
+        if (carry) ctx->EFlags |= 0x0001;                                    /* CF */
+
+        if (is_cmp) {
+            g_apu_mmio_read_count++;
+        } else {
+            mcpx_apu_mmio_write(g_apu_state, mmio_offset, result, access_size);
+            g_apu_mmio_write_count++;
+        }
+
+        ctx->Rip += prefix_len + 1 + modrm_len + imm_len;
+        return true;
+    }
+
+    /* ── Group 3: TEST/NOT/NEG r/m (F6 /0-/3 imm8, F7 /0-/3 imm32) ──
+     *
+     * Ported from nv2a_mmio_hook.c. Also selected by the ModRM reg field.
+     * `test [reg], BIT` is the read half of the same handshakes Group 1 writes.
+     * This is the gap that crashed the first APU-enabled boot: the title issues
+     * `42 F7 04 0A 18 00` -- test dword [rdx+r9], 0x18 -- against APU offset
+     * 0x2000, and with no F7 case the decoder returned false and the VEH
+     * correctly escalated it to a fatal fault.
+     *
+     * MUL/DIV (/4-/7) take EAX implicitly and are left to the decode-fail path;
+     * nothing drives a hardware register through them.
+     */
+    if (opcode[0] == 0xF6 || opcode[0] == 0xF7) {
+        int op = (opcode[1] >> 3) & 7;
+
+        if (op <= 3) {
+            int modrm_len = decode_modrm_len(opcode + 1, rex_b);
+            const uint8_t *imm_ptr = opcode + 1 + modrm_len;
+            int imm_len = 0;
+            uint64_t imm = 0;
+
+            if (opcode[0] == 0xF6) access_size = 1;
+
+            if (op <= 1) {  /* TEST takes an immediate; NOT/NEG do not */
+                if (access_size == 1)      { imm_len = 1; imm = *imm_ptr; }
+                else if (access_size == 2) { imm_len = 2; imm = *(const uint16_t *)imm_ptr; }
+                else                       { imm_len = 4;
+                                             imm = (uint64_t)(int64_t)*(const int32_t *)imm_ptr; }
+            }
+
+            uint64_t mask = (access_size >= 8) ? ~0ULL
+                                               : ((1ULL << (access_size * 8)) - 1);
+            uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size) & mask;
+            uint64_t result;
+            int writes_back = 0;
+            int carry = 0;
+            int set_flags = 1;
+
+            if (op <= 1) {
+                result = mem_val & (imm & mask);          /* TEST */
+            } else if (op == 2) {
+                result = (~mem_val) & mask;               /* NOT: no flags */
+                writes_back = 1;
+                set_flags = 0;
+            } else {
+                result = (0 - mem_val) & mask;            /* NEG */
+                writes_back = 1;
+                carry = (mem_val != 0);
+            }
+
+            if (set_flags) {
+                ctx->EFlags &= ~(0x0001 | 0x0040 | 0x0080 | 0x0800);
+                if (result == 0) ctx->EFlags |= 0x0040;                              /* ZF */
+                if (result & (1ULL << (access_size * 8 - 1))) ctx->EFlags |= 0x0080; /* SF */
+                if (carry) ctx->EFlags |= 0x0001;                                    /* CF */
+            }
+
+            if (writes_back) {
+                mcpx_apu_mmio_write(g_apu_state, mmio_offset, result, access_size);
+                g_apu_mmio_write_count++;
+            } else {
+                g_apu_mmio_read_count++;
+            }
+
+            ctx->Rip += prefix_len + 1 + modrm_len + imm_len;
+            return true;
+        }
     }
 
     /* Unrecognized */

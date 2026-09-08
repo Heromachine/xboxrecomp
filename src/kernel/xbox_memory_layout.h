@@ -103,6 +103,23 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size);
 BOOL xbox_Nv2aEnableTrapping(void);
 
 /**
+ * Switch the APU register window (the first 512 KB of the MCPX aperture at
+ * XBOX_MCPX_BASE) from plain RAM to a trapping region, so that reads and
+ * writes route through apu_hook_handle_mmio() into the xemu-derived MCPX APU
+ * model in src/apu/. The rest of the MCPX aperture -- AC97, USB, NIC -- is
+ * untouched and stays plain RAM.
+ *
+ * Stops the NV2A ack thread if it is still running: it pokes MCPX_COUNTERS
+ * offset 0x020010 directly, which is inside the window about to trap.
+ *
+ * Call before mcpx_apu_init_standalone(), so the VEH can service the very
+ * first access, matching the order used for NV2A.
+ *
+ * @return TRUE if the window now traps.
+ */
+BOOL xbox_ApuEnableTrapping(void);
+
+/**
  * Release the reserved Xbox memory layout.
  */
 void xbox_MemoryLayoutShutdown(void);

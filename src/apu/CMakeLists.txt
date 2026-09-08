@@ -34,7 +34,14 @@ if(MSVC)
 endif()
 
 if(WIN32)
-    target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm)
+    # xaudio2_8 / ole32: apu_xaudio2.c asks for these with #pragma comment(lib),
+    # which only MSVC honours. Under mingw nothing supplied them, so the moment
+    # any consumer actually referenced an APU symbol the archive member got
+    # pulled in and the link failed on XAudio2Create. It never showed up before
+    # because nothing referenced the library at all. xaudio2_8 is the Win8+
+    # import lib and matches the XAudio2Create the file calls; it resolves
+    # under Wine, which ships xaudio2_8.dll as a builtin.
+    target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm xaudio2_8 ole32)
 else()
     # Linux: platform layer (Win32 primitives on POSIX) + SDL2 audio + libm
     find_package(SDL2 REQUIRED)
