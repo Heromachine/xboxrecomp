@@ -140,20 +140,56 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     set_notify_status(d, v, notifier, NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
 }
 
+/*
+ * This is the ONLY place a guest access reaches d->lock, and the guest
+ * reaches it through a VEH fault handler running on the guest's OWN OS
+ * thread (the 0xFE800000 aperture trap in apu_mmio_hook.c) rather than
+ * xemu's re-dispatched vCPU instruction. That made it a genuine blocking
+ * EnterCriticalSection() call contending against mcpx_apu_frame_thread,
+ * which holds d->lock across its whole per-frame pipeline -- and once
+ * a00d943 made that pipeline do real work instead of shuffling a masked
+ * memory alias, the frame thread stopped reliably releasing the lock on
+ * schedule (throttle() only drops it when caught up on its real-time
+ * budget) and the guest thread starved outright: Wine's own
+ * "RtlpWaitForCriticalSection ... wait timed out (60 sec)" (HeroLab task
+ * 0470e51b).
+ *
+ * A first attempt made the frame thread unconditionally yield d->lock
+ * once per iteration (unlock/Sleep(N)/lock). That masked the deadlock at
+ * Sleep(10) in casual testing but did NOT reliably clear it -- re-measured
+ * over several clean-rebuild runs, timeouts still fired about 2 out of 3
+ * runs, just less often than with no yield at all. It also throttled the
+ * frame thread to roughly 1/15th of its intended ~1500 Hz cadence, since a
+ * blanket sleep fires whether or not the guest is actually contending.
+ *
+ * The actual fix: this function's only guest-visible effect is a single
+ * bit in d->vp.voice_locked[], which is already read lock-free elsewhere
+ * (is_voice_locked() uses qatomic_read()). There is no reason the WRITE
+ * side needs d->lock at all -- an atomic read-modify-write on the same
+ * word is enough, and removes the guest's only path to that lock
+ * entirely rather than trying to guarantee it gets serviced in time. This
+ * is closer to xemu's actual invariant than the yield was: in xemu,
+ * mcpx_apu_read/write (the guest-facing MMIO dispatch) never take d->lock
+ * either, for exactly this reason.
+ */
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    qemu_mutex_lock(&d->lock);
 
     uint64_t mask = 1ULL << (v % 64);
     if (lock) {
-        d->vp.voice_locked[v / 64] |= mask;
+        qatomic_or(&d->vp.voice_locked[v / 64], mask);
     } else {
-        d->vp.voice_locked[v / 64] &= ~mask;
+        qatomic_and(&d->vp.voice_locked[v / 64], ~mask);
     }
 
+    /* WakeConditionVariable() is documented safe to call without holding
+     * the associated critical section; the only cost of not holding it is
+     * a possible redundant wakeup, never a missed one that matters here --
+     * every waiter on d->cond (mcpx_apu_wait_for_idle, the frame thread's
+     * pause_requested wait, throttle()'s pacing wait) rechecks its own
+     * condition in a loop rather than trusting the wakeup alone. */
     qemu_cond_signal(&d->cond);
-    qemu_mutex_unlock(&d->lock);
 }
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)

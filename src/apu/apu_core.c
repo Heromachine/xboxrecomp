@@ -477,60 +477,24 @@ static void *mcpx_apu_frame_thread(void *arg)
         }
 
         /*
-         * Yield d->lock once per iteration, unconditionally.
+         * NOTE: this loop used to end with an unconditional
+         * unlock/Sleep(N)/lock here, to give a guest thread blocked in
+         * voice_lock() (apu_vp.c) a window to acquire d->lock before this
+         * thread re-took it. That was a mitigation, not a fix: re-measured
+         * over several clean-rebuild runs, Sleep(10) still let Wine's
+         * "RtlpWaitForCriticalSection ... wait timed out (60 sec)" fire on
+         * roughly 2 of 3 runs (HeroLab task 0470e51b), and unconditionally
+         * sleeping every iteration also throttled this thread to roughly
+         * 1/15th of its intended ~1500 Hz cadence regardless of whether the
+         * guest was even contending.
          *
-         * In xemu, mcpx_apu_read/write -- the guest-facing MMIO dispatch --
-         * never take d->lock at all; only a handful of VP PIO writes reach
-         * voice_lock(), which is a brief, self-contained critical section.
-         * The frame thread's own hold on d->lock is broken up naturally by
-         * throttle()'s qemu_cond_timedwait(), which drops the lock while it
-         * paces frames to real time.
-         *
-         * That pacing guarantee doesn't hold here. throttle() only sleeps
-         * when the frame thread is caught up (remaining_ms > 0); once
-         * se_frame() falls behind schedule, throttle() returns immediately
-         * every iteration and the lock is held continuously across the
-         * whole while(!exiting) loop except for the brief pause_requested
-         * path. Since a00d943 (dropping the 0x03FFFFFF phys-RAM mask so the
-         * VP reads/writes real guest memory instead of a harmless masked
-         * alias) se_frame() does real, sometimes-slow work and this runtime
-         * hits exactly that "always behind" case.
-         *
-         * The other half of the asymmetry: in xemu a stalled vp_write() is
-         * a re-dispatched vCPU instruction, not a parked OS thread. Here,
-         * a guest access to the 0xFE800000 aperture reaches voice_lock()
-         * through a VEH fault handler running ON THE GUEST'S OWN THREAD, so
-         * it is a genuine blocking EnterCriticalSection() call. With the
-         * lock never released, that wait is unbounded -- observed directly
-         * as Wine's own "RtlpWaitForCriticalSection ... wait timed out ...
-         * (60 sec)" error (HeroLab task 0470e51b). xemu's granularity alone
-         * doesn't protect this runtime because it relies on a scheduling
-         * guarantee (frame processing usually fits its time budget) that a
-         * VEH-blocked guest thread cannot afford to depend on.
-         *
-         * Dropping and reacquiring the lock here gives a guest thread
-         * parked in voice_lock() a real window to get in, instead of
-         * starving for as long as the backlog lasts. The duration matters
-         * and was measured, not assumed: Sleep(0) (yield only if another
-         * ready thread of equal/higher priority exists) made no measurable
-         * difference -- still 2 Wine "RtlpWaitForCriticalSection ... wait
-         * timed out (60 sec)" hits per 130s run, frames stuck at 5. Sleep(1)
-         * (one scheduler quantum) got measurably further -- frames reached
-         * 300 before the guest thread starved out again, still 2 timeouts.
-         * Only Sleep(10) cleared it outright: 0 timeouts across two
-         * independent 130s runs, frames back to 7500 (the pre-a00d943
-         * level), full verification bar intact. A same-thread unlock/relock
-         * evidently isn't enough of a fairness signal under Wine's
-         * critical-section wakeup path when this thread is re-entering
-         * hundreds of times a second; a real double-digit-millisecond sleep
-         * is what actually lets the scheduler run the waiter. This trades
-         * APU frame-processing throughput for correctness -- acceptable at
-         * this stage (unblocking boot matters more than audio pacing) but
-         * worth revisiting if audio timing turns out to matter later.
+         * voice_lock() no longer takes d->lock at all -- it updates
+         * d->vp.voice_locked[] atomically instead (see the comment there).
+         * That removes the guest's only path to this lock entirely, so
+         * there is nothing here for a per-iteration yield to protect
+         * against; removing it restores this thread to its intended
+         * cadence.
          */
-        qemu_mutex_unlock(&d->lock);
-        Sleep(10);
-        qemu_mutex_lock(&d->lock);
     }
 
     qemu_mutex_unlock(&d->lock);
