@@ -667,7 +667,15 @@ class FunctionTranslator:
         # zero- and sign-extended to the compare's own width, so the branch
         # tests what the compare actually saw. Declared whenever a cmp/test
         # exists - the consuming jcc can be in a later basic block, or absent.
-        if any(insn.mnemonic in ("cmp", "test") for insn in instructions):
+        # cmpxchg belongs in this set too: it is the one flag setter whose
+        # result cannot be recovered by re-reading its operands at the jcc,
+        # because it overwrites one of them, so _lift_cmpxchg() latches the
+        # comparison into _fa and the predicate reads it back. A function whose
+        # only flag setter is a cmpxchg -- sub_001D46C1 in Breakdown, the APU
+        # interrupt drain routine -- otherwise never declares _fa at all and
+        # fails to compile. xadd is deliberately NOT here: its predicate tests
+        # the destination, which legitimately holds the sum afterwards.
+        if any(insn.mnemonic in ("cmp", "test", "cmpxchg") for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")
             lines.append("    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;")

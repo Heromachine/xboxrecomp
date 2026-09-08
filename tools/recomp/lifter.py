@@ -640,10 +640,17 @@ def _make_condition(jcc, flag_setter, flag_ops):
 
     # ── cmpxchg: compares accumulator with dest, sets ZF on match ──
     if flag_setter == "cmpxchg":
+        # ZF reflects the comparison made BEFORE the exchange, and cmpxchg
+        # writes one of the two things being compared: on a match it stores src
+        # into dst, on a mismatch it loads dst into the accumulator. So a lazy
+        # predicate that re-reads dst and eax at the jcc is wrong in BOTH
+        # directions -- after a mismatch it finds them equal, which is exactly
+        # backwards. _lift_cmpxchg() therefore latches the result into _fa at
+        # the instruction, and this reads that.
         if jcc in ("je", "jz"):
-            return f"({lhs} == eax)", desc
+            return "(_fa != 0)", desc
         if jcc in ("jne", "jnz"):
-            return f"({lhs} != eax)", desc
+            return "(_fa == 0)", desc
         return None
 
     # ── xadd: exchange and add, flags from addition ──
@@ -897,6 +904,10 @@ class Lifter:
             return self._lift_lea(insn, ops)
         if m == "xchg":
             return self._lift_xchg(insn, ops)
+        if m == "cmpxchg":
+            return self._lift_cmpxchg(insn, ops)
+        if m == "xadd":
+            return self._lift_xadd(insn, ops)
 
         # ── Stack ──
         if m == "push":
@@ -1194,6 +1205,80 @@ class Lifter:
             f"{{ uint32_t _tmp = {a};",
             _fmt_operand_write(ops[0], b),
             _fmt_operand_write(ops[1], "_tmp") + " }",
+        ]
+
+    def _lift_cmpxchg(self, insn, ops):
+        """cmpxchg dst, src -- compare the accumulator with dst and exchange.
+
+            if (eax == dst) { ZF = 1; dst = src; }
+            else            { ZF = 0; eax = dst; }
+
+        Unhandled, this fell through to the generic TODO fallback: a comment
+        and nothing else. That is not a missing optimisation, it is a lock-free
+        algorithm silently losing its only atomic step.
+
+        Breakdown hits it in sub_001D46C1, the routine its audio service loop
+        runs under KeSynchronizeExecution to drain pending APU interrupt flags:
+
+            mov eax, [ecx]          ; ecx = ctx+0x4B8, the pending word
+          retry:
+            cmpxchg [ecx], edx      ; edx = 0 -- atomically take it and clear it
+            jne retry
+            or [esi+0x4C0], eax     ; merge what was taken into the ready word
+
+        With the exchange missing the pending word is never cleared, so every
+        pass re-reads the same non-zero value, the ready word's bit 0 is set
+        again immediately, and sub_001D4CC3's drain loop -- which exits only
+        when nothing is pending -- can never terminate. HeroLab task 31bb489a.
+
+        Single-threaded semantics only: this runtime executes guest code without
+        a global lock, so a true atomic would need an interlocked intrinsic.
+        Emitting the compare-and-swap non-atomically restores the ALGORITHM,
+        which is what the guest is actually blocked on; a torn update between
+        the read and the write remains possible and is not what fails here.
+        """
+        if len(ops) < 2:
+            return ["/* cmpxchg: bad operands */"]
+        w = _operand_width(ops[0]) or 4
+        if w != 4:
+            # 8- and 16-bit forms compare against al/ax, which this register
+            # model reaches through LO8/LO16 accessors rather than a plain
+            # name. Neither appears in this title; left loud rather than
+            # guessed at.
+            return [f"/* TODO: cmpxchg {insn.op_str} (only the 32-bit form is lifted) */"]
+        dst = _fmt_operand_read(ops[0])
+        src = _fmt_operand_read(ops[1])
+        return [
+            f"{{ uint32_t _cx = {dst};",
+            "  _fa = (uint32_t)(_cx == eax); _fb = 0;",
+            "  if (_cx == eax) { " + _fmt_operand_write(ops[0], src) + " }",
+            "  else { eax = _cx; } } /* cmpxchg */",
+        ]
+
+    def _lift_xadd(self, insn, ops):
+        """xadd dst, src -- exchange and add.
+
+            temp = dst + src; src = dst; dst = temp;
+
+        Same fallback problem as cmpxchg, same class of consequence: it is the
+        primitive behind an interlocked increment, so losing it means a counter
+        that never moves. Both operands are read before either is written, so
+        overlapping operands are safe.
+
+        The existing jcc predicate for xadd tests dst against zero, which stays
+        correct here because dst ends up holding the sum.
+        """
+        if len(ops) < 2:
+            return ["/* xadd: bad operands */"]
+        w = _operand_width(ops[0]) or 4
+        if w != 4:
+            return [f"/* TODO: xadd {insn.op_str} (only the 32-bit form is lifted) */"]
+        dst = _fmt_operand_read(ops[0])
+        src = _fmt_operand_read(ops[1])
+        return [
+            f"{{ uint32_t _xa_d = {dst}; uint32_t _xa_s = {src};",
+            "  " + _fmt_operand_write(ops[1], "_xa_d"),
+            "  " + _fmt_operand_write(ops[0], "(uint32_t)(_xa_d + _xa_s)") + " } /* xadd */",
         ]
 
     # ── Stack ──
