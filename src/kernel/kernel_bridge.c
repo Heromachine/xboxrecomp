@@ -910,6 +910,62 @@ static void bridge_NtPulseEvent(void)
     g_eax = 0;
 }
 
+/* ── NtCreateSemaphore (ordinal 193, 4 args) ─────────────── */
+/*
+ * Unbridged, this was worse than a no-op: the default path returns 0, and 0 as
+ * an NTSTATUS is STATUS_SUCCESS. So the guest was told its semaphore had been
+ * created successfully while the out-handle was never written, leaving it
+ * holding a NULL handle it believed was valid. The visible symptom is a
+ * permanent block one call later:
+ *     NtWaitForSingleObjectEx: token=0x00000000 handle=0x0 timeout=INFINITE
+ * Breakdown creates it at guest 0x001AAE38 and releases at 0x001AAE74, a
+ * create/release pair in one routine. Same class the NtSetEvent comment above
+ * records for Halo's map-copy worker; a semaphore is just a counting version
+ * of the same handoff.
+ *
+ * xbox_NtCreateSemaphore() ignores ObjectAttributes (unnamed semaphores only),
+ * which is why the pointer is still translated but nothing depends on its
+ * contents. Local HANDLE then bridge_write_handle(), as NtCreateEvent does, so
+ * an 8-byte host handle never gets written through a 4-byte guest slot.
+ */
+static void bridge_NtCreateSemaphore(void)
+{
+    uint32_t handle_ptr   = STACK_ARG(0);
+    uint32_t obj_attr_ptr = STACK_ARG(1);
+    LONG     initial      = (LONG)STACK_ARG(2);
+    LONG     maximum      = (LONG)STACK_ARG(3);
+
+    HANDLE   local_handle = NULL;
+    NTSTATUS status = xbox_NtCreateSemaphore(
+        &local_handle, XBOX_TO_NATIVE(obj_attr_ptr), initial, maximum);
+
+    if (status >= 0 && handle_ptr)
+        bridge_write_handle(handle_ptr, local_handle);
+
+    g_eax = (uint32_t)status;
+}
+
+/* ── NtReleaseSemaphore (ordinal 222, 3 args) ────────────── */
+/*
+ * The other half of the pair. Unbridged it silently dropped every release, so
+ * even once creation works nothing would ever raise the count and a waiter
+ * would still sleep forever.
+ *
+ * PreviousCount is an optional out-parameter; XBOX_TO_NATIVE maps a NULL guest
+ * pointer to NULL, and xbox_NtReleaseSemaphore passes it straight to
+ * ReleaseSemaphore, which accepts NULL. Guest LONG and host LONG are both 4
+ * bytes, so this one needs no local-and-copy dance.
+ */
+static void bridge_NtReleaseSemaphore(void)
+{
+    HANDLE   handle   = bridge_resolve_handle(STACK_ARG(0));
+    LONG     release  = (LONG)STACK_ARG(1);
+    uint32_t prev_ptr = STACK_ARG(2);
+
+    g_eax = (uint32_t)xbox_NtReleaseSemaphore(
+        handle, release, (PLONG)XBOX_TO_NATIVE(prev_ptr));
+}
+
 /* ── NtWaitForSingleObjectEx (ordinal 234) ───────────────── */
 /*
  * Unbridged, this fell through to the "no bridge, returning 0" default -- and 0
@@ -2613,6 +2669,25 @@ static void bridge_NtCreateMutant(void)
 }
 
 /* ── NtResumeThread (ordinal 224, 2 args) */
+/* ── NtSuspendThread (ordinal 231, 2 args) ───────────────── */
+/*
+ * The exact sibling of bridge_NtResumeThread below, and it was the only half
+ * of the pair missing. Unbridged it returned 0 -- STATUS_SUCCESS -- without
+ * suspending anything, so a thread that asked to park itself carried straight
+ * on and asked again. That shows up as a three-call cycle running flat out:
+ * ordinal 231 61,966 times, NtReleaseSemaphore 61,964, NtWaitForSingleObjectEx
+ * 61,915 in one 120 s run -- a worker handing off and then failing to sleep.
+ *
+ * This became reachable only once the semaphore bridges above were added; it
+ * is the next thing the same code path does.
+ */
+static void bridge_NtSuspendThread(void)
+{
+    g_eax = (uint32_t)xbox_NtSuspendThread(
+        bridge_resolve_handle(STACK_ARG(0)),
+        (PULONG)XBOX_TO_NATIVE(STACK_ARG(1)));
+}
+
 static void bridge_NtResumeThread(void)
 {
     g_eax = (uint32_t)xbox_NtResumeThread(
@@ -3155,7 +3230,10 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* case  65: bridge_IoCreateDevice */
     /* case  97: bridge_KeCancelTimer */
     /* case 100: bridge_KeDisconnectInterrupt */
-    /* case 143: bridge_KeSetBasePriorityThread */
+    /* KeSetBasePriorityThread (143): bridge and its 8-byte arg entry both
+     * already existed. Two stack args, no out-parameter, nothing wider than 4
+     * bytes crossing the boundary. */
+    case 143: return bridge_KeSetBasePriorityThread;
     /* KeStallExecutionProcessor (151): the bridge and its arg-size entry
      * (line ~2792) both already existed; only this registration was missing.
      * Found 2026-09-07 because an MCPX/APU register wait in DSOUND
@@ -3171,9 +3249,32 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
      * the outer loop still retries forever -- it only stops that retry from
      * being free. */
     case 151: return bridge_KeStallExecutionProcessor;
-    /* case 175: bridge_MmLockUnlockBufferPages */
-    /* case 180: bridge_MmQueryAllocationSize */
+    /* MmLockUnlockBufferPages (175) and MmQueryAllocationSize (180): both
+     * bridges, both arg-size entries (12 and 4) and both xbox_Mm*
+     * implementations already existed; only these two registrations were
+     * missing, the same shape as ordinal 151 above. Breakdown calls both --
+     * 175 from guest 0x00204A93, 180 from guest 0x001D3D37, which is inside
+     * the audio code.
+     *
+     * 180 is the one that changes behaviour: xbox_MmQueryAllocationSize()
+     * answers with VirtualQuery's RegionSize, where the unbridged fallback
+     * silently returned 0. A buffer-management path told its buffer is zero
+     * bytes long does not do anything useful with it.
+     *
+     * 175 is a deliberate no-op inside (page locking is meaningless in user
+     * mode) and is registered for honesty rather than effect: an unbridged
+     * call is indistinguishable in the log from a missing one. */
+    case 175: return bridge_MmLockUnlockBufferPages;
+    case 180: return bridge_MmQueryAllocationSize;
     /* case 192: bridge_NtCreateMutant */
+    /* NtCreateSemaphore (193) / NtReleaseSemaphore (222): bridges written this
+     * session -- see their definitions for why an unbridged NtCreateSemaphore
+     * is actively harmful rather than merely absent (it reports SUCCESS and
+     * hands back a NULL handle). NtQuerySymbolicLinkObject (215) already had a
+     * bridge and only wanted registering. */
+    case 193: return bridge_NtCreateSemaphore;
+    case 215: return bridge_NtQuerySymbolicLinkObject;
+    case 222: return bridge_NtReleaseSemaphore;
     /* Routed. Checked against the memory-model warning above rather than
      * assumed mechanical: NtResumeThread takes a handle token and writes a
      * 4-byte suspend count through an optional out-parameter. Guest ULONG and
@@ -3186,7 +3287,11 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
      * unbridged it returned 0 (STATUS_SUCCESS) without resuming anything, so a
      * thread the title had created suspended never started. */
     case 224: return bridge_NtResumeThread;
-    /* case 250: bridge_ObfDereferenceObject */
+    case 231: return bridge_NtSuspendThread;
+    /* ObfDereferenceObject (250): fastcall, argument in ecx, arg-size entry
+     * correctly 0 -- the bridge reads g_ecx rather than the stack, so routing
+     * it does not disturb esp. */
+    case 250: return bridge_ObfDereferenceObject;
     /* case 252: bridge_PhyGetLinkState */
     /* case 253: bridge_PhyInitialize */
     /* case 305: bridge_RtlTimeToTimeFields */
