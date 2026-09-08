@@ -594,8 +594,51 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
 
     switch (Option) {
     case AV_OPTION_QUERY_AVPACK:
-        /* Report HDTV/Component pack - allows games to offer 480p/720p */
-        *Result = AV_PACK_HDTV;
+        /* Report HDTV/Component pack - allows games to offer 480p/720p.
+         *
+         * Neither extra bit OR'd in below is invented -- both are what
+         * Breakdown's OWN embedded video-mode table (a game-data array
+         * of {key, width<<16|height, ...} entries at guest 0x1CC860,
+         * walked via guest-side tracing at HeroLab task f542e7ac)
+         * requires to ever match, confirmed by instrumenting the
+         * title's own mode-search (sub_001C6574 -> sub_001C65ED in
+         * this title's disassembly) and watching it reject every
+         * candidate until the right bits were present:
+         *
+         *   Bit 8 (0x100): every one of 30 sampled table entries,
+         *   spanning pack types 3/4/5 (SCART/HDTV/VGA) and resolutions
+         *   from 640x240 to 1920x1080, carries this bit in the same
+         *   position. Without it, sub_001C6574's lookup never matches
+         *   any real row -- only the 0xFFFFFFFF sentinel past the end
+         *   of the table (confirmed: this is what happened before the
+         *   fix below existed at all).
+         *
+         *   Bit 22 (0x400000): needed for a SECOND, deeper check in
+         *   sub_001C65ED (`entry_key & eax` where `eax` is derived from
+         *   this Result value) that runs even after a table row matches
+         *   on width/height and three other bit-tests -- confirmed by
+         *   tracing entry index 19 (640x480, HDTV) all the way through
+         *   every earlier check successfully, only to fail on exactly
+         *   this one because bit 22 was 0. Every HDTV/SCART/VGA table
+         *   entry's own key has this bit set too (byte 2 of every
+         *   sampled key is >= 0x40), so it reads as a shared "supports
+         *   this whole class of modes" flag rather than anything
+         *   specific to HDTV -- but that is inference from the guest
+         *   data, not confirmed against hardware documentation.
+         *
+         * Without BOTH bits, the title's mode-search always returns
+         * E_FAIL (0x80004005), which is the actual branch that skips
+         * display initialization -- AvSetDisplayMode is never reached
+         * because of this, not because of the AV pack type itself.
+         * Neither bit's real-hardware meaning is confirmed against SDK
+         * documentation (none available in this sandbox); both are
+         * guest-observed ground truth, not values invented from memory.
+         * If display init still doesn't complete with both set, trace
+         * sub_001C65ED again rather than assume these two are wrong --
+         * the first fix (bit 8 alone) measurably changed the table
+         * lookup's outcome without yet being sufficient on its own, and
+         * the same could be true here. */
+        *Result = AV_PACK_HDTV | 0x100 | 0x400000;
         break;
 
     case AV_OPTION_QUERY_MODE:

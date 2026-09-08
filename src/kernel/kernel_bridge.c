@@ -1148,6 +1148,15 @@ static void bridge_AvSetDisplayMode(void)
     uint32_t pitch = STACK_ARG(4);
     uint32_t fb = STACK_ARG(5);
 
+    /* Kept diagnostic (HeroLab task 28b5168a): per prior
+     * measurement this is bridged and available but never actually called.
+     * Unconditional log so if that ever changes -- with the AvPack ordinals
+     * re-registered -- it is impossible to miss. */
+    fprintf(stderr, "  [AVPACK] AvSetDisplayMode(step=%u mode=0x%X format=0x%X "
+            "pitch=%u fb=0x%X) called from guest VA 0x%08X\n",
+            step, mode, format, pitch, fb, g_esp ? BRIDGE_MEM32(g_esp - 4) : 0);
+    fflush(stderr);
+
     xbox_AvSetDisplayMode(XBOX_TO_NATIVE(addr), step, mode, format, pitch, fb);
     g_eax = 0;
 }
@@ -1272,6 +1281,67 @@ static void bridge_KeInsertQueueDpc(void)
     fn();
 
     g_eax = 1;  /* TRUE: approximation -- we don't track already-queued state */
+}
+
+/* ── KeSynchronizeExecution (ordinal 153) ─────────────────
+ * BOOLEAN KeSynchronizeExecution(PKINTERRUPT Interrupt,
+ *                                 PKSYNCHRONIZE_ROUTINE SynchronizeRoutine,
+ *                                 PVOID SynchronizeContext)
+ *
+ * Same shape as KeInsertQueueDpc above before ITS fix: entirely unbridged, so
+ * every call fell through to the generic "no bridge for ordinal" path,
+ * silently returned FALSE, and SynchronizeRoutine never ran. Found live
+ * (2026-09-07) while tracing why Breakdown's namcologo.xmv stream stops after
+ * exactly two prefetched chunks: the streaming-buffer service loop
+ * (sub_001D4CC3 / sub_001DAA3C, guest addresses) calls this in a loop
+ * checking a per-buffer busy flag afterward, and the routine that is
+ * supposed to synchronize with the delivering interrupt and update that flag
+ * was never being invoked at all -- confirmed via the one-line-per-slot
+ * "[KERNEL] WARNING: no bridge for ordinal 153 ... called from guest VA
+ * 0x001D4CF7" this bridge already prints for any unwired ordinal.
+ *
+ * xbox_KeSynchronizeExecution() in kernel_sync.c is NOT used here: it casts
+ * SynchronizeRoutine straight to a host function pointer and calls it
+ * natively, which cannot work in this recompiler -- guest code is translated
+ * into differently-addressed host C functions (sub_XXXXXXXX, looked up by
+ * recomp_lookup/recomp_lookup_manual), not left callable at its literal
+ * 32-bit address. That guest memory happens to be identity-mapped in this
+ * build (xbox_memory_layout.c's "ideal case", offset 0) means the call reads
+ * as valid code bytes without a page fault, but they are the ORIGINAL x86
+ * instructions being executed as x86-64 host code with none of the expected
+ * register/stack state -- undefined, not a working invocation. Left
+ * un-deleted since removing it is a separate cleanup, not required for this
+ * fix.
+ *
+ * Runs SynchronizeRoutine synchronously on the calling thread, exactly like
+ * bridge_KeInsertQueueDpc's DeferredRoutine: this bridge already prefers
+ * running callbacks immediately over modeling real IRQL-based preemption,
+ * and "raise to the interrupt's IRQL and call the routine" on real hardware
+ * already happens synchronously on the caller's own thread. */
+static void bridge_KeSynchronizeExecution(void)
+{
+    uint32_t interrupt_va = STACK_ARG(0);
+    uint32_t routine      = STACK_ARG(1);
+    uint32_t context      = STACK_ARG(2);
+    recomp_func_t fn;
+    (void)interrupt_va;  /* not modeled -- opaque token only, same as elsewhere */
+
+    fn = recomp_lookup_manual(routine);
+    if (!fn) fn = recomp_lookup(routine);
+    if (!fn) {
+        fprintf(stderr, "  [KERNEL] KeSynchronizeExecution: routine 0x%08X "
+                "not resolvable\n", routine);
+        g_eax = 0;
+        return;
+    }
+
+    /* BOOLEAN SynchronizeRoutine(PVOID SynchronizeContext);
+     * stdcall, one argument, so the callee's own "ret 4" restores g_esp. */
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
+    g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;  /* dummy return address */
+    fn();
+    /* g_eax is now whatever SynchronizeRoutine returned -- pass it through
+     * unmodified, matching how a real call would leave eax for the caller. */
 }
 
 /* ── NV2A interrupt plumbing (ordinals 44, 98, 109) ───────
@@ -2388,15 +2458,41 @@ static void bridge_generic_stub(void)
 /* ── AvGetSavedDataAddress (ordinal 1, void) */
 static void bridge_AvGetSavedDataAddress(void)
 {
+    /* Kept diagnostic (HeroLab task 28b5168a, "what gates display
+     * init"): called only twice in a whole run per prior measurement, so
+     * logging every call unconditionally is cheap. The guest return address
+     * sits at [esp-4] at this point -- kernel_thunk_dispatch has already
+     * popped the dummy/return slot before invoking the bridge (see its own
+     * comment); this is the same expression bridge_HalReadWritePCISpace
+     * already uses successfully for the same purpose. */
+    fprintf(stderr, "  [AVPACK] AvGetSavedDataAddress called from guest VA 0x%08X\n",
+            g_esp ? BRIDGE_MEM32(g_esp - 4) : 0);
+    fflush(stderr);
     g_eax = (uint32_t)xbox_AvGetSavedDataAddress();
+    fprintf(stderr, "  [AVPACK] AvGetSavedDataAddress -> 0x%08X\n", g_eax);
+    fflush(stderr);
 }
 
 /* ── AvSendTVEncoderOption (ordinal 2, 4 args) */
 static void bridge_AvSendTVEncoderOption(void)
 {
+    /* Same rationale as AvGetSavedDataAddress above. Also log the Option
+     * argument and the Result actually written, so the branch the title
+     * takes afterward can be reasoned about from the SAME value it saw,
+     * not from what xbox_AvSendTVEncoderOption() is currently coded to
+     * return (already known: AV_OPTION_QUERY_AVPACK -> AV_PACK_HDTV). */
+    uint32_t option = STACK_ARG(1);
+    PULONG result_ptr = (PULONG)XBOX_TO_NATIVE(STACK_ARG(3));
+    fprintf(stderr, "  [AVPACK] AvSendTVEncoderOption(option=0x%02X, param=0x%X) "
+            "called from guest VA 0x%08X\n",
+            option, STACK_ARG(2), g_esp ? BRIDGE_MEM32(g_esp - 4) : 0);
+    fflush(stderr);
     xbox_AvSendTVEncoderOption(XBOX_TO_NATIVE(STACK_ARG(0)),
                                STACK_ARG(1), STACK_ARG(2),
-                               (PULONG)XBOX_TO_NATIVE(STACK_ARG(3)));
+                               result_ptr);
+    fprintf(stderr, "  [AVPACK] AvSendTVEncoderOption(option=0x%02X) -> *Result=0x%08X\n",
+            option, result_ptr ? *result_ptr : 0xDEADBEEF);
+    fflush(stderr);
     g_eax = 0;
 }
 
@@ -2937,6 +3033,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 145: return bridge_KeSetEvent;
     case 159: return bridge_KeWaitForSingleObject;
     case  99: return bridge_KeDelayExecutionThread;
+    case 153: return bridge_KeSynchronizeExecution;
     case 179: return bridge_MmQueryAddressProtect;
     case 232: return bridge_NtUserIoApcDispatcher;
     case  95: return bridge_KeBugCheck;
@@ -3029,18 +3126,30 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
      * leaving the kernel lying about the AV pack is a stopgap, not the
      * intended end state. The bridge functions above are written and correct.
      * HeroLab: Xbox Recompiler project, tasks b7d706a3 / a7c305d1. */
-    /* Still unregistered, but the reason has moved on -- retested 2026-09-06
-     * with the NV2A backend enabled and healthy (PFIFO queue-empty bits and
-     * the general ALU decoder in place, 3.7M GPU accesses, zero decode
-     * failures). Bridged, the title STILL stops after dsstdfx.bin, and the
-     * next path it builds is garbage: `D:\<binary junk>` instead of a
-     * filename. So the display path's blocker is now a memory-corruption bug
-     * producing a bad string, NOT the GPU model being incapable -- a
-     * different and more tractable problem than when these were first
-     * disabled. Chase that, then re-register both; they are correct and the
-     * kernel should not be claiming there is no AV pack. */
-    /* case   1: return bridge_AvGetSavedDataAddress; */
-    /* case   2: return bridge_AvSendTVEncoderOption; */
+    /* REGISTERED 2026-09-07. Everything above this line is history now, and
+     * every blocker it names was removed the same day: the push buffer
+     * executes, there is a window and a swap chain, and the MMX stub count is
+     * down from ~1,558 to ~45. Re-measured with all three in place -- bridged,
+     * boot is completely healthy: 35 file opens reaching namcologo.xmv, no bug
+     * checks, no faults, frames unchanged. Neither the 2026-09-06 stall after
+     * dsstdfx.bin nor the garbage path string reproduces at all.
+     *
+     * The garbage-string "memory corruption" lead directly above was therefore
+     * a symptom of the half-finished display path, not a bug of its own. Do
+     * not chase it.
+     *
+     * Nor was the AV pack TYPE ever the gate. What actually gated display init
+     * was two undocumented bits missing from the QUERY_AVPACK result; see
+     * xbox_AvSendTVEncoderOption in kernel_hal.c. With those added the title
+     * calls AvSetDisplayMode for the first time.
+     *
+     * The lesson, since this note misled a later reader once already: a
+     * comment describing a blocker is a snapshot, not a standing fact. When
+     * one says "re-register as soon as X can complete", check whether X
+     * completes now before trusting its conclusion.
+     * HeroLab tasks e305a8f6, 28b5168a. */
+    case   1: return bridge_AvGetSavedDataAddress;
+    case   2: return bridge_AvSendTVEncoderOption;
     case  17: return bridge_ExFreePool;   /* guest-heap free -- see note above */
     case  46: return bridge_HalReadWritePCISpace;  /* GPU discovery -- see kernel_hal.c */
     /* case  65: bridge_IoCreateDevice */
