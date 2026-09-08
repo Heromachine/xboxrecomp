@@ -839,6 +839,60 @@ static uint32_t tex_cache_key(int stage)
     return h ? h : 1u;  /* reserve 0 for "empty slot" */
 }
 
+/* ── Packed-YUV 4:2:2 unpack ────────────────────────────────────────
+ * Ported from xemu's hw/xbox/nv2a/pgraph/util.h (convert_yuy2_to_rgb /
+ * convert_uyvy_to_rgb), which is what its own texture.c uses for these
+ * two formats. Taken from there rather than written from a remembered
+ * BT.601 matrix on purpose: the coefficients AND the chroma-pair
+ * indexing both have to match hardware, and this project's most
+ * expensive recurring bug is a constant recalled instead of read.
+ *
+ * Both formats are 2 bytes per texel. They differ only in whether luma
+ * or chroma comes first in each pair, which is the whole reason NV2A
+ * gives them separate format codes:
+ *   0x24 CR8YB8CB8YA8 -> YUY2 (luma first)
+ *   0x25 YB8CR8YA8CB8 -> UYVY (chroma first)
+ * Chroma is shared between each even/odd texel pair, so the converter
+ * looks at its neighbour to find the other component -- which is why it
+ * indexes line[ix*2 +/- 1] and [ix*2 + 3] rather than a flat stride.
+ *
+ * Output is written B,G,R,A to match DXGI_FORMAT_B8G8R8A8_UNORM, the
+ * same target the A8R8G8B8 path uses; xemu writes R,G,B,A into its own
+ * RGBA surface, so the channel order here is deliberately swapped. */
+static uint8_t tex_cliptobyte(int x)
+{
+    return (uint8_t)((x < 0) ? 0 : ((x > 255) ? 255 : x));
+}
+
+static void tex_yuv422_to_bgra(const uint8_t *line, unsigned ix, int chroma_first,
+                               uint8_t *out)
+{
+    int c, d, e;
+    if (chroma_first) {           /* UYVY (0x25) */
+        c = (int)line[ix * 2 + 1] - 16;
+        if (ix % 2) {
+            d = (int)line[ix * 2 - 2] - 128;
+            e = (int)line[ix * 2] - 128;
+        } else {
+            d = (int)line[ix * 2] - 128;
+            e = (int)line[ix * 2 + 2] - 128;
+        }
+    } else {                      /* YUY2 (0x24) */
+        c = (int)line[ix * 2] - 16;
+        if (ix % 2) {
+            d = (int)line[ix * 2 - 1] - 128;
+            e = (int)line[ix * 2 + 1] - 128;
+        } else {
+            d = (int)line[ix * 2 + 1] - 128;
+            e = (int)line[ix * 2 + 3] - 128;
+        }
+    }
+    out[2] = tex_cliptobyte((298 * c + 409 * e + 128) >> 8);            /* R */
+    out[1] = tex_cliptobyte((298 * c - 100 * d - 208 * e + 128) >> 8);  /* G */
+    out[0] = tex_cliptobyte((298 * c + 516 * d + 128) >> 8);            /* B */
+    out[3] = 255;
+}
+
 /* Resolve (uploading/caching as needed) the texture bound to `stage`.
  * Returns NULL if the stage is disabled, or programmed with a format
  * this translator doesn't decode (see the file comment above) -- either
@@ -852,6 +906,8 @@ static TexCacheEntry *resolve_texture_stage(int stage)
     const uint8_t *guest_ram;
     uint32_t guest_ram_size;
     const uint8_t *src;
+    uint8_t *conv = NULL;
+    int is_yuv, chroma_first;
     TexCacheEntry *entry;
     D3D11_TEXTURE2D_DESC td;
     D3D11_SUBRESOURCE_DATA sd;
@@ -862,7 +918,10 @@ static TexCacheEntry *resolve_texture_stage(int stage)
         return NULL;
 
     color = (g_pg.tex[stage].format & NV097_SET_TEXTURE_FORMAT_COLOR) >> 8;
-    if (color != NV2A_TEX_COLOR_A8R8G8B8_LINEAR) {
+    is_yuv = (color == NV2A_TEX_COLOR_YUV_CR8YB8CB8YA8 ||
+              color == NV2A_TEX_COLOR_YUV_YB8CR8YA8CB8);
+    chroma_first = (color == NV2A_TEX_COLOR_YUV_YB8CR8YA8CB8);
+    if (color != NV2A_TEX_COLOR_A8R8G8B8_LINEAR && !is_yuv) {
         /* YUV movie texture and anything else: not decoded yet (see file
          * comment). Warn once per stage so this is visible without being
          * a flood -- 40k+ draws would otherwise repeat it every frame. */
@@ -901,7 +960,9 @@ static TexCacheEntry *resolve_texture_stage(int stage)
     if (width == 0 || height == 0)
         return NULL;  /* IMAGE_RECT not programmed yet */
     if (pitch == 0)
-        pitch = width * 4;  /* A8R8G8B8 is 4 bytes/texel; tightly packed if unset */
+        pitch = width * (is_yuv ? 2 : 4);  /* tightly packed if unset:
+                                            * A8R8G8B8 is 4 bytes/texel,
+                                            * packed YUV 4:2:2 is 2 */
 
     key = tex_cache_key(stage);
 
@@ -992,10 +1053,52 @@ static TexCacheEntry *resolve_texture_stage(int stage)
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
     memset(&sd, 0, sizeof(sd));
-    sd.pSysMem = src;
-    sd.SysMemPitch = pitch;
+    if (is_yuv) {
+        /* Unpack to BGRA. D3D11 has no packed-4:2:2 SRV format usable here,
+         * and the shader samples this like any other texture, so the
+         * conversion happens once at upload rather than per-pixel per-frame.
+         * The cache above means that is once per distinct movie frame.
+         *
+         * Bounds-check the source span first. The A8R8G8B8 path masks only
+         * the START offset and trusts the rest, which is survivable when the
+         * hardware hands the size back; here the loop below would read
+         * height*pitch bytes off a pointer derived from guest-programmed
+         * registers, so an over-long read is a host fault, not a bad pixel.
+         * Same bug class as the unguarded pointers this project has already
+         * been bitten by twice. */
+        uint32_t off = g_pg.tex[stage].offset & (guest_ram_size - 1);
+        uint64_t need = (uint64_t)(height - 1) * pitch + (uint64_t)width * 2;
+        uint32_t y, x;
+
+        if (need > (uint64_t)guest_ram_size - off) {
+            fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: YUV source span %llu bytes "
+                    "at 0x%08X exceeds guest RAM -- not uploading\n",
+                    stage, (unsigned long long)need, off);
+            memset(entry, 0, sizeof(*entry));
+            return NULL;
+        }
+
+        conv = (uint8_t *)malloc((size_t)width * height * 4);
+        if (!conv) {
+            memset(entry, 0, sizeof(*entry));
+            return NULL;
+        }
+        for (y = 0; y < height; y++) {
+            const uint8_t *line = src + (size_t)y * pitch;
+            uint8_t *out = conv + (size_t)y * width * 4;
+            for (x = 0; x < width; x++)
+                tex_yuv422_to_bgra(line, x, chroma_first, out + x * 4);
+        }
+        sd.pSysMem = conv;
+        sd.SysMemPitch = width * 4;
+    } else {
+        sd.pSysMem = src;
+        sd.SysMemPitch = pitch;
+    }
 
     hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, &sd, &entry->tex2d);
+    free(conv);  /* USAGE_IMMUTABLE copies at creation; safe to drop now */
+    conv = NULL;
     if (FAILED(hr)) {
         fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: CreateTexture2D failed: 0x%08lX "
                 "(%ux%u, pitch=%u, offset=0x%08X)\n",
@@ -1023,9 +1126,11 @@ static TexCacheEntry *resolve_texture_stage(int stage)
     entry->width = (float)width;
     entry->height = (float)height;
 
-    fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: uploaded %ux%u A8R8G8B8 from "
+    fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: uploaded %ux%u %s from "
             "offset=0x%08X pitch=%u (cache slot %d)\n",
-            stage, width, height, g_pg.tex[stage].offset, pitch, free_slot);
+            stage, width, height,
+            is_yuv ? (chroma_first ? "UYVY->BGRA" : "YUY2->BGRA") : "A8R8G8B8",
+            g_pg.tex[stage].offset, pitch, free_slot);
 
     if (getenv("XBOXRECOMP_TEXDUMP")) {
         /* Raw bytes actually read, so "the upload path is wired but the
