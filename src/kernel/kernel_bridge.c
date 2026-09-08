@@ -3156,7 +3156,21 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* case  97: bridge_KeCancelTimer */
     /* case 100: bridge_KeDisconnectInterrupt */
     /* case 143: bridge_KeSetBasePriorityThread */
-    /* case 151: bridge_KeStallExecutionProcessor */
+    /* KeStallExecutionProcessor (151): the bridge and its arg-size entry
+     * (line ~2792) both already existed; only this registration was missing.
+     * Found 2026-09-07 because an MCPX/APU register wait in DSOUND
+     * (guest ~0x001D4632) calls it in a bounded busy-retry that never sees
+     * its expected value, so it burns the full retry budget on every
+     * attempt -- unbridged, each call is a near-free "no bridge" fallback,
+     * so the retry loop span at native speed: 1.5B+ calls and 150+ MB of
+     * throttled-sample log per run. Bridging makes the 1us stall real
+     * (xbox_KeStallExecutionProcessor busy-waits for real via
+     * QueryPerformanceCounter), which paces each retry honestly and cuts
+     * the call rate by several orders of magnitude. This does NOT resolve
+     * the wait itself -- 0x1DBA8C still never takes the expected value, so
+     * the outer loop still retries forever -- it only stops that retry from
+     * being free. */
+    case 151: return bridge_KeStallExecutionProcessor;
     /* case 175: bridge_MmLockUnlockBufferPages */
     /* case 180: bridge_MmQueryAllocationSize */
     /* case 192: bridge_NtCreateMutant */
