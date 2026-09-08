@@ -2600,13 +2600,75 @@ static void bridge_ExFreePool(void)
 }
 
 /* ── IoCreateDevice (ordinal 65, 6 args) */
+/*
+ * Deliberately no longer forwards to xbox_IoCreateDevice() in kernel_io.c.
+ * That routing could not have worked, which is presumably why it stayed
+ * commented out, and it fails in two independent ways:
+ *
+ *  1. (PVOID*)XBOX_TO_NATIVE(STACK_ARG(5)) writes an 8-byte HOST pointer into
+ *     a 4-byte guest slot -- both the wrong value and four bytes of collateral.
+ *     bridge_NtCreateEvent's own comment warns about exactly this.
+ *  2. xbox_IoCreateDevice returns a HeapAlloc() block on the HOST heap and puts
+ *     DeviceExtension at offset 8 of its XBOX_FAKE_DEVICE (64-bit build). The
+ *     guest dereferences the result through MEM32 and reads DeviceExtension at
+ *     +0x18. Either mismatch alone yields a wild pointer.
+ *
+ * Unbridged it was worse than absent, the same class as NtCreateSemaphore
+ * above but with a destructive ending. Breakdown's Memory Unit driver -- the
+ * "MU__" tag at guest 0x00203F00 -- does:
+ *
+ *     call IoCreateDevice(..., ext_size=0x170, ..., &dev)
+ *     jl   fail                 ; the default 0 return reads as STATUS_SUCCESS
+ *     mov  eax, [ebp-4]         ; dev, NEVER WRITTEN -> stale stack slot
+ *     mov  edx, [eax+0x18]      ; DeviceExtension, dereferenced from garbage
+ *     rep  stosd (0x5C dwords)  ; 368-byte memset THROUGH THAT GARBAGE POINTER
+ *
+ * So every boot scribbled 368 zero bytes at an arbitrary guest address, and
+ * nothing pointed at it because the call had "succeeded".
+ *
+ * LAYOUT NOTE, read before changing the header size. The true Xbox
+ * DEVICE_OBJECT layout is not available here -- not in this tree, and not in
+ * xemu, which has no reason to model a kernel object. The ONE offset with
+ * evidence behind it is DeviceExtension at +0x18, read straight out of the
+ * guest code above. The header is therefore sized generously and zeroed rather
+ * than sized to a remembered number: an unknown field answering zero is
+ * survivable, and inventing a struct would be the constant-from-memory mistake
+ * this project keeps paying for. Revisit only with a real layout in hand.
+ */
+#define XBOX_DEVICE_OBJECT_HEADER 0x80u  /* >= any offset the evidence supports */
+
 static void bridge_IoCreateDevice(void)
 {
-    g_eax = (uint32_t)xbox_IoCreateDevice(
-        XBOX_TO_NATIVE(STACK_ARG(0)), STACK_ARG(1),
-        (PXBOX_ANSI_STRING)XBOX_TO_NATIVE(STACK_ARG(2)),
-        STACK_ARG(3), (BOOLEAN)STACK_ARG(4),
-        (PVOID*)XBOX_TO_NATIVE(STACK_ARG(5)));
+    uint32_t ext_size = STACK_ARG(1);
+    uint32_t out_ptr  = STACK_ARG(5);
+    uint32_t total, va, ext_va;
+
+    if (!out_ptr) {
+        g_eax = (uint32_t)STATUS_INVALID_PARAMETER;
+        return;
+    }
+
+    total = XBOX_DEVICE_OBJECT_HEADER + ext_size;
+    va = xbox_HeapAlloc(total, 16);
+    if (!va) {
+        *(uint32_t *)XBOX_TO_NATIVE(out_ptr) = 0;
+        g_eax = (uint32_t)STATUS_INSUFFICIENT_RESOURCES;
+        return;
+    }
+
+    /* xbox_HeapAlloc is a bump allocator and promises nothing about contents,
+     * and the caller reads fields this bridge does not set. */
+    memset(XBOX_TO_NATIVE(va), 0, total);
+
+    ext_va = ext_size ? (va + XBOX_DEVICE_OBJECT_HEADER) : 0;
+    *(uint32_t *)((uintptr_t)XBOX_TO_NATIVE(va) + 0x18) = ext_va;
+    *(uint32_t *)XBOX_TO_NATIVE(out_ptr) = va;
+
+    fprintf(stderr, "  [BRIDGE] IoCreateDevice: ext_size=%u -> device VA 0x%08X, "
+            "extension VA 0x%08X\n", ext_size, va, ext_va);
+    fflush(stderr);
+
+    g_eax = 0;  /* STATUS_SUCCESS */
 }
 
 /* ── KeCancelTimer (ordinal 97, 1 arg) */
@@ -3227,7 +3289,10 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case   2: return bridge_AvSendTVEncoderOption;
     case  17: return bridge_ExFreePool;   /* guest-heap free -- see note above */
     case  46: return bridge_HalReadWritePCISpace;  /* GPU discovery -- see kernel_hal.c */
-    /* case  65: bridge_IoCreateDevice */
+    /* IoCreateDevice (65): the last unbridged ordinal. Body rewritten to
+     * allocate in GUEST memory with DeviceExtension at +0x18; see it for the
+     * 368-byte wild memset the unbridged path caused on every boot. */
+    case  65: return bridge_IoCreateDevice;
     /* case  97: bridge_KeCancelTimer */
     /* case 100: bridge_KeDisconnectInterrupt */
     /* KeSetBasePriorityThread (143): bridge and its 8-byte arg entry both
