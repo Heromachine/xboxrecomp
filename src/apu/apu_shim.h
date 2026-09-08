@@ -93,34 +93,75 @@ static inline void qemu_thread_join(QemuThread *t) {
  * We access Xbox RAM via a global pointer, same as NV2A.
  * ============================================================ */
 
-extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
+extern uint8_t *g_apu_ram_ptr; /* Set at init to the host base of guest address 0 */
+
+/*
+ * Translate a guest address the APU was handed into a host pointer.
+ *
+ * These helpers used to mask with 0x03FFFFFF. That is correct in xemu, where
+ * the guest RAM object really is 64 MB of physical memory and the Xbox's
+ * 26-bit address bus makes every alias fold into it. It is WRONG here.
+ *
+ * This runtime maps guest RAM flat at g_apu_ram_ptr and builds 64 MB mirror
+ * views so the aliasing still works -- except three of those views fail to
+ * map, and one of the three is the important one: mirror 32 at host
+ * +0x80000000, which is exactly the Xbox physical-memory window every
+ * contiguous allocation lives in. MapViewOfFileEx returns 487
+ * (ERROR_INVALID_ADDRESS) there because the region is already occupied.
+ *
+ * So masking sent every APU access to the wrong memory. Breakdown's DSOUND
+ * completion handshake writes NV_PAPU_FEMEMADDR = 0x83FF5000 and then polls
+ * that same address for the sequence number FEMEMDATA is supposed to echo
+ * there. Masked, the echo landed at host +0x03FF5000 while the guest polled
+ * host +0x83FF5000, which still held the ~N the guest had poisoned it with --
+ * so the poll could never succeed. Measured directly: masked and unmasked
+ * addresses report ALIASED=NO, and the guest's mailbox reads 0xFFFFFFFE,
+ * 0xFFFFFFFD, 0xFFFFFFFC against echoes of 1, 2, 3. HeroLab task 31bb489a.
+ *
+ * Using the address as given is right for both forms this runtime produces: a
+ * 0x8xxxxxxx window address lands where the guest reads it, and a genuine low
+ * physical address still lands inside the flat map.
+ *
+ * The NULL return is the guard this file previously had none of -- an
+ * unvalidated register value became a wild host write, the same bug class as
+ * the timeout pointer that took out five sync functions on 2026-09-07. Reads
+ * answer 0 and writes are dropped rather than faulting the APU thread.
+ */
+#define APU_PHYS_DEVICE_BASE 0xF0000000u  /* NV2A/MCPX apertures start here */
+
+static inline void *apu_phys_ptr(hwaddr addr)
+{
+    uint32_t a = (uint32_t)addr;
+    if (!g_apu_ram_ptr || a == 0 || a >= APU_PHYS_DEVICE_BASE) return 0;
+    return g_apu_ram_ptr + a;
+}
 
 /* Little-endian physical memory reads */
 static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
-    (void)as;
-    return *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    void *p = apu_phys_ptr(addr); (void)as;
+    return p ? *(uint32_t *)p : 0;
 }
 static inline uint16_t lduw_le_phys(void *as, hwaddr addr) {
-    (void)as;
-    return *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    void *p = apu_phys_ptr(addr); (void)as;
+    return p ? *(uint16_t *)p : 0;
 }
 static inline uint8_t ldub_phys(void *as, hwaddr addr) {
-    (void)as;
-    return *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    void *p = apu_phys_ptr(addr); (void)as;
+    return p ? *(uint8_t *)p : 0;
 }
 
 /* Little-endian physical memory writes */
 static inline void stl_le_phys(void *as, hwaddr addr, uint32_t val) {
-    (void)as;
-    *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    void *p = apu_phys_ptr(addr); (void)as;
+    if (p) *(uint32_t *)p = val;
 }
 static inline void stw_le_phys(void *as, hwaddr addr, uint16_t val) {
-    (void)as;
-    *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    void *p = apu_phys_ptr(addr); (void)as;
+    if (p) *(uint16_t *)p = val;
 }
 static inline void stb_phys(void *as, hwaddr addr, uint8_t val) {
-    (void)as;
-    *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    void *p = apu_phys_ptr(addr); (void)as;
+    if (p) *(uint8_t *)p = val;
 }
 
 /* Stub address space - just passed to ldl_le_phys etc. (ignored) */
