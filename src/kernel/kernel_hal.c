@@ -101,6 +101,29 @@ static void xbox_update_tick_count(void)
  * Both Xbox and Windows return LARGE_INTEGER.
  * ============================================================================ */
 
+/* Guest RDTSC has a fixed frequency even when the host CPU differs.
+ * QueryPerformanceCounter is monotonic on Windows; the POSIX compatibility
+ * implementation uses CLOCK_MONOTONIC. Keep the separate KeQueryPerformance*
+ * APIs in their matching host units.
+ *
+ * Split whole seconds from the fractional remainder before multiplying: an
+ * absolute counter multiplied by the guest frequency would overflow quickly.
+ * Host QPC frequencies used here (Windows clocks or POSIX nanoseconds) keep
+ * the fractional product within uint64_t. Querying the frequency also avoids
+ * shared lazy-initialization state across guest threads. */
+uint64_t recomp_rdtsc64(void)
+{
+    LARGE_INTEGER counter, frequency;
+    const uint64_t guest_hz = 733333333ULL;
+    uint64_t ticks, hz;
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
+        return 0;
+    QueryPerformanceCounter(&counter);
+    ticks = (uint64_t)counter.QuadPart;
+    hz = (uint64_t)frequency.QuadPart;
+    return (ticks / hz) * guest_hz + ((ticks % hz) * guest_hz) / hz;
+}
+
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void)
 {
     LARGE_INTEGER counter;

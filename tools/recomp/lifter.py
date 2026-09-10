@@ -929,9 +929,9 @@ class Lifter:
         if m in ("mul", "div", "idiv"):
             return self._lift_muldiv(insn, ops, m)
         if m == "rdtsc":
-            # Real host cycle counter -> edx:eax, matching x86 rdtsc's
-            # output convention. See RECOMP_RDTSC64 in recomp_types.h for
-            # why an unscaled host read is the right fix, not a stub.
+            # Runtime-scaled Xbox CPU counter -> edx:eax, matching x86
+            # rdtsc's output convention. See RECOMP_RDTSC64 in
+            # recomp_types.h for why the guest frequency matters.
             return [
                 "{ uint64_t _tsc = RECOMP_RDTSC64();",
                 "  eax = (uint32_t)_tsc; edx = (uint32_t)(_tsc >> 32); } /* rdtsc */"

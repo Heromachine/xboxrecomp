@@ -945,40 +945,11 @@ static inline uint16_t BSWAP16(uint16_t v) {
     return (uint16_t)((v >> 8) | (v << 8));
 }
 
-/* ================================================================
- * rdtsc (Read Time-Stamp Counter)
- *
- * Xbox game code that hand-rolls high-resolution timing (movie
- * playback pacing, async I/O poll/timeout loops) reads this directly
- * instead of going through a kernel time call. Before this, the
- * lifter had no case for it and fell through to the generic
- * "unhandled instruction" path, which emits nothing -- eax/edx were
- * left holding whatever value the surrounding code last put there,
- * not a real counter. Any elapsed-time computation built on that
- * ("now - start") either never advances or moves nonsensically, and
- * a wait loop keyed on "has enough time passed" spins forever.
- * Confirmed on Breakdown: the base.pak loader's async-read wait
- * (0x00188EB0) hangs solid on exactly this pattern; the same rdtsc
- * opcode also appears in the D3D and XMV (movie) code, so a real,
- * monotonically increasing counter here is not just for this one
- * call site.
- *
- * A real host TSC read (not scaled to the Xbox's 733.33MHz part) is
- * used deliberately: guest code of this era self-calibrates a
- * ticks-per-millisecond ratio against a wall-clock reference rather
- * than assuming a fixed frequency, so any genuinely monotonic counter
- * satisfies it. Where the host has no TSC, clock() is a strictly
- * lower-resolution but still monotonically-increasing fallback --
- * never the silent stale-register readback this replaces.
- * ================================================================ */
-
-static inline uint64_t recomp_rdtsc64(void) {
-#if defined(__i386__) || defined(__x86_64__)
-    return __builtin_ia32_rdtsc();
-#else
-    return (uint64_t)clock();
-#endif
-}
+/* Guest RDTSC runs at the Xbox CPU frequency, not the host CPU frequency.
+ * Titles can use a fixed 733,333,333 Hz constant (Breakdown's XMV code does),
+ * so returning a raw host TSC makes elapsed time depend on the host machine.
+ * The kernel runtime derives this shared clock from monotonic host QPC. */
+uint64_t recomp_rdtsc64(void);
 #define RECOMP_RDTSC64() recomp_rdtsc64()
 
 /* ================================================================
