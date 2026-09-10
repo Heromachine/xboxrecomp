@@ -705,6 +705,7 @@ static void convert_vsh_vertex(const uint8_t *src_vb, const uint32_t src_offset[
 #define TEX_CACHE_SIZE 16
 typedef struct {
     uint32_t key;                 /* hash of offset/format/control1/image_rect */
+    uint32_t upload_frame;        /* YUV source refresh epoch (g_pg.stats.frames) */
     int      in_use;
     ID3D11Texture2D          *tex2d;
     ID3D11ShaderResourceView *srv;
@@ -968,43 +969,9 @@ static TexCacheEntry *resolve_texture_stage(int stage)
                                             * A8R8G8B8 is 4 bytes/texel,
                                             * packed YUV 4:2:2 is 2 */
 
-    key = tex_cache_key(stage);
-
-    /* Cache lookup */
-    free_slot = -1;
-    for (i = 0; i < TEX_CACHE_SIZE; i++) {
-        if (g_tex_cache[i].in_use && g_tex_cache[i].key == key) {
-            /* TEMPORARY: peek the CURRENT live bytes (bypassing the
-             * cached upload) and compare against what got cached, to
-             * tell apart "this memory is permanently blank" from "we
-             * cached it before the game finished writing it" -- a race
-             * the cache-once design would otherwise hide forever. Only
-             * reads 4 bytes and only under XBOXRECOMP_TEXDUMP; strip
-             * once the guest-RAM timing question is settled. */
-            if (getenv("XBOXRECOMP_TEXDUMP")) {
-                static uint32_t last_live[4];
-                uint32_t sz2;
-                const uint8_t *ram2 = nv2a_get_guest_ram(&sz2);
-                if (ram2 && sz2 && (sz2 & (sz2 - 1)) == 0) {
-                    const uint8_t *p2 = ram2 + (g_pg.tex[stage].offset & (sz2 - 1));
-                    uint32_t live;
-                    memcpy(&live, p2, 4);
-                    if (live != last_live[stage]) {
-                        fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: live bytes at "
-                                "offset=0x%08X changed: 0x%08X -> 0x%08X "
-                                "(cached upload was from an earlier read)\n",
-                                stage, g_pg.tex[stage].offset, last_live[stage], live);
-                        last_live[stage] = live;
-                    }
-                }
-            }
-            return &g_tex_cache[i];
-        }
-        if (free_slot < 0 && !g_tex_cache[i].in_use)
-            free_slot = i;
-    }
-
-    /* Cache miss: resolve guest RAM and upload. SET_TEXTURE_OFFSET is a
+    /* Resolve guest RAM before the cache lookup because mutable YUV surfaces
+     * need their current pixels even when their address and format are
+     * unchanged. SET_TEXTURE_OFFSET is a
      * physical address under the same "whole of RAM, zero base" DMA
      * object convention nv2a_core.c's push buffer puller uses for its
      * own reads -- nv2a_get_guest_ram() reads back the exact base/size
@@ -1061,6 +1028,63 @@ static TexCacheEntry *resolve_texture_stage(int stage)
     src = (is_yuv ? (guest_ram - 0x80000000u) : guest_ram)
         + (g_pg.tex[stage].offset & (guest_ram_size - 1));
 
+    if (is_yuv) {
+        uint32_t off = g_pg.tex[stage].offset & (guest_ram_size - 1);
+        uint64_t need = (uint64_t)(height - 1) * pitch + (uint64_t)width * 2;
+        if (need > (uint64_t)guest_ram_size - off) {
+            fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: YUV source span %llu bytes "
+                    "at 0x%08X exceeds guest RAM -- not uploading\n",
+                    stage, (unsigned long long)need, off);
+            return NULL;
+        }
+    }
+
+    key = tex_cache_key(stage);
+
+    /* Cache lookup. Static textures stay cache-once. Movie surfaces reuse
+     * the same two addresses while the decoder replaces their pixels, so a
+     * YUV hit is refreshed on the first draw of each PGRAPH frame. */
+    free_slot = -1;
+    for (i = 0; i < TEX_CACHE_SIZE; i++) {
+        if (g_tex_cache[i].in_use && g_tex_cache[i].key == key) {
+            entry = &g_tex_cache[i];
+            if (is_yuv && entry->upload_frame != g_pg.stats.frames) {
+                ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+                D3D11_MAPPED_SUBRESOURCE mapped;
+                HRESULT map_hr = E_FAIL;
+                uint32_t y, x;
+
+                if (ctx)
+                    map_hr = ID3D11DeviceContext_Map(ctx,
+                        (ID3D11Resource *)entry->tex2d, 0,
+                        D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+                if (SUCCEEDED(map_hr)) {
+                    for (y = 0; y < height; y++) {
+                        const uint8_t *line = src + (size_t)y * pitch;
+                        uint8_t *out = (uint8_t *)mapped.pData
+                            + (size_t)y * mapped.RowPitch;
+                        for (x = 0; x < width; x++)
+                            tex_yuv422_to_bgra(line, x, chroma_first,
+                                              out + x * 4);
+                    }
+                    ID3D11DeviceContext_Unmap(ctx,
+                        (ID3D11Resource *)entry->tex2d, 0);
+                    entry->upload_frame = g_pg.stats.frames;
+                } else {
+                    static int warned_map[4];
+                    if (!warned_map[stage]) {
+                        fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: dynamic YUV "
+                                "Map failed: 0x%08lX\n", stage, map_hr);
+                        warned_map[stage] = 1;
+                    }
+                }
+            }
+            return entry;
+        }
+        if (free_slot < 0 && !g_tex_cache[i].in_use)
+            free_slot = i;
+    }
+
     if (free_slot < 0) {
         /* Evict slot 0. Simple and rare in practice: Breakdown's own
          * texture set (icons + one movie frame texture, per XBOXRECOMP_
@@ -1085,8 +1109,9 @@ static TexCacheEntry *resolve_texture_stage(int stage)
      * memory layout, so this is a straight copy, no channel repacking. */
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.Usage = is_yuv ? D3D11_USAGE_DYNAMIC : D3D11_USAGE_IMMUTABLE;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags = is_yuv ? D3D11_CPU_ACCESS_WRITE : 0;
 
     memset(&sd, 0, sizeof(sd));
     if (is_yuv) {
@@ -1102,17 +1127,7 @@ static TexCacheEntry *resolve_texture_stage(int stage)
          * registers, so an over-long read is a host fault, not a bad pixel.
          * Same bug class as the unguarded pointers this project has already
          * been bitten by twice. */
-        uint32_t off = g_pg.tex[stage].offset & (guest_ram_size - 1);
-        uint64_t need = (uint64_t)(height - 1) * pitch + (uint64_t)width * 2;
         uint32_t y, x;
-
-        if (need > (uint64_t)guest_ram_size - off) {
-            fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: YUV source span %llu bytes "
-                    "at 0x%08X exceeds guest RAM -- not uploading\n",
-                    stage, (unsigned long long)need, off);
-            memset(entry, 0, sizeof(*entry));
-            return NULL;
-        }
 
         conv = (uint8_t *)malloc((size_t)width * height * 4);
         if (!conv) {
@@ -1133,7 +1148,7 @@ static TexCacheEntry *resolve_texture_stage(int stage)
     }
 
     hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, &sd, &entry->tex2d);
-    free(conv);  /* USAGE_IMMUTABLE copies at creation; safe to drop now */
+    free(conv);  /* CreateTexture2D copies initial data; safe to drop now */
     conv = NULL;
     if (FAILED(hr)) {
         fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: CreateTexture2D failed: 0x%08lX "
@@ -1158,6 +1173,7 @@ static TexCacheEntry *resolve_texture_stage(int stage)
     }
 
     entry->key = key;
+    entry->upload_frame = g_pg.stats.frames;
     entry->in_use = 1;
     entry->width = (float)width;
     entry->height = (float)height;
