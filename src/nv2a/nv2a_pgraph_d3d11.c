@@ -735,6 +735,10 @@ static const char *k_tex_ps_src =
     "struct PS_IN {\n"
     "    float4 pos   : SV_POSITION;\n"
     "    float4 color : COLOR0;\n"
+    /* Keep the VS_OUT prefix from d3d8_vsh.c, including unused COLOR1.
+     * Removing it shifts TEXCOORD0 onto the vertex shader's COLOR1 register,
+     * so every pixel samples one texel even when the vertex UVs vary. */
+    "    float4 specular : COLOR1;\n"
     "    float4 tex0  : TEXCOORD0;\n"
     "};\n"
     "float4 main(PS_IN input) : SV_TARGET {\n"
@@ -1023,7 +1027,39 @@ static TexCacheEntry *resolve_texture_stage(int stage)
          * stops holding. */
         return NULL;
     }
-    src = guest_ram + (g_pg.tex[stage].offset & (guest_ram_size - 1));
+    /* Textures live in the LOW map, not the contiguous mirror.
+     *
+     * nv2a_get_guest_ram() returns kernel_base + 0x80000000, the physical
+     * mirror. That base is correct for the push buffer -- verified for that
+     * one object in nv2a_core.c's pfifo_pull() comment -- but it was never
+     * verified for textures, and it is wrong for them here.
+     *
+     * The two views are NOT aliases in this runtime: xbox_MemoryLayoutInit
+     * gives the contiguous window its own committed storage, and three of the
+     * launcher's 64 MB mirror views (30/31/32, the one at host +0x80000000
+     * among them) fail to map with ERROR_INVALID_ADDRESS. So a texture written
+     * by the CPU through the low map is simply not visible 2 GB up.
+     *
+     * Measured, both views printed side by side for every texture this title
+     * programs (XBOXRECOMP_TEXDUMP):
+     *     0x02232800  mirror 00000000    low 10801080 10801080 ...
+     *     0x022C8800  mirror 00000000    low 10801080 10801080 ...
+     * 0x10801080 is YUY2 video black (Y=0x10, U=V=0x80) -- a real decoded
+     * frame, not noise. Every byte the old base read was zero, which is what
+     * the "textures are empty" note in nv2a_core.c recorded without being able
+     * to explain. This is why: the decoder was writing frames the whole time,
+     * to an address the GPU side was not looking at.
+     *
+     * Scoped to the YUV movie surfaces deliberately. The A8R8G8B8 textures
+     * read zero through BOTH views in the same capture, so they are a
+     * different problem (not yet populated at the time sampled) and nothing
+     * here is evidence about which base they want. Widen this only when a
+     * measurement supports it. The real fix is DMA-object resolution
+     * (SET_CONTEXT_DMA_A/_B -> RAMIN descriptor, xemu's nv_dma_map), which
+     * would derive the base per object instead of assuming one; this is the
+     * narrow, evidenced step toward it. */
+    src = (is_yuv ? (guest_ram - 0x80000000u) : guest_ram)
+        + (g_pg.tex[stage].offset & (guest_ram_size - 1));
 
     if (free_slot < 0) {
         /* Evict slot 0. Simple and rare in practice: Breakdown's own
@@ -1139,10 +1175,10 @@ static TexCacheEntry *resolve_texture_stage(int stage)
          * A handful of texels from the first row plus one from mid-image
          * (pitch bytes in) is enough to tell solid-color from real data
          * without dumping the whole texture. */
-        fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: first row: "
+        fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: offset=0x%08X color=0x%02X first row: "
                 "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X "
                 "... mid-image (row %u): %02X%02X%02X%02X\n",
-                stage,
+                stage, g_pg.tex[stage].offset, color,
                 src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
                 src[8], src[9], src[10], src[11], src[12], src[13], src[14], src[15],
                 height / 2,
