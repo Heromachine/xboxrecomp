@@ -21,7 +21,50 @@ import struct
 # at startup, so a by-value import would freeze the fallback layout.
 from .config import va_to_file_offset, is_code_address
 from .disasm import Disassembler
-from .lifter import Lifter, lift_basic_block, detect_seh_helpers
+from .lifter import Lifter, lift_basic_block, detect_seh_helpers, _make_condition
+
+
+def _plan_flag_materialisation(unresolved):
+    """Plan per-predecessor conditions for flag consumers at disagreeing merges.
+
+    unresolved: [(block, [(pred start, flag state)], [(address, mnemonic)])]
+    for every block whose predecessors set the incoming flags differently and
+    that reads them before setting its own.
+
+    Returns (cond_overrides, tail_stmts, decls) for lift_basic_block and the
+    function preamble. A block is planned only when every predecessor's state
+    yields a condition for every consumer; otherwise it keeps the fallback.
+    """
+    cond_overrides, tail_stmts, decls = {}, {}, []
+    for bb, pred_states, consumers in unresolved:
+        conds = []
+        for address, mnemonic in consumers:
+            if mnemonic.startswith("set"):
+                jcc = "j" + mnemonic[3:]
+            elif mnemonic.startswith("cmov"):
+                jcc = "j" + mnemonic[4:]
+            else:
+                jcc = mnemonic
+            per_pred = []
+            for pred, (setter, ops) in pred_states:
+                result = _make_condition(jcc, setter, ops)
+                if not result:
+                    break
+                per_pred.append((pred, result[0]))
+            else:
+                conds.append((address, mnemonic, per_pred))
+                continue
+            break
+        else:
+            for address, mnemonic, per_pred in conds:
+                var = f"_mf_{address:08X}"
+                cond_overrides.setdefault(bb.start, {})[address] = var
+                decls.append(f"    int {var} = 0; /* {mnemonic} at 0x{address:08X}:"
+                             f" set by each predecessor */")
+                for pred, cond in per_pred:
+                    tail_stmts.setdefault(pred, []).append(
+                        f"{var} = ({cond}) ? 1 : 0; /* {mnemonic} at 0x{address:08X} */")
+    return cond_overrides, tail_stmts, decls
 
 
 def _fixup_icall_esp_save(lines):
@@ -788,73 +831,109 @@ class FunctionTranslator:
             _, local_out_state[bb.start] = lift_basic_block(
                 self.lifter, bb, flag_state=None)
 
-        out_state = {}
-        for bb in blocks:
-            # Emit label if this block is a branch target
-            if bb.start in label_addrs or bb.start == start:
-                # The trailing ';' is load-bearing: C requires a statement after
-                # a label, and a block whose instructions all emit comments only
-                # (a lone `cmp`, which just sets flags for the next jcc) would
-                # otherwise produce `loc_X:` immediately before `}` and fail to
-                # compile. The null statement costs nothing and is always valid.
-                lines.append(f"loc_{bb.start:08X}: ;")
+        # The walk below runs twice when it has to. The first pass may find
+        # blocks whose predecessors set the flags in genuinely different ways
+        # (a `test` on one path, a `cmp` on the other) for a jcc that reads
+        # them. No single predicate is right for both, and giving up used to
+        # emit `if (_flags)` against a variable nothing assigns -- a branch
+        # that is never taken. Breakdown's movie decoder joins its normal and
+        # escape paths that way at the coefficient-sign `je`, so every
+        # coefficient came out negated. Instead, each predecessor evaluates
+        # the condition with its own flag state as control leaves it and
+        # stores it in a per-consumer variable, and the consumer tests that.
+        # The second pass re-lifts with that plan; the flag-state decisions
+        # are deterministic, so only the planned statements differ.
+        body_start = len(lines)
+        cond_overrides = {}   # block start -> {consumer address: variable}
+        tail_stmts = {}       # predecessor block start -> [statements]
+        for materialise in (False, True):
+            unresolved = []   # (bb, [(pred, state)], [(address, mnemonic)])
+            out_state = {}
+            for bb in blocks:
+                # Emit label if this block is a branch target
+                if bb.start in label_addrs or bb.start == start:
+                    # The trailing ';' is load-bearing: C requires a statement after
+                    # a label, and a block whose instructions all emit comments only
+                    # (a lone `cmp`, which just sets flags for the next jcc) would
+                    # otherwise produce `loc_X:` immediately before `}` and fail to
+                    # compile. The null statement costs nothing and is always valid.
+                    lines.append(f"loc_{bb.start:08X}: ;")
 
-            # Inherit the flag state only when every predecessor agrees on it.
-            # Blocks are walked in address order, so a back edge's predecessor
-            # may not have its real (incoming-dependent) out_state computed
-            # yet; fall back to that predecessor's local_out_state (see
-            # above) rather than giving up immediately -- it's exact whenever
-            # the predecessor sets flags itself, which covers the common
-            # `dec`/`jmp back to top` loop shape.
-            sources = preds[bb.start]
-            if bb.start == start or not sources:
-                incoming = None
-            else:
-                states = []
-                resolvable = True
-                for p in sources:
-                    if p in out_state:
-                        states.append(out_state[p])
-                    elif local_out_state.get(p) is not None:
-                        states.append(local_out_state[p])
-                    else:
-                        resolvable = False
-                        break
-                if resolvable and states:
-                    incoming = states[0]
-                    for other in states[1:]:
-                        if other != incoming:
-                            incoming = None
-                            break
-                    if incoming is None:
-                        # Raw states disagree (e.g. one predecessor is a
-                        # `dec`, another a `sub` into the same register) but
-                        # may still be behaviourally identical for *this*
-                        # block -- both resolve the same jcc to the same
-                        # condition. Ask the real lifter rather than
-                        # re-deriving that equivalence here: re-lift this
-                        # block with each distinct candidate and compare the
-                        # emitted statements. Only agreement on the actual
-                        # output is trusted; anything else keeps today's
-                        # conservative None.
-                        distinct = []
-                        for s in states:
-                            if s not in distinct:
-                                distinct.append(s)
-                        if len(distinct) > 1:
-                            outputs = [lift_basic_block(self.lifter, bb, flag_state=s)[0]
-                                       for s in distinct]
-                            if all(o == outputs[0] for o in outputs[1:]):
-                                incoming = distinct[0]
-                else:
+                # Inherit the flag state only when every predecessor agrees on it.
+                # Blocks are walked in address order, so a back edge's predecessor
+                # may not have its real (incoming-dependent) out_state computed
+                # yet; fall back to that predecessor's local_out_state (see
+                # above) rather than giving up immediately -- it's exact whenever
+                # the predecessor sets flags itself, which covers the common
+                # `dec`/`jmp back to top` loop shape.
+                sources = preds[bb.start]
+                pred_states = []
+                disagree = False
+                if bb.start == start or not sources:
                     incoming = None
+                else:
+                    states = []
+                    resolvable = True
+                    for p in sources:
+                        if p in out_state:
+                            states.append(out_state[p])
+                        elif local_out_state.get(p) is not None:
+                            states.append(local_out_state[p])
+                        else:
+                            resolvable = False
+                            break
+                        pred_states.append((p, states[-1]))
+                    if resolvable and states:
+                        incoming = states[0]
+                        for other in states[1:]:
+                            if other != incoming:
+                                incoming = None
+                                break
+                        if incoming is None:
+                            # Raw states disagree (e.g. one predecessor is a
+                            # `dec`, another a `sub` into the same register) but
+                            # may still be behaviourally identical for *this*
+                            # block -- both resolve the same jcc to the same
+                            # condition. Ask the real lifter rather than
+                            # re-deriving that equivalence here: re-lift this
+                            # block with each distinct candidate and compare the
+                            # emitted statements. Only agreement on the actual
+                            # output is trusted; anything else is planned below.
+                            distinct = []
+                            for s in states:
+                                if s not in distinct:
+                                    distinct.append(s)
+                            if len(distinct) > 1:
+                                outputs = [lift_basic_block(self.lifter, bb, flag_state=s)[0]
+                                           for s in distinct]
+                                if all(o == outputs[0] for o in outputs[1:]):
+                                    incoming = distinct[0]
+                            disagree = incoming is None
+                    else:
+                        incoming = None
 
-            stmts, out_state[bb.start] = lift_basic_block(
-                self.lifter, bb, flag_state=incoming)
-            for stmt in stmts:
-                lines.append(f"    {stmt}")
+                consumers = []
+                stmts, out_state[bb.start] = lift_basic_block(
+                    self.lifter, bb, flag_state=incoming,
+                    cond_overrides=cond_overrides.get(bb.start),
+                    tail_stmts=tail_stmts.get(bb.start),
+                    fallback_consumers=consumers)
+                if disagree and consumers:
+                    unresolved.append((bb, pred_states, consumers))
+                for stmt in stmts:
+                    lines.append(f"    {stmt}")
 
-            lines.append(f"")
+                lines.append(f"")
+
+            if materialise:
+                break
+            cond_overrides, tail_stmts, decls = _plan_flag_materialisation(unresolved)
+            if not decls:
+                break
+            del lines[body_start:]
+            at = body_start - 1 if body_start and lines[body_start - 1] == "" else body_start
+            lines[at:at] = decls
+            body_start += len(decls)
 
         # Continue into the next function when control runs off the bottom.
         if fallthrough_target is not None:

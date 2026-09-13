@@ -2749,7 +2749,14 @@ class Lifter:
         return [f"/* FPU: {m} {insn.op_str} */"]
 
 
-def lift_basic_block(lifter, bb, flag_state=None):
+_SETCC_TRACKED = ("sete", "setne", "setb", "setae", "setbe", "seta",
+                  "setl", "setge", "setle", "setg", "sets", "setns")
+_CMOVCC_TRACKED = ("cmove", "cmovne", "cmovb", "cmovae", "cmovbe", "cmova",
+                   "cmovl", "cmovge", "cmovle", "cmovg", "cmovs", "cmovns")
+
+
+def lift_basic_block(lifter, bb, flag_state=None, cond_overrides=None,
+                     tail_stmts=None, fallback_consumers=None):
     """
     Lift a basic block to C statements.
     Tracks flags to generate proper conditions for jcc/setcc/cmovcc.
@@ -2759,6 +2766,15 @@ def lift_basic_block(lifter, bb, flag_state=None):
         bb: BasicBlock with instructions
         flag_state: tuple of (flag_setter_mnemonic, flag_operands) from
                     a preceding block, or None
+        cond_overrides: {instruction address: C variable} for jcc/setcc/cmovcc
+                    that read flags entering the block from predecessors that
+                    disagree on them. Each predecessor stores the condition in
+                    the variable (see tail_stmts), so the consumer tests that.
+        tail_stmts: statements to run as control leaves this block - before
+                    its final jump, or at the end if it falls through.
+        fallback_consumers: if a list, receives (address, mnemonic) of every
+                    jcc/setcc/cmovcc that had to read flags entering the block
+                    without knowing what set them.
 
     Returns:
         (stmts, flag_state) where stmts is a list of C statement strings
@@ -2767,6 +2783,10 @@ def lift_basic_block(lifter, bb, flag_state=None):
     stmts = []
     insns = bb.instructions
     i = 0
+    tail_done = not tail_stmts
+    # Still reading the flags the block was entered with: nothing in the block
+    # has set, cleared or clobbered them yet.
+    from_incoming = True
 
     # Track the last instruction that set flags
     if flag_state:
@@ -2790,11 +2810,46 @@ def lift_basic_block(lifter, bb, flag_state=None):
             if flag_insn.mnemonic in ("cmp", "test") and len(flag_insn.operands) >= 2:
                 stmts.extend(lifter._snapshot_flags(
                     flag_insn, flag_insn.operands, flag_insn.mnemonic))
+            if not tail_done and i + consumed == len(insns):
+                stmts.extend(tail_stmts)     # after the snapshot, before the jump
+                tail_done = True
             stmts.append(stmt)
             last_flag_setter = flag_insn.mnemonic
             last_flag_ops = list(flag_insn.operands)
+            from_incoming = False
             i += consumed
             continue
+
+        if (not tail_done and i == len(insns) - 1
+                and (curr.is_branch or curr.is_ret)):
+            stmts.extend(tail_stmts)
+            tail_done = True
+
+        # A consumer of the incoming flags whose setter this block cannot know.
+        if (from_incoming and not last_flag_setter
+                and ((curr.is_cond_jump and curr.mnemonic not in ("jecxz", "jcxz"))
+                     or curr.mnemonic in _SETCC_TRACKED
+                     or curr.mnemonic in _CMOVCC_TRACKED)):
+            var = cond_overrides.get(curr.address) if cond_overrides else None
+            if var and (curr.is_cond_jump or len(curr.operands)
+                        >= (1 if curr.mnemonic in _SETCC_TRACKED else 2)):
+                if curr.is_cond_jump:
+                    info = COND_MAP.get(curr.mnemonic)
+                    desc = (info[2] if info else curr.mnemonic) + ", per predecessor"
+                    stmts.append(_emit_cond_goto(
+                        var, curr.mnemonic, desc, curr.jump_target, lifter))
+                elif curr.mnemonic in _SETCC_TRACKED:
+                    stmts.append(_fmt_operand_write(curr.operands[0], f"{var} ? 1 : 0")
+                                 + f" /* {curr.mnemonic}, per predecessor */")
+                else:
+                    stmts.append(f"if ({var}) "
+                                 + _fmt_operand_write(curr.operands[0],
+                                                      _fmt_operand_read(curr.operands[1]))
+                                 + f" /* {curr.mnemonic}, per predecessor */")
+                i += 1
+                continue
+            if fallback_consumers is not None:
+                fallback_consumers.append((curr.address, curr.mnemonic))
 
         # Handle jecxz/jcxz specially (not flag-based)
         if curr.mnemonic in ("jecxz", "jcxz"):
@@ -2816,9 +2871,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
-        if (curr.mnemonic in ("sete", "setne", "setb", "setae", "setbe",
-                              "seta", "setl", "setge", "setle", "setg",
-                              "sets", "setns")
+        if (curr.mnemonic in _SETCC_TRACKED
                 and last_flag_setter and len(curr.operands) >= 1):
             cond = _make_setcc_value(
                 curr.mnemonic, last_flag_setter, last_flag_ops)
@@ -2830,9 +2883,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
-        if (curr.mnemonic in ("cmove", "cmovne", "cmovb", "cmovae",
-                              "cmovbe", "cmova", "cmovl", "cmovge",
-                              "cmovle", "cmovg", "cmovs", "cmovns")
+        if (curr.mnemonic in _CMOVCC_TRACKED
                 and last_flag_setter and len(curr.operands) >= 2):
             cond = _make_cmovcc_cond(
                 curr.mnemonic, last_flag_setter, last_flag_ops)
@@ -2869,14 +2920,17 @@ def lift_basic_block(lifter, bb, flag_state=None):
         if curr.mnemonic in FLAG_SETTERS:
             last_flag_setter = curr.mnemonic
             last_flag_ops = list(curr.operands)
+            from_incoming = False
         elif curr.mnemonic in _FLAGS_UNDEFINED:
             # Flags are undefined after these - clear tracking
             last_flag_setter = None
             last_flag_ops = []
+            from_incoming = False
         elif curr.mnemonic in _EFLAGS_SETTERS:
             # Additional flag-setting instructions
             last_flag_setter = curr.mnemonic
             last_flag_ops = list(curr.operands)
+            from_incoming = False
         elif curr.mnemonic in _EFLAGS_PRESERVE:
             pass  # These don't affect EFLAGS
         elif curr.mnemonic in ("fcompi", "fcomip", "fucomi", "fucompi",
@@ -2884,11 +2938,13 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # FPU compare-to-EFLAGS: sets CF, ZF, PF directly
             last_flag_setter = curr.mnemonic
             last_flag_ops = list(curr.operands)
+            from_incoming = False
         elif curr.mnemonic == "sahf":
             # sahf loads AH into flags - typically after fnstsw ax
             # in the fcomp/fnstsw/sahf pattern for FPU comparisons
             last_flag_setter = "sahf"
             last_flag_ops = list(curr.operands)
+            from_incoming = False
         elif curr.mnemonic.startswith("f") or curr.mnemonic.startswith("cmov"):
             pass  # FPU and already-handled CMOVcc
         elif curr.mnemonic.startswith("j"):
@@ -2903,17 +2959,23 @@ def lift_basic_block(lifter, bb, flag_state=None):
             if "cmpsb" in raw_m or "scasb" in raw_m:
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
+                from_incoming = False
             elif "cmpsb" in rest or "scasb" in rest:
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
+                from_incoming = False
             else:
                 pass  # rep movs/stos = data movement, flags preserved
         else:
             # Unknown instruction - conservatively clear flag state
             last_flag_setter = None
             last_flag_ops = []
+            from_incoming = False
 
         i += 1
+
+    if not tail_done:
+        stmts.extend(tail_stmts)     # falls through: control leaves at the end
 
     out_flag_state = (last_flag_setter, last_flag_ops) if last_flag_setter else None
     return stmts, out_flag_state
