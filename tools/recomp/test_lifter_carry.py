@@ -1,3 +1,7 @@
+import pathlib
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 from .disasm import BasicBlock, Instruction, Operand
@@ -114,6 +118,77 @@ class CarryLifterTest(unittest.TestCase):
         generated = "\n".join(lifted)
 
         self.assertNotIn("_cf = (int)((eax) != 0);", generated)
+
+
+def _reg(name):
+    return Operand(type="reg", reg=name)
+
+
+def _cmp_sbb_block(lhs, rhs):
+    """cmp lhs, rhs / mov ecx, edx / sbb ebx, ebx / inc ebx.
+
+    The shape Breakdown's movie decoder uses for its end-of-block flag
+    (ebx = lhs >= rhs), with a flag-preserving instruction in between.
+    """
+    cmp = Instruction(0, 2, "cmp", f"{lhs}, {rhs}", "39d0")
+    cmp.operands = [_reg(lhs), _reg(rhs)]
+    mov = Instruction(2, 2, "mov", "ecx, edx", "89d1")
+    mov.operands = [_reg("ecx"), _reg("edx")]
+    sbb = Instruction(4, 2, "sbb", "ebx, ebx", "19db")
+    sbb.operands = [_reg("ebx"), _reg("ebx")]
+    inc = Instruction(6, 1, "inc", "ebx", "43")
+    inc.operands = [_reg("ebx")]
+    lifter = Lifter()
+    lifter.needs_cf = True   # the translator sets this for any function with sbb
+    lifted, _ = lift_basic_block(
+        lifter, BasicBlock(start=0, instructions=[cmp, mov, sbb, inc]))
+    return "\n".join(lifted)
+
+
+class CmpCarryLifterTest(unittest.TestCase):
+    def test_cmp_carry_feeds_sbb_across_mov(self):
+        generated = _cmp_sbb_block("eax", "edx")
+        self.assertIn("_cf = (int)(_fa < _fb);", generated)
+        self.assertLess(generated.index("_cf = (int)(_fa < _fb);"),
+                        generated.index("ebx = _cf ? 0xFFFFFFFF : 0;"))
+
+    def test_cmp_sbb_executes_as_x86(self):
+        """Compile the lifted block and check it against x86 borrow semantics.
+
+        _cf starts at both 0 and 1 to stand in for a carry left behind by
+        earlier code: the result must not depend on it.
+        """
+        cc = shutil.which("cc")
+        if not cc:
+            self.skipTest("C compiler required")
+        cases = [(0, 0), (0, 1), (1, 0), (5, 5), (0x7FFFFFFF, 0x80000000),
+                 (0xFFFFFFFF, 0), (0, 0xFFFFFFFF), (0x100, 0x001), (0x1FF, 0x2FE)]
+        for lhs, rhs, width in (("eax", "edx", 32), ("al", "dl", 8)):
+            body = _cmp_sbb_block(lhs, rhs)
+            source = (
+                "#include <stdint.h>\n#include <stdio.h>\n"
+                "#define LO8(r) ((uint8_t)((r) & 0xFF))\n"
+                "int main(void) {\n"
+                "    uint32_t eax, ebx, ecx, edx, _fa, _fb; int32_t _fas, _fbs; int _cf, stale;\n"
+                "    while (scanf(\"%u %u %d\", &eax, &edx, &stale) == 3) {\n"
+                "        _cf = stale; ebx = 0x5A5A5A5A;\n"
+                f"{body}\n"
+                "        (void)ecx; (void)_fas; (void)_fbs;\n"
+                "        printf(\"%u\\n\", ebx);\n"
+                "    }\n    return 0;\n}\n")
+            with tempfile.TemporaryDirectory() as tmp:
+                src = pathlib.Path(tmp) / "cmp_sbb.c"
+                exe = pathlib.Path(tmp) / "cmp_sbb"
+                src.write_text(source)
+                subprocess.run([cc, "-std=c11", "-Wall", "-Werror", str(src), "-o", str(exe)],
+                               check=True)
+                feed = "".join(f"{a} {b} {s}\n" for a, b in cases for s in (0, 1))
+                run = subprocess.run([str(exe)], input=feed, text=True,
+                                     capture_output=True, check=True)
+            mask = (1 << width) - 1
+            expected = [0 if (a & mask) < (b & mask) else 1 for a, b in cases for _ in (0, 1)]
+            self.assertEqual([int(x) for x in run.stdout.split()], expected,
+                             f"{width}-bit cmp/sbb")
 
 
 if __name__ == "__main__":

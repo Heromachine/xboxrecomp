@@ -1540,6 +1540,15 @@ class Lifter:
         Snapshotting fixes both: operands are read once, at the right
         width, in both a zero- and a sign-extended form so the jcc can
         pick whichever its condition needs.
+
+        The carry is produced here too. A jcc reads the snapshot, but an
+        adc/sbb reads _cf, and nothing used to write _cf for a cmp or test -
+        so "cmp a, b / sbb r, r" (r = a < b ? -1 : 0) picked up whatever
+        carry the last add or shift left behind. Breakdown's movie decoder
+        computes its end-of-block flag exactly that way, and the stale
+        carry ended coefficient blocks at random. The snapshot is already
+        masked to the compare's width, so the borrow is just _fa < _fb;
+        test always clears CF.
         """
         size = _operand_width(ops[0])
         if size is None:
@@ -1550,11 +1559,15 @@ class Lifter:
         sx = self._SNAP_SX[size]
         lhs = _fmt_operand_read(ops[0])
         rhs = _fmt_operand_read(ops[1])
-        return [
+        out = [
             f"_fa = (uint32_t)({lhs}) & {mask}; _fb = (uint32_t)({rhs}) & {mask};",
             f"_fas = (int32_t){sx}(_fa); _fbs = (int32_t){sx}(_fb);"
             f" /* {kind} {lhs}, {rhs} ({size*8}-bit) */",
         ]
+        if self.needs_cf:
+            out.append("_cf = (int)(_fa < _fb);" if kind == "cmp"
+                       else "_cf = 0; /* test clears CF */")
+        return out
 
     def _lift_cmp(self, insn, ops):
         if len(ops) < 2:

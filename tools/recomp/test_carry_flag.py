@@ -83,6 +83,37 @@ def test_no_cost_when_function_has_no_carry_consumer():
     assert "_cf" not in out, out
 
 
+AL = _Op("al", reg="al")
+DL = _Op("dl", reg="dl")
+
+
+def test_cmp_produces_borrow():
+    # "cmp eax, edx / sbb ebx, ebx" means ebx = eax < edx ? -1 : 0; the sbb
+    # reads _cf, so the cmp has to write it.
+    out = _lift("cmp", [EAX, EDX])
+    assert "_cf = (int)(_fa < _fb);" in out, out
+    # The borrow is taken from the snapshot, so it must come after it.
+    assert out.index("_fa =") < out.index("_cf ="), out
+
+
+def test_cmp_borrow_is_taken_at_compare_width():
+    # An 8-bit compare borrows on the low bytes: eax=0x100, edx=1 is a borrow
+    # for "cmp al, dl" even though eax > edx.
+    out = _lift("cmp", [AL, DL])
+    assert "& 0xFFu" in out, out
+    assert "_cf = (int)(_fa < _fb);" in out, out
+
+
+def test_test_clears_carry():
+    out = _lift("test", [EAX, EAX])
+    assert "_cf = 0" in out, out
+
+
+def test_cmp_and_test_cost_nothing_without_carry_consumer():
+    assert "_cf" not in _lift("cmp", [EAX, EDX], needs_cf=False)
+    assert "_cf" not in _lift("test", [EAX, EAX], needs_cf=False)
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
