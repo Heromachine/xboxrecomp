@@ -358,6 +358,14 @@ void xbox_ContigFree(uint32_t xbox_va);
 int xbox_IsContigAddress(uint32_t xbox_va);
 
 /**
+ * Size of a live block that xbox_ContigAlloc or xbox_HeapAlloc returned at
+ * exactly this address: page-rounded for contiguous blocks (what the console's
+ * MmQueryAllocationSize reports), exact for heap blocks. 0 for any other
+ * address. Thread-safe: no.
+ */
+uint32_t xbox_AllocationSize(uint32_t xbox_va);
+
+/**
  * Get the file mapping handle for the Xbox memory region.
  * Used by the VEH handler to map additional mirror views on demand.
  * Returns NULL if file mapping is not available.

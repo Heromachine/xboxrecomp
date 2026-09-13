@@ -2710,8 +2710,18 @@ static void bridge_MmLockUnlockBufferPages(void)
 /* ── MmQueryAllocationSize (ordinal 180, 1 arg) */
 static void bridge_MmQueryAllocationSize(void)
 {
-    g_eax = (uint32_t)xbox_MmQueryAllocationSize(
-        XBOX_TO_NATIVE(STACK_ARG(0)));
+    uint32_t va = STACK_ARG(0);
+    /* Ask the allocator that handed the block out. VirtualQuery cannot answer
+     * for those: the heap and the contiguous window are each one big host
+     * mapping, so RegionSize runs from the block to the end of the whole
+     * window. Breakdown's audio allocator zeroes whatever this returns right
+     * after allocating (guest 0x001D3D46); with RegionSize that wiped every
+     * contiguous block above the new one, including the free-list headers the
+     * previous allocation had just written. Addresses neither allocator knows
+     * (the pinned-physical path) keep the old answer. */
+    uint32_t size = xbox_AllocationSize(va);
+    g_eax = size ? size
+                 : (uint32_t)xbox_MmQueryAllocationSize(XBOX_TO_NATIVE(va));
 }
 
 /* ── NtCreateMutant (ordinal 192, 3 args) */
@@ -3321,10 +3331,11 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
      * 175 from guest 0x00204A93, 180 from guest 0x001D3D37, which is inside
      * the audio code.
      *
-     * 180 is the one that changes behaviour: xbox_MmQueryAllocationSize()
-     * answers with VirtualQuery's RegionSize, where the unbridged fallback
-     * silently returned 0. A buffer-management path told its buffer is zero
-     * bytes long does not do anything useful with it.
+     * 180 is the one that changes behaviour: the unbridged fallback silently
+     * returned 0, and a buffer-management path told its buffer is zero bytes
+     * long does not do anything useful with it. (The bridge now asks the
+     * allocator for the size; VirtualQuery's RegionSize, its first answer,
+     * overstated contiguous blocks by the rest of the window.)
      *
      * 175 is a deliberate no-op inside (page locking is meaningless in user
      * mode) and is registered for honesty rather than effect: an unbridged

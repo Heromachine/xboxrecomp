@@ -1421,6 +1421,29 @@ void xbox_ContigFree(uint32_t xbox_va)
     }
 }
 
+uint32_t xbox_AllocationSize(uint32_t xbox_va)
+{
+    if (!xbox_va) {
+        return 0;
+    }
+    /* Contiguous memory is handed out in whole pages, and every block starts
+     * on a page boundary below the one before it, so the rounded size is
+     * both what the console reports and still inside this block. */
+    for (int i = 0; i < g_contig_block_count; i++) {
+        if (g_contig_blocks[i].addr == xbox_va && !g_contig_blocks[i].free) {
+            return (g_contig_blocks[i].size + 4095u) & ~4095u;
+        }
+    }
+    /* Heap blocks are bump-allocated at 16-byte alignment: rounding would run
+     * into the next block, so report exactly what was handed out. */
+    for (int i = 0; i < g_heap_block_count; i++) {
+        if (g_heap_blocks[i].addr == xbox_va && !g_heap_blocks[i].free) {
+            return g_heap_blocks[i].size;
+        }
+    }
+    return 0;
+}
+
 HANDLE xbox_GetMappingHandle(void)
 {
     return g_mapping_handle;
