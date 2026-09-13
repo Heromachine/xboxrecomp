@@ -38,6 +38,8 @@ class _Insn:
         self.is_jump = is_jump
         self.is_cond_jump = is_cond_jump
         self.is_branch = is_jump or is_cond_jump
+        # _find_function_end reads this for every jmp since d31a798.
+        self.jump_table_base = None
 
 
 class _Engine:
