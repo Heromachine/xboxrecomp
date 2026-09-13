@@ -1095,29 +1095,27 @@ static int g_heap_block_count = 0;
 /*
  * Simulated stacks for spawned threads.
  *
- * The main thread owns the top of the XBOX_STACK region and grows down; worker
- * stacks are carved from the bottom upward so the two cannot meet until the
- * whole 8 MB is gone. Xbox VAs, not host memory: recompiled code addresses its
- * stack through MEM32() like any other Xbox pointer.
+ * The main thread owns the top of the XBOX_STACK region and grows down; every
+ * other guest stack comes out of the worker-slice table at the bottom (see
+ * XBOX_WORKER_STACK_* in xbox_memory_layout.h). A spawned game thread gets two
+ * adjacent slices, 512 KB. Xbox VAs, not host memory: recompiled code addresses
+ * its stack through MEM32() like any other Xbox pointer.
+ *
+ * This used to be a separate bump allocator over the same bottom of the region.
+ * The interrupt-delivery threads take worker slices, so both were live at once
+ * and handed out the same memory: in Breakdown the fourth interrupt thread ran
+ * its service routine at 60 Hz on the pak loader thread's stack (both at top
+ * 0x0087FFF0), zeroing the loader's job-priority limit, so it skipped every job
+ * and base.pak never finished loading.
  */
-#define XBOX_THREAD_STACK_SIZE  (512 * 1024)
-#define XBOX_MAX_THREAD_STACKS  8
-
-static int g_thread_stacks_used = 0;
-
 uint32_t xbox_AllocThreadStack(void)
 {
-    uint32_t base;
-
-    if (g_thread_stacks_used >= XBOX_MAX_THREAD_STACKS) {
+    int slot = xbox_worker_stack_alloc_span(2);
+    if (slot < 0) {
         return 0;
     }
-    base = XBOX_STACK_BASE +
-           (uint32_t)g_thread_stacks_used * XBOX_THREAD_STACK_SIZE;
-    g_thread_stacks_used++;
-
-    /* Top of the slice, 16-byte aligned, growing down. */
-    return base + XBOX_THREAD_STACK_SIZE - 16;
+    /* Top of the upper slice, 16-byte aligned, growing down across both. */
+    return XBOX_WORKER_STACK_TOP(slot + 1);
 }
 
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)

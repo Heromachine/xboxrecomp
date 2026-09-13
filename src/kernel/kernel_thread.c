@@ -403,10 +403,10 @@ NTSTATUS __stdcall xbox_NtResumeThread(
  * Ported from the Burnout 3 fork as the runtimes reunite. A host-driven title
  * returns from its entry after spawning an init thread and expects the host's
  * own thread to drive the per-frame tick; to call recompiled code from there it
- * needs a guest stack, which a worker slice provides. Additive: a default-model
- * title never calls any of this, so it is inert for Halo, Crimson Skies, etc.
- * See docs/technical/burnout3-reunification.md and XBOX_WORKER_STACK_* in
- * xbox_memory_layout.h.
+ * needs a guest stack, which a worker slice provides. The slice table is also
+ * where spawned game threads and interrupt-delivery threads get their stacks,
+ * in every title. See docs/technical/burnout3-reunification.md and
+ * XBOX_WORKER_STACK_* in xbox_memory_layout.h.
  */
 
 /* The game's own thread, kept so a wedged boot can be inspected from the host
@@ -424,12 +424,25 @@ static volatile LONG g_worker_stack_used[XBOX_WORKER_STACK_COUNT];
 
 int xbox_worker_stack_alloc(void)
 {
-    int i;
-    for (i = 0; i < XBOX_WORKER_STACK_COUNT; i++) {
-        if (InterlockedCompareExchange(&g_worker_stack_used[i], 1, 0) == 0)
-            return i;
+    return xbox_worker_stack_alloc_span(1);
+}
+
+int xbox_worker_stack_alloc_span(int count)
+{
+    int first, i;
+    for (first = 0; first + count <= XBOX_WORKER_STACK_COUNT; first++) {
+        /* Claim the run one slice at a time; if another thread holds any of
+         * it, give back what this attempt took and try the next start. */
+        for (i = 0; i < count; i++) {
+            if (InterlockedCompareExchange(&g_worker_stack_used[first + i], 1, 0) != 0)
+                break;
+        }
+        if (i == count)
+            return first;
+        while (i-- > 0)
+            InterlockedExchange(&g_worker_stack_used[first + i], 0);
     }
-    return -1;  /* all slices in use */
+    return -1;  /* no run of that many free slices */
 }
 
 void xbox_worker_stack_free(int slot)

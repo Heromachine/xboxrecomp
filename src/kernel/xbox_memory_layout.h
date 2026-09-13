@@ -264,15 +264,20 @@ void xbox_init_fake_tib(void);
  * code from the host's own message-loop thread, that thread needs a guest stack
  * (its g_esp starts at 0), which is what a worker slice provides.
  *
- * These slices carve the low end of the same 8 MB stack region xbox_AllocThreadStack
- * uses, and a title uses one model or the other -- never both -- so they do not
- * coexist at runtime. For a title that never calls xbox_worker_stack_alloc
- * (every default-model title), this is unused address space and dead code, so
- * adding it changes nothing for them.
+ * These slices are the one allocator for every guest stack but the main
+ * thread's: a spawned game thread takes two adjacent slices
+ * (xbox_AllocThreadStack), an interrupt-delivery thread or a host tick thread
+ * takes one. They used to share the low end of this region with a separate
+ * bump allocator for game threads, on the assumption that a title never needs
+ * both kinds -- but interrupt delivery takes slices in every title, and the two
+ * handed out the same memory.
+ *
+ * 24 slices is 6 MB, leaving the main thread the top 2 MB of the region, far
+ * above any Xbox title's own main-thread stack.
  */
 #define XBOX_WORKER_STACK_SIZE   (256 * 1024)
 #define XBOX_WORKER_STACK_BASE   XBOX_STACK_BASE             /* 0x00780000 */
-#define XBOX_WORKER_STACK_COUNT  16                          /* 4 MB total */
+#define XBOX_WORKER_STACK_COUNT  24                          /* 6 MB total */
 #define XBOX_WORKER_STACK_END    (XBOX_WORKER_STACK_BASE + \
                                   XBOX_WORKER_STACK_SIZE * XBOX_WORKER_STACK_COUNT)
 
@@ -381,10 +386,10 @@ HANDLE xbox_GetMappingHandle(void);
  * stack top, or 0 when the pool is exhausted. */
 uint32_t xbox_AllocThreadStack(void);
 
-/* Worker stack slices for host-tick-driven titles (see XBOX_WORKER_STACK_* and
- * docs/technical/burnout3-reunification.md). Additive; unused by default-model
- * titles. */
+/* Worker stack slices (see XBOX_WORKER_STACK_*): every guest stack except the
+ * main thread's comes from this one table. Thread-safe. */
 int  xbox_worker_stack_alloc(void);   /* slice index, or -1 if none free */
+int  xbox_worker_stack_alloc_span(int count); /* first of count adjacent slices, or -1 */
 void xbox_worker_stack_free(int slot);
 void   xbox_set_game_thread(void *h);  /* HANDLE, recorded for the host watchdog */
 void  *xbox_thread_debug_handle(void); /* the game thread, or NULL under inline model */
