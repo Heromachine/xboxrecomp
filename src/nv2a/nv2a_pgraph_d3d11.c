@@ -29,6 +29,7 @@
                           * section below for why a texture offset resolves
                           * through the exact same base/size the push
                           * buffer puller uses, not a second copy of it. */
+#include "nv2a_texconv.h"  /* S3TC and palettised texture decode */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -351,6 +352,12 @@ static struct {
                                * SWIZZLED formats get their (power-of-two)
                                * dimensions from the FORMAT register's
                                * BASE_SIZE_U/V log2 fields instead. */
+        uint32_t address;    /* Wrap/mirror/clamp per axis (SET_TEXTURE_
+                               * ADDRESS, 0x1B08) */
+        uint32_t filter;     /* Min/mag filter (SET_TEXTURE_FILTER, 0x1B14) */
+        uint32_t palette;    /* Palette offset, length and DMA for SZ_I8
+                               * (SET_TEXTURE_PALETTE, 0x1B20) */
+        uint32_t border_color; /* SET_TEXTURE_BORDER_COLOR, 0x1B24 */
         int enabled;         /* Decoded from control0 bit 30 */
     } tex[4];
 
@@ -667,20 +674,19 @@ static void convert_vsh_vertex(const uint8_t *src_vb, const uint32_t src_offset[
 /* ══════════════════════════════════════════════════════════════════════
  * Texture upload + pixel shader (VSH draw path only)
  *
- * Format support is deliberately narrow, matched to what Breakdown was
- * measured (XBOXRECOMP_TEXDUMP=1) actually programming: every texture
- * seen is NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8 (0x12, plain
- * 32bpp UI/icon textures) or _LC_IMAGE_CR8YB8CB8YA8 (0x24, a packed YUV
- * format -- almost certainly the namcologo.xmv movie decode texture,
- * given the boot sequence is still there). Both are LINEAR (the "LU_"/
- * "LC_" prefix in nv2a_regs.h, as opposed to "SZ_" for swizzled) --
- * nothing swizzled or DXT-compressed was ever observed, so no de-swizzle
- * or block-decompression is implemented here. A8R8G8B8 is handled below;
- * the YUV format is decoded (dimensions/pitch tracked) but not unpacked
- * to RGB -- see resolve_texture_stage()'s default case. If a future
- * title needs SWIZZLED or compressed formats, that is real additional
- * work (de-swizzle is a Z-order/Morton walk, not a memcpy) and should be
- * scoped separately rather than guessed at here.
+ * Format support follows what Breakdown was measured programming:
+ *   - LU_IMAGE_A8R8G8B8 (0x12): render targets and 32bpp images, copied as is.
+ *   - LC_IMAGE_CR8YB8CB8YA8 / YB8CR8YA8CB8 (0x24/0x25): the XMV movie
+ *     surfaces, unpacked from 4:2:2 to BGRA and refreshed every frame.
+ *   - L_DXT1 / L_DXT23 / L_DXT45 (0x0C/0x0E/0x0F): S3TC blocks, decoded on
+ *     the CPU (nv2a_texconv.c). The title screen's sprites are DXT4/5.
+ *   - SZ_I8_A8R8G8B8 (0x0B): swizzled 8-bit indices into a palette from
+ *     SET_TEXTURE_PALETTE, unswizzled and looked up (nv2a_texconv.c).
+ * "LU_"/"LC_" formats are LINEAR: IMAGE_RECT gives their size and CONTROL1
+ * their pitch. The rest are power-of-two sizes from the FORMAT register, with
+ * level 0 first; only level 0 is uploaded. Any other format -- the remaining
+ * SZ_ family, cube maps, volume textures -- shades diffuse-only and says so
+ * once in the log.
  *
  * UV space: confirmed against xemu's hw/xbox/nv2a/pgraph/glsl/psh.c line
  * ~127 (`state->rect_tex[i] = f.linear`) -- LINEAR-format NV2A textures
@@ -693,27 +699,47 @@ static void convert_vsh_vertex(const uint8_t *src_vb, const uint32_t src_offset[
  * dividing by the sampled texture's real size (psh.c ~line 1421); the
  * shader below does the same thing, in the same place (the pixel shader,
  * not the vertex shader) for the same reason -- only the pixel shader
- * knows which texture is actually bound to a given stage.
+ * knows which texture is actually bound to a given stage. Non-linear
+ * textures are sampled with ordinary [0,1] UVs, so for them the size passed
+ * to the shader is 1.
  * ══════════════════════════════════════════════════════════════════════ */
 
-/* Only the two formats actually observed; anything else falls through to
- * "unsupported" (NULL SRV -> diffuse-only shading) rather than a guess. */
+/* Formats decoded here; anything else falls through to "unsupported" (NULL
+ * SRV -> diffuse-only shading) rather than a guess. The S3TC and palettised
+ * codes live in nv2a_texconv.h with their decoders. */
 #define NV2A_TEX_COLOR_A8R8G8B8_LINEAR  0x12
 #define NV2A_TEX_COLOR_YUV_CR8YB8CB8YA8 0x24
 #define NV2A_TEX_COLOR_YUV_YB8CR8YA8CB8 0x25
 
-#define TEX_CACHE_SIZE 16
+/* Sized for a whole screen's textures at once. Breakdown's title screen binds
+ * about twenty, and with 16 slots and slot-0 eviction every frame re-uploaded
+ * (and re-decoded) some of them. */
+#define TEX_CACHE_SIZE 64
 typedef struct {
-    uint32_t key;                 /* hash of offset/format/control1/image_rect */
-    uint32_t upload_frame;        /* YUV source refresh epoch (g_pg.stats.frames) */
+    uint32_t key;                 /* hash of offset/format/control1/image_rect/palette */
+    uint32_t checked_frame;       /* g_pg.stats.frames when the source was last
+                                   * compared (or, for YUV, refreshed) */
+    uint32_t last_use;            /* g_tex_use_clock at the last bind, for LRU */
+    uint64_t content_hash;        /* source bytes (and palette) at upload */
     int      in_use;
+    int      normalized;          /* sampled with [0,1] UVs (non-linear formats) */
     ID3D11Texture2D          *tex2d;
     ID3D11ShaderResourceView *srv;
     float    width, height;       /* real texel dimensions, for UV normalization */
 } TexCacheEntry;
 
 static TexCacheEntry g_tex_cache[TEX_CACHE_SIZE];
-static ID3D11SamplerState *g_tex_sampler;   /* lazy-created, shared by all stages */
+static uint32_t g_tex_use_clock;
+
+/* One sampler per distinct address/filter/border combination the title uses. */
+#define SAMPLER_CACHE_SIZE 32
+typedef struct {
+    int      in_use;
+    uint32_t key;
+    uint32_t border_color;
+    ID3D11SamplerState *state;
+} SamplerCacheEntry;
+static SamplerCacheEntry g_sampler_cache[SAMPLER_CACHE_SIZE];
 static ID3D11PixelShader  *g_tex_ps;        /* lazy-compiled, shared by all draws */
 static ID3D11Buffer       *g_tex_ps_cb;     /* texSize0/hasTexture constant buffer */
 
@@ -798,33 +824,85 @@ static ID3D11PixelShader *get_tex_pixel_shader(void)
     return g_tex_ps;
 }
 
-static ID3D11SamplerState *get_tex_sampler(void)
+/* NV2A address modes (NV_PGRAPH_TEXADDRESS0_ADDRU_*) to D3D11. CLAMP_OGL is
+ * approximated as clamp-to-edge, as xemu does. 0 -- a register the title never
+ * wrote -- keeps the clamp this backend always used before. */
+static D3D11_TEXTURE_ADDRESS_MODE tex_address_mode(unsigned nv)
 {
+    switch (nv) {
+    case 1:  return D3D11_TEXTURE_ADDRESS_WRAP;
+    case 2:  return D3D11_TEXTURE_ADDRESS_MIRROR;
+    case 4:  return D3D11_TEXTURE_ADDRESS_BORDER;
+    case 3:                                   /* CLAMP_TO_EDGE */
+    case 5:                                   /* CLAMP_OGL */
+    default: return D3D11_TEXTURE_ADDRESS_CLAMP;
+    }
+}
+
+/* The sampler for `stage`'s address and filter registers (xemu stores both
+ * methods straight into NV_PGRAPH_TEXADDRESS0/TEXFILTER0, so their fields
+ * apply). Only level 0 is uploaded, so the mip half of a MIN filter doesn't
+ * matter: MIN codes 1/3/5 take the nearest texel and 2/4/6/7 filter, and MAG 1
+ * is nearest (xemu pgraph/gl/constants.h). */
+static ID3D11SamplerState *get_stage_sampler(int stage)
+{
+    uint32_t address = g_pg.tex[stage].address;
+    uint32_t filter = g_pg.tex[stage].filter;
+    unsigned addru = address & 0x7, addrv = (address >> 8) & 0x7;
+    unsigned minf = (filter & NV097_SET_TEXTURE_FILTER_MIN) >> 16;
+    unsigned magf = (filter & NV097_SET_TEXTURE_FILTER_MAG) >> 24;
+    int min_point = (minf == 1 || minf == 3 || minf == 5);
+    int mag_point = (magf == 1);
+    int border = (addru == 4 || addrv == 4);
+    uint32_t key = addru | (addrv << 3) | ((uint32_t)min_point << 6)
+                 | ((uint32_t)mag_point << 7);
+    uint32_t border_color = border ? g_pg.tex[stage].border_color : 0;
+    SamplerCacheEntry *slot = NULL;
     D3D11_SAMPLER_DESC sd;
     HRESULT hr;
+    int i;
 
-    if (g_tex_sampler)
-        return g_tex_sampler;
+    for (i = 0; i < SAMPLER_CACHE_SIZE; i++) {
+        SamplerCacheEntry *e = &g_sampler_cache[i];
+        if (e->in_use && e->key == key && e->border_color == border_color)
+            return e->state;
+        if (!e->in_use && !slot)
+            slot = e;
+    }
+    if (!slot)
+        slot = &g_sampler_cache[0];   /* past 32 combinations, recycle one */
+    if (slot->state)
+        ID3D11SamplerState_Release(slot->state);
+    memset(slot, 0, sizeof(*slot));
 
     memset(&sd, 0, sizeof(sd));
-    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-    /* CLAMP, not WRAP: we divide by the real texture size to normalize a
-     * texel-space UV (see the file comment above), so a UV that lands
-     * exactly on the texture's edge should clamp there, not wrap -- WRAP
-     * would only be correct if the source UV were already meant to tile,
-     * which nothing here has established. */
-    sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-    sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    if (min_point)
+        sd.Filter = mag_point ? D3D11_FILTER_MIN_MAG_MIP_POINT
+                              : D3D11_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT;
+    else
+        sd.Filter = mag_point ? D3D11_FILTER_MIN_LINEAR_MAG_MIP_POINT
+                              : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = tex_address_mode(addru);
+    sd.AddressV = tex_address_mode(addrv);
     sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    /* SET_TEXTURE_BORDER_COLOR is packed A8R8G8B8. */
+    sd.BorderColor[0] = ((border_color >> 16) & 0xFF) / 255.0f;
+    sd.BorderColor[1] = ((border_color >> 8) & 0xFF) / 255.0f;
+    sd.BorderColor[2] = (border_color & 0xFF) / 255.0f;
+    sd.BorderColor[3] = ((border_color >> 24) & 0xFF) / 255.0f;
     sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
     sd.MaxLOD = D3D11_FLOAT32_MAX;
 
-    hr = ID3D11Device_CreateSamplerState(d3d8_GetD3D11Device(), &sd, &g_tex_sampler);
+    hr = ID3D11Device_CreateSamplerState(d3d8_GetD3D11Device(), &sd, &slot->state);
     if (FAILED(hr)) {
         fprintf(stderr, "[PGRAPH-D3D11] TEX: CreateSamplerState failed: 0x%08lX\n", hr);
+        slot->state = NULL;
         return NULL;
     }
-    return g_tex_sampler;
+    slot->in_use = 1;
+    slot->key = key;
+    slot->border_color = border_color;
+    return slot->state;
 }
 
 static uint32_t tex_cache_key(int stage)
@@ -834,10 +912,11 @@ static uint32_t tex_cache_key(int stage)
      * that a title swapping textures across these fields gets a fresh
      * upload instead of stale cached bytes. */
     uint32_t h = 0x811c9dc5u;
-    uint32_t vals[4] = { g_pg.tex[stage].offset, g_pg.tex[stage].format,
-                          g_pg.tex[stage].control1, g_pg.tex[stage].image_rect };
+    uint32_t vals[5] = { g_pg.tex[stage].offset, g_pg.tex[stage].format,
+                          g_pg.tex[stage].control1, g_pg.tex[stage].image_rect,
+                          g_pg.tex[stage].palette };
     int i;
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 5; i++) {
         h ^= vals[i];
         h *= 0x01000193u;
     }
@@ -898,246 +977,273 @@ static void tex_yuv422_to_bgra(const uint8_t *line, unsigned ix, int chroma_firs
     out[3] = 255;
 }
 
-/* Resolve (uploading/caching as needed) the texture bound to `stage`.
- * Returns NULL if the stage is disabled, or programmed with a format
- * this translator doesn't decode (see the file comment above) -- either
- * way the caller falls back to diffuse-only shading, never a guess at
- * texture content. */
-static TexCacheEntry *resolve_texture_stage(int stage)
-{
-    uint32_t key, color;
-    int i, free_slot;
-    uint32_t width, height, pitch;
-    const uint8_t *guest_ram;
-    uint32_t guest_ram_size;
+/* How a stage's texture is laid out in guest memory, worked out on each bind
+ * from the format, image-rect, pitch and palette registers. */
+enum { TEXK_A8R8G8B8_LINEAR, TEXK_YUV, TEXK_S3TC, TEXK_I8 };
+
+typedef struct {
+    int kind;
+    unsigned color;
+    int chroma_first;              /* YUV: UYVY (0x25) rather than YUY2 (0x24) */
+    unsigned width, height;
+    unsigned pitch;                /* linear formats only */
     const uint8_t *src;
-    uint8_t *conv = NULL;
-    int is_yuv, chroma_first;
-    TexCacheEntry *entry;
+    size_t src_len;
+    const uint8_t *palette;        /* TEXK_I8: A8R8G8B8 entries */
+    unsigned palette_entries;
+} TexSource;
+
+static const char *tex_kind_name(const TexSource *ts)
+{
+    switch (ts->kind) {
+    case TEXK_YUV:  return ts->chroma_first ? "UYVY->BGRA" : "YUY2->BGRA";
+    case TEXK_I8:   return "I8->BGRA";
+    case TEXK_S3TC:
+        return ts->color == NV2A_TEXCONV_L_DXT1_A1R5G5B5 ? "DXT1->BGRA"
+             : ts->color == NV2A_TEXCONV_L_DXT23_A8R8G8B8 ? "DXT3->BGRA"
+             : "DXT5->BGRA";
+    default:        return "A8R8G8B8";
+    }
+}
+
+/* Once per colour code, not per stage: a stage-keyed flag hid every format
+ * after the first one a stage met, so the log never said which were missing. */
+static void tex_warn_format(int stage, unsigned color, const char *why)
+{
+    static uint8_t warned[256];
+    if (warned[color & 0xFF])
+        return;
+    warned[color & 0xFF] = 1;
+    fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: color format 0x%02X %s -- falling "
+            "back to diffuse-only for this format\n", stage, color, why);
+}
+
+/* A guest span as host memory, or NULL when guest RAM isn't armed or the span
+ * runs past it. SET_TEXTURE_OFFSET and the palette offset are physical
+ * addresses under the same "whole of RAM, zero base" DMA convention
+ * nv2a_core.c's push buffer puller uses, and nv2a_get_guest_ram() reports the
+ * base and size that convention resolved to (the contiguous window).
+ *
+ * Every read is bounds-checked against the whole span: a length derived from
+ * guest-programmed registers that ran off the mapping would be a host fault,
+ * not a bad texel.
+ *
+ * The real fix is still DMA-object resolution (SET_CONTEXT_DMA_A/_B -> RAMIN
+ * descriptor, xemu's nv_dma_map), deriving the base per object instead of
+ * assuming one. */
+static const uint8_t *tex_guest_span(uint32_t offset, size_t len)
+{
+    uint32_t size;
+    const uint8_t *ram = nv2a_get_guest_ram(&size);
+    uint32_t off;
+
+    if (!ram || size == 0 || (size & (size - 1)) != 0)
+        return NULL;
+    off = offset & (size - 1);
+    if (len > (size_t)(size - off))
+        return NULL;
+    return ram + off;
+}
+
+/* Fill `ts` for `stage`. Returns 0, or -1 if the texture can't be decoded (the
+ * caller then shades diffuse-only). Linear formats take their size from
+ * IMAGE_RECT and address texels by pitch; non-linear ones are power-of-two
+ * sizes from the FORMAT register, level 0 first (xemu pgraph/texture.c). */
+static int tex_describe(int stage, TexSource *ts)
+{
+    uint32_t fmt = g_pg.tex[stage].format;
+
+    memset(ts, 0, sizeof(*ts));
+    ts->color = (fmt & NV097_SET_TEXTURE_FORMAT_COLOR) >> 8;
+
+    switch (ts->color) {
+    case NV2A_TEX_COLOR_A8R8G8B8_LINEAR:
+    case NV2A_TEX_COLOR_YUV_CR8YB8CB8YA8:
+    case NV2A_TEX_COLOR_YUV_YB8CR8YA8CB8: {
+        unsigned bpp;
+        ts->kind = ts->color == NV2A_TEX_COLOR_A8R8G8B8_LINEAR
+                 ? TEXK_A8R8G8B8_LINEAR : TEXK_YUV;
+        ts->chroma_first = ts->color == NV2A_TEX_COLOR_YUV_YB8CR8YA8CB8;
+        bpp = ts->kind == TEXK_YUV ? 2 : 4;   /* packed 4:2:2 is 2 bytes a texel */
+        ts->width  = (g_pg.tex[stage].image_rect & NV097_SET_TEXTURE_IMAGE_RECT_WIDTH) >> 16;
+        ts->height = g_pg.tex[stage].image_rect & NV097_SET_TEXTURE_IMAGE_RECT_HEIGHT;
+        ts->pitch  = (g_pg.tex[stage].control1 & NV097_SET_TEXTURE_CONTROL1_IMAGE_PITCH) >> 16;
+        if (ts->width == 0 || ts->height == 0)
+            return -1;                        /* IMAGE_RECT not programmed yet */
+        if (ts->pitch == 0)
+            ts->pitch = ts->width * bpp;      /* tightly packed if unset */
+        ts->src_len = (size_t)(ts->height - 1) * ts->pitch + (size_t)ts->width * bpp;
+        break;
+    }
+
+    case NV2A_TEXCONV_SZ_I8_A8R8G8B8:
+    case NV2A_TEXCONV_L_DXT1_A1R5G5B5:
+    case NV2A_TEXCONV_L_DXT23_A8R8G8B8:
+    case NV2A_TEXCONV_L_DXT45_A8R8G8B8:
+        if (((fmt & NV097_SET_TEXTURE_FORMAT_DIMENSIONALITY) >> 4) != 2
+                || (fmt & NV097_SET_TEXTURE_FORMAT_CUBEMAP_ENABLE)) {
+            tex_warn_format(stage, ts->color, "is only decoded as a plain 2D texture");
+            return -1;
+        }
+        /* BORDER_SOURCE_TEXTURE puts a ring of border texels in the image
+         * itself, which changes the layout (xemu doubles the dimensions). */
+        if (!(fmt & NV097_SET_TEXTURE_FORMAT_BORDER_SOURCE)) {
+            tex_warn_format(stage, ts->color, "with a texture-sourced border is not decoded");
+            return -1;
+        }
+        ts->width  = 1u << ((fmt & NV097_SET_TEXTURE_FORMAT_BASE_SIZE_U) >> 20);
+        ts->height = 1u << ((fmt & NV097_SET_TEXTURE_FORMAT_BASE_SIZE_V) >> 24);
+        if (ts->color == NV2A_TEXCONV_SZ_I8_A8R8G8B8) {
+            uint32_t pal = g_pg.tex[stage].palette;
+            ts->kind = TEXK_I8;
+            ts->src_len = (size_t)ts->width * ts->height;
+            ts->palette_entries =
+                256u >> ((pal & NV097_SET_TEXTURE_PALETTE_LENGTH) >> 2);
+            ts->palette = tex_guest_span(pal & NV097_SET_TEXTURE_PALETTE_OFFSET,
+                                         (size_t)ts->palette_entries * 4);
+            if (!ts->palette) {
+                static int warned_pal;
+                if (!warned_pal) {
+                    warned_pal = 1;
+                    fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: palette 0x%08X is "
+                            "outside guest RAM -- not uploading\n", stage, pal);
+                }
+                return -1;
+            }
+        } else {
+            ts->kind = TEXK_S3TC;
+            ts->src_len = nv2a_texconv_s3tc_level_size(ts->color, ts->width,
+                                                       ts->height);
+        }
+        break;
+
+    default:
+        tex_warn_format(stage, ts->color, "not decoded");
+        return -1;
+    }
+
+    ts->src = tex_guest_span(g_pg.tex[stage].offset, ts->src_len);
+    if (!ts->src) {
+        static int warned_span;
+        if (!warned_span) {
+            warned_span = 1;
+            fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: %zu bytes at offset=0x%08X "
+                    "are outside guest RAM (or RAM isn't armed yet) -- not "
+                    "uploading\n", stage, ts->src_len, g_pg.tex[stage].offset);
+        }
+        return -1;
+    }
+    return 0;
+}
+
+/* Decode a non-A8R8G8B8 source to width*height BGRA texels. */
+static void tex_decode_bgra(const TexSource *ts, uint8_t *out)
+{
+    unsigned x, y;
+
+    switch (ts->kind) {
+    case TEXK_YUV:
+        for (y = 0; y < ts->height; y++) {
+            const uint8_t *line = ts->src + (size_t)y * ts->pitch;
+            for (x = 0; x < ts->width; x++)
+                tex_yuv422_to_bgra(line, x, ts->chroma_first,
+                                   out + ((size_t)y * ts->width + x) * 4);
+        }
+        break;
+    case TEXK_S3TC:
+        nv2a_texconv_decode_s3tc(ts->color, ts->src, ts->width, ts->height, out);
+        break;
+    case TEXK_I8:
+        nv2a_texconv_decode_i8(ts->src, ts->width, ts->height, ts->palette,
+                               ts->palette_entries, out);
+        break;
+    default:
+        break;
+    }
+}
+
+/* 64-bit hash of a texture's source bytes and palette, to notice a title
+ * loading different pixels at an address it has used before. Eight bytes a
+ * step: it runs over every bound texture once a frame, and a byte-wise FNV
+ * over a pair of 640x448 render targets alone cost milliseconds. */
+static uint64_t tex_hash_bytes(const uint8_t *p, size_t n, uint64_t h)
+{
+    size_t i = 0;
+
+    h ^= (uint64_t)n * 0x9E3779B97F4A7C15ull;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t v;
+        memcpy(&v, p + i, 8);
+        h = (h ^ v) * 0x100000001B3ull;
+        h ^= h >> 32;
+    }
+    for (; i < n; i++)
+        h = (h ^ p[i]) * 0x100000001B3ull;
+    return h;
+}
+
+static uint64_t tex_content_hash(const TexSource *ts)
+{
+    uint64_t h = tex_hash_bytes(ts->src, ts->src_len, 0xCBF29CE484222325ull);
+    if (ts->palette)
+        h = tex_hash_bytes(ts->palette, (size_t)ts->palette_entries * 4, h);
+    return h;
+}
+
+/* (Re)create `entry`'s texture and view from `ts`. YUV movie surfaces are
+ * DYNAMIC so tex_refresh_yuv() can rewrite them in place every frame; the rest
+ * are IMMUTABLE and are recreated when their source changes. */
+static int tex_entry_create(TexCacheEntry *entry, const TexSource *ts, int stage)
+{
     D3D11_TEXTURE2D_DESC td;
     D3D11_SUBRESOURCE_DATA sd;
     D3D11_SHADER_RESOURCE_VIEW_DESC srvd;
+    uint8_t *conv = NULL;
+    int dynamic = ts->kind == TEXK_YUV;
     HRESULT hr;
 
-    if (stage < 0 || stage >= 4 || !g_pg.tex[stage].enabled)
-        return NULL;
-
-    color = (g_pg.tex[stage].format & NV097_SET_TEXTURE_FORMAT_COLOR) >> 8;
-    is_yuv = (color == NV2A_TEX_COLOR_YUV_CR8YB8CB8YA8 ||
-              color == NV2A_TEX_COLOR_YUV_YB8CR8YA8CB8);
-    chroma_first = (color == NV2A_TEX_COLOR_YUV_YB8CR8YA8CB8);
-    if (color != NV2A_TEX_COLOR_A8R8G8B8_LINEAR && !is_yuv) {
-        /* YUV movie texture and anything else: not decoded yet (see file
-         * comment). Warn once per stage so this is visible without being
-         * a flood -- 40k+ draws would otherwise repeat it every frame. */
-        static int warned[4];
-        if (!warned[stage]) {
-            fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: color format 0x%02X not "
-                    "decoded (only A8R8G8B8/0x12 is) -- falling back to "
-                    "diffuse-only for this stage\n", stage, color);
-            warned[stage] = 1;
-
-            /* Diagnostic-only peek at the raw bytes (no texture created):
-             * tells apart "this format just isn't decoded yet" from "the
-             * memory behind it isn't real data anyway" -- same question
-             * being asked of the A8R8G8B8 path below, useful to know
-             * before deciding whether YUV decode is worth the added
-             * scope. Not gated on XBOXRECOMP_TEXDUMP separately since
-             * it's a one-shot per stage either way. */
-            if (getenv("XBOXRECOMP_TEXDUMP")) {
-                uint32_t sz;
-                const uint8_t *ram = nv2a_get_guest_ram(&sz);
-                if (ram && sz && (sz & (sz - 1)) == 0) {
-                    const uint8_t *p = ram + (g_pg.tex[stage].offset & (sz - 1));
-                    fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: (YUV, undecoded) raw "
-                            "bytes at offset=0x%08X: %02X%02X%02X%02X %02X%02X%02X%02X\n",
-                            stage, g_pg.tex[stage].offset,
-                            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
-                }
-            }
-        }
-        return NULL;
-    }
-
-    width  = (g_pg.tex[stage].image_rect & NV097_SET_TEXTURE_IMAGE_RECT_WIDTH) >> 16;
-    height = (g_pg.tex[stage].image_rect & NV097_SET_TEXTURE_IMAGE_RECT_HEIGHT);
-    pitch  = (g_pg.tex[stage].control1 & NV097_SET_TEXTURE_CONTROL1_IMAGE_PITCH) >> 16;
-    if (width == 0 || height == 0)
-        return NULL;  /* IMAGE_RECT not programmed yet */
-    if (pitch == 0)
-        pitch = width * (is_yuv ? 2 : 4);  /* tightly packed if unset:
-                                            * A8R8G8B8 is 4 bytes/texel,
-                                            * packed YUV 4:2:2 is 2 */
-
-    /* Resolve guest RAM before the cache lookup because mutable YUV surfaces
-     * need their current pixels even when their address and format are
-     * unchanged. SET_TEXTURE_OFFSET is a
-     * physical address under the same "whole of RAM, zero base" DMA
-     * object convention nv2a_core.c's push buffer puller uses for its
-     * own reads -- nv2a_get_guest_ram() reads back the exact base/size
-     * that convention resolved to, rather than this file keeping a
-     * second copy of it (see nv2a_state.h's comment on that accessor). */
-    guest_ram = nv2a_get_guest_ram(&guest_ram_size);
-    if (!guest_ram) {
-        static int warned_ram;
-        if (!warned_ram) {
-            fprintf(stderr, "[PGRAPH-D3D11] TEX: guest RAM not armed yet "
-                    "(nv2a_set_guest_ram not called) -- skipping upload\n");
-            warned_ram = 1;
-        }
-        return NULL;
-    }
-    if (guest_ram_size == 0 || (guest_ram_size & (guest_ram_size - 1)) != 0) {
-        /* pb_read32()-style masking below assumes a power-of-two size,
-         * same as nv2a_core.c's own pb_read32(); guard rather than
-         * silently reading the wrong bytes if that assumption ever
-         * stops holding. */
-        return NULL;
-    }
-    /* Every texture reads from the contiguous window, YUV movie surfaces
-     * included. Textures are contiguous allocations, and nv2a_get_guest_ram()
-     * is that window.
-     *
-     * Movie surfaces used to read the LOW map instead (527f89f): the decoder
-     * writes them through D3D's tiled-lock alias 0xF0000000 | physical, and
-     * that alias was mapped onto low RAM, so the frames really were there --
-     * on top of whatever the heap had put at the same addresses. The alias
-     * now reaches the contiguous window (XBOX_CONTIG_WC_BASE), which is where
-     * both the frames and this read belong.
-     *
-     * The real fix is still DMA-object resolution (SET_CONTEXT_DMA_A/_B ->
-     * RAMIN descriptor, xemu's nv_dma_map), deriving the base per object
-     * instead of assuming one. */
-    src = guest_ram + (g_pg.tex[stage].offset & (guest_ram_size - 1));
-
-    if (is_yuv) {
-        uint32_t off = g_pg.tex[stage].offset & (guest_ram_size - 1);
-        uint64_t need = (uint64_t)(height - 1) * pitch + (uint64_t)width * 2;
-        if (need > (uint64_t)guest_ram_size - off) {
-            fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: YUV source span %llu bytes "
-                    "at 0x%08X exceeds guest RAM -- not uploading\n",
-                    stage, (unsigned long long)need, off);
-            return NULL;
-        }
-    }
-
-    key = tex_cache_key(stage);
-
-    /* Cache lookup. Static textures stay cache-once. Movie surfaces reuse
-     * the same two addresses while the decoder replaces their pixels, so a
-     * YUV hit is refreshed on the first draw of each PGRAPH frame. */
-    free_slot = -1;
-    for (i = 0; i < TEX_CACHE_SIZE; i++) {
-        if (g_tex_cache[i].in_use && g_tex_cache[i].key == key) {
-            entry = &g_tex_cache[i];
-            if (is_yuv && entry->upload_frame != g_pg.stats.frames) {
-                ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
-                D3D11_MAPPED_SUBRESOURCE mapped;
-                HRESULT map_hr = E_FAIL;
-                uint32_t y, x;
-
-                if (ctx)
-                    map_hr = ID3D11DeviceContext_Map(ctx,
-                        (ID3D11Resource *)entry->tex2d, 0,
-                        D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-                if (SUCCEEDED(map_hr)) {
-                    for (y = 0; y < height; y++) {
-                        const uint8_t *line = src + (size_t)y * pitch;
-                        uint8_t *out = (uint8_t *)mapped.pData
-                            + (size_t)y * mapped.RowPitch;
-                        for (x = 0; x < width; x++)
-                            tex_yuv422_to_bgra(line, x, chroma_first,
-                                              out + x * 4);
-                    }
-                    ID3D11DeviceContext_Unmap(ctx,
-                        (ID3D11Resource *)entry->tex2d, 0);
-                    entry->upload_frame = g_pg.stats.frames;
-                } else {
-                    static int warned_map[4];
-                    if (!warned_map[stage]) {
-                        fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: dynamic YUV "
-                                "Map failed: 0x%08lX\n", stage, map_hr);
-                        warned_map[stage] = 1;
-                    }
-                }
-            }
-            return entry;
-        }
-        if (free_slot < 0 && !g_tex_cache[i].in_use)
-            free_slot = i;
-    }
-
-    if (free_slot < 0) {
-        /* Evict slot 0. Simple and rare in practice: Breakdown's own
-         * texture set (icons + one movie frame texture, per XBOXRECOMP_
-         * TEXDUMP) is well under TEX_CACHE_SIZE, so eviction under normal
-         * play would mean something is churning through many distinct
-         * textures -- worth another look if that count climbs, but not
-         * a correctness issue either way. */
-        free_slot = 0;
-        if (g_tex_cache[0].srv)   ID3D11ShaderResourceView_Release(g_tex_cache[0].srv);
-        if (g_tex_cache[0].tex2d) ID3D11Texture2D_Release(g_tex_cache[0].tex2d);
-        memset(&g_tex_cache[0], 0, sizeof(g_tex_cache[0]));
-    }
-    entry = &g_tex_cache[free_slot];
-
-    memset(&td, 0, sizeof(td));
-    td.Width = width;
-    td.Height = height;
-    td.MipLevels = 1;
-    td.ArraySize = 1;
-    /* A8R8G8B8 in NV2A's naming is byte order B,G,R,A in memory (same as
-     * D3DFMT_A8R8G8B8) -- DXGI_FORMAT_B8G8R8A8_UNORM is the exact same
-     * memory layout, so this is a straight copy, no channel repacking. */
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count = 1;
-    td.Usage = is_yuv ? D3D11_USAGE_DYNAMIC : D3D11_USAGE_IMMUTABLE;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    td.CPUAccessFlags = is_yuv ? D3D11_CPU_ACCESS_WRITE : 0;
+    if (entry->srv)   ID3D11ShaderResourceView_Release(entry->srv);
+    if (entry->tex2d) ID3D11Texture2D_Release(entry->tex2d);
+    entry->srv = NULL;
+    entry->tex2d = NULL;
 
     memset(&sd, 0, sizeof(sd));
-    if (is_yuv) {
-        /* Unpack to BGRA. D3D11 has no packed-4:2:2 SRV format usable here,
-         * and the shader samples this like any other texture, so the
-         * conversion happens once at upload rather than per-pixel per-frame.
-         * The cache above means that is once per distinct movie frame.
-         *
-         * Bounds-check the source span first. The A8R8G8B8 path masks only
-         * the START offset and trusts the rest, which is survivable when the
-         * hardware hands the size back; here the loop below would read
-         * height*pitch bytes off a pointer derived from guest-programmed
-         * registers, so an over-long read is a host fault, not a bad pixel.
-         * Same bug class as the unguarded pointers this project has already
-         * been bitten by twice. */
-        uint32_t y, x;
-
-        conv = (uint8_t *)malloc((size_t)width * height * 4);
-        if (!conv) {
-            memset(entry, 0, sizeof(*entry));
-            return NULL;
-        }
-        for (y = 0; y < height; y++) {
-            const uint8_t *line = src + (size_t)y * pitch;
-            uint8_t *out = conv + (size_t)y * width * 4;
-            for (x = 0; x < width; x++)
-                tex_yuv422_to_bgra(line, x, chroma_first, out + x * 4);
-        }
-        sd.pSysMem = conv;
-        sd.SysMemPitch = width * 4;
+    if (ts->kind == TEXK_A8R8G8B8_LINEAR) {
+        /* A8R8G8B8 in NV2A's naming is B,G,R,A in memory, the same layout as
+         * DXGI_FORMAT_B8G8R8A8_UNORM, so this is a straight copy. */
+        sd.pSysMem = ts->src;
+        sd.SysMemPitch = ts->pitch;
     } else {
-        sd.pSysMem = src;
-        sd.SysMemPitch = pitch;
+        /* D3D11 has no packed 4:2:2 or palettised SRV format usable here, and
+         * S3TC is decoded on the CPU as xemu does, so every other format is
+         * unpacked to BGRA once per upload. */
+        conv = (uint8_t *)malloc((size_t)ts->width * ts->height * 4);
+        if (!conv)
+            return -1;
+        tex_decode_bgra(ts, conv);
+        sd.pSysMem = conv;
+        sd.SysMemPitch = ts->width * 4;
     }
 
+    memset(&td, 0, sizeof(td));
+    td.Width = ts->width;
+    td.Height = ts->height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = dynamic ? D3D11_USAGE_DYNAMIC : D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags = dynamic ? D3D11_CPU_ACCESS_WRITE : 0;
+
     hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, &sd, &entry->tex2d);
-    free(conv);  /* CreateTexture2D copies initial data; safe to drop now */
-    conv = NULL;
+    free(conv);   /* CreateTexture2D copies the initial data */
     if (FAILED(hr)) {
         fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: CreateTexture2D failed: 0x%08lX "
-                "(%ux%u, pitch=%u, offset=0x%08X)\n",
-                stage, hr, width, height, pitch, g_pg.tex[stage].offset);
-        memset(entry, 0, sizeof(*entry));
-        return NULL;
+                "(%ux%u %s, offset=0x%08X)\n", stage, hr, ts->width, ts->height,
+                tex_kind_name(ts), g_pg.tex[stage].offset);
+        entry->tex2d = NULL;
+        return -1;
     }
 
     memset(&srvd, 0, sizeof(srvd));
@@ -1150,38 +1256,137 @@ static TexCacheEntry *resolve_texture_stage(int stage)
         fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: CreateShaderResourceView failed: "
                 "0x%08lX\n", stage, hr);
         ID3D11Texture2D_Release(entry->tex2d);
+        entry->tex2d = NULL;
+        entry->srv = NULL;
+        return -1;
+    }
+
+    entry->width = (float)ts->width;
+    entry->height = (float)ts->height;
+    /* Linear formats are sampled with texel-space UVs (see this section's
+     * comment); everything else already arrives in [0,1]. */
+    entry->normalized = ts->kind == TEXK_S3TC || ts->kind == TEXK_I8;
+    return 0;
+}
+
+/* Movie surfaces keep their address and format while the decoder replaces
+ * their pixels, so a YUV texture is rewritten on its first bind each frame. */
+static void tex_refresh_yuv(TexCacheEntry *entry, const TexSource *ts, int stage)
+{
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = E_FAIL;
+    unsigned x, y;
+
+    if (ctx)
+        hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)entry->tex2d, 0,
+                                     D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(hr)) {
+        static int warned_map[4];
+        if (!warned_map[stage]) {
+            fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: dynamic YUV Map failed: "
+                    "0x%08lX\n", stage, hr);
+            warned_map[stage] = 1;
+        }
+        return;
+    }
+    for (y = 0; y < ts->height; y++) {
+        const uint8_t *line = ts->src + (size_t)y * ts->pitch;
+        uint8_t *out = (uint8_t *)mapped.pData + (size_t)y * mapped.RowPitch;
+        for (x = 0; x < ts->width; x++)
+            tex_yuv422_to_bgra(line, x, ts->chroma_first, out + x * 4);
+    }
+    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)entry->tex2d, 0);
+}
+
+/* Resolve (uploading/caching as needed) the texture bound to `stage`.
+ * Returns NULL if the stage is disabled, or programmed with a format
+ * this translator doesn't decode (see tex_describe()) -- either way the
+ * caller falls back to diffuse-only shading, never a guess at texture
+ * content.
+ *
+ * The cache used to be cache-once: a key hit returned the old texture even
+ * after the title loaded different pixels at the same address with the same
+ * format. Each entry now compares its source bytes against the upload once a
+ * frame and re-uploads when they differ. */
+static TexCacheEntry *resolve_texture_stage(int stage)
+{
+    TexSource ts;
+    TexCacheEntry *entry;
+    uint32_t key;
+    int i, slot;
+
+    if (stage < 0 || stage >= 4 || !g_pg.tex[stage].enabled)
+        return NULL;
+    if (tex_describe(stage, &ts) != 0)
+        return NULL;
+
+    key = tex_cache_key(stage);
+    for (i = 0; i < TEX_CACHE_SIZE; i++) {
+        entry = &g_tex_cache[i];
+        if (!entry->in_use || entry->key != key)
+            continue;
+        entry->last_use = ++g_tex_use_clock;
+        if (entry->checked_frame != g_pg.stats.frames) {
+            entry->checked_frame = g_pg.stats.frames;
+            if (ts.kind == TEXK_YUV) {
+                tex_refresh_yuv(entry, &ts, stage);
+            } else {
+                uint64_t h = tex_content_hash(&ts);
+                if (h != entry->content_hash) {
+                    if (tex_entry_create(entry, &ts, stage) != 0) {
+                        memset(entry, 0, sizeof(*entry));
+                        return NULL;
+                    }
+                    entry->content_hash = h;
+                }
+            }
+        }
+        return entry;
+    }
+
+    /* Miss: a free slot, or else the least recently bound. */
+    slot = 0;
+    for (i = 0; i < TEX_CACHE_SIZE; i++) {
+        if (!g_tex_cache[i].in_use) {
+            slot = i;
+            break;
+        }
+        if (g_tex_cache[i].last_use < g_tex_cache[slot].last_use)
+            slot = i;
+    }
+    entry = &g_tex_cache[slot];
+    entry->in_use = 0;
+    if (tex_entry_create(entry, &ts, stage) != 0) {
         memset(entry, 0, sizeof(*entry));
         return NULL;
     }
-
     entry->key = key;
-    entry->upload_frame = g_pg.stats.frames;
     entry->in_use = 1;
-    entry->width = (float)width;
-    entry->height = (float)height;
+    entry->last_use = ++g_tex_use_clock;
+    entry->checked_frame = g_pg.stats.frames;
+    entry->content_hash = ts.kind == TEXK_YUV ? 0 : tex_content_hash(&ts);
 
-    fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: uploaded %ux%u %s from "
-            "offset=0x%08X pitch=%u (cache slot %d)\n",
-            stage, width, height,
-            is_yuv ? (chroma_first ? "UYVY->BGRA" : "YUY2->BGRA") : "A8R8G8B8",
-            g_pg.tex[stage].offset, pitch, free_slot);
+    {
+        static uint32_t uploads;
+        if (++uploads <= 64 || uploads % 500 == 0) {
+            fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: uploaded %ux%u %s from "
+                    "offset=0x%08X (cache slot %d, upload #%u)\n", stage,
+                    ts.width, ts.height, tex_kind_name(&ts),
+                    g_pg.tex[stage].offset, slot, uploads);
+        }
+    }
 
     if (getenv("XBOXRECOMP_TEXDUMP")) {
-        /* Raw bytes actually read, so "the upload path is wired but the
-         * source bytes are genuinely blank/uninitialized" can be told
-         * apart from "the offset/pitch math is reading the wrong place."
-         * A handful of texels from the first row plus one from mid-image
-         * (pitch bytes in) is enough to tell solid-color from real data
-         * without dumping the whole texture. */
-        fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: offset=0x%08X color=0x%02X first row: "
-                "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X "
-                "... mid-image (row %u): %02X%02X%02X%02X\n",
-                stage, g_pg.tex[stage].offset, color,
-                src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
-                src[8], src[9], src[10], src[11], src[12], src[13], src[14], src[15],
-                height / 2,
-                src[(size_t)pitch * (height / 2) + 0], src[(size_t)pitch * (height / 2) + 1],
-                src[(size_t)pitch * (height / 2) + 2], src[(size_t)pitch * (height / 2) + 3]);
+        /* The first source bytes, so "the upload path is wired but the bytes
+         * are blank" can be told apart from "the offset math reads the wrong
+         * place". */
+        fprintf(stderr, "[PGRAPH-D3D11] TEX[%d]: offset=0x%08X color=0x%02X first "
+                "bytes: %02X%02X%02X%02X %02X%02X%02X%02X\n", stage,
+                g_pg.tex[stage].offset, ts.color, ts.src[0], ts.src[1], ts.src[2],
+                ts.src[3], ts.src_len > 4 ? ts.src[4] : 0,
+                ts.src_len > 5 ? ts.src[5] : 0, ts.src_len > 6 ? ts.src[6] : 0,
+                ts.src_len > 7 ? ts.src[7] : 0);
     }
 
     return entry;
@@ -1586,8 +1791,10 @@ static void submit_draw(void)
             if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_tex_ps_cb,
                     0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
                 float *f = (float *)mapped.pData;
-                f[0] = te ? te->width  : 1.0f;  /* texSize0.x */
-                f[1] = te ? te->height : 1.0f;  /* texSize0.y */
+                /* Texel-space UVs are divided by the texture's size in the
+                 * shader; a non-linear texture's UVs are already [0,1]. */
+                f[0] = (te && !te->normalized) ? te->width  : 1.0f;  /* texSize0.x */
+                f[1] = (te && !te->normalized) ? te->height : 1.0f;  /* texSize0.y */
                 f[2] = te ? 1.0f : 0.0f;         /* hasTexture */
                 f[3] = 0.0f;                      /* pad */
                 ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_tex_ps_cb, 0);
@@ -1595,7 +1802,7 @@ static void submit_draw(void)
             ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &g_tex_ps_cb);
 
             if (te) {
-                ID3D11SamplerState *samp = get_tex_sampler();
+                ID3D11SamplerState *samp = get_stage_sampler(0);
                 ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &te->srv);
                 if (samp)
                     ID3D11DeviceContext_PSSetSamplers(ctx, 0, 1, &samp);
@@ -1929,6 +2136,37 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         texdump_stage(stage);
         return 1;
     }
+
+    /* Sampler state and the palette. These used to sit in the 0x1B00-0x1C00
+     * ignore range: every texture clamped and filtered linearly whatever the
+     * title asked for, and a palettised texture had no palette to read. */
+    case NV097_SET_TEXTURE_ADDRESS:
+    case NV097_SET_TEXTURE_ADDRESS + 0x40:
+    case NV097_SET_TEXTURE_ADDRESS + 0x80:
+    case NV097_SET_TEXTURE_ADDRESS + 0xC0:
+        g_pg.tex[(method - NV097_SET_TEXTURE_ADDRESS) / 0x40].address = param;
+        return 1;
+
+    case NV097_SET_TEXTURE_FILTER:
+    case NV097_SET_TEXTURE_FILTER + 0x40:
+    case NV097_SET_TEXTURE_FILTER + 0x80:
+    case NV097_SET_TEXTURE_FILTER + 0xC0:
+        g_pg.tex[(method - NV097_SET_TEXTURE_FILTER) / 0x40].filter = param;
+        return 1;
+
+    case NV097_SET_TEXTURE_PALETTE:
+    case NV097_SET_TEXTURE_PALETTE + 0x40:
+    case NV097_SET_TEXTURE_PALETTE + 0x80:
+    case NV097_SET_TEXTURE_PALETTE + 0xC0:
+        g_pg.tex[(method - NV097_SET_TEXTURE_PALETTE) / 0x40].palette = param;
+        return 1;
+
+    case NV097_SET_TEXTURE_BORDER_COLOR:
+    case NV097_SET_TEXTURE_BORDER_COLOR + 0x40:
+    case NV097_SET_TEXTURE_BORDER_COLOR + 0x80:
+    case NV097_SET_TEXTURE_BORDER_COLOR + 0xC0:
+        g_pg.tex[(method - NV097_SET_TEXTURE_BORDER_COLOR) / 0x40].border_color = param;
+        return 1;
 
     /* ── Vertex attribute format (drives INLINE_ARRAY decode) ──
      * This register lives at 0x1760 + slot*4, 16 slots; it used to fall
