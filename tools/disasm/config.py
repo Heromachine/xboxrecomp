@@ -133,6 +133,8 @@ CONFIDENCE_PROLOGUE = 0.95   # Standard prologue pattern
 CONFIDENCE_CALL_TARGET = 0.90  # Destination of a call instruction
 CONFIDENCE_TAIL_JUMP = 0.88   # Target of a jmp that leaves its function
 CONFIDENCE_CC_BOUNDARY = 0.85  # After CC padding run following ret
+CONFIDENCE_IMM_REF = 0.86    # Address taken as an immediate, lands in a gap
+CONFIDENCE_DATA_PTR = 0.84   # Code pointer stored in a data section
 
 # ============================================================
 # Disassembly Engine Settings

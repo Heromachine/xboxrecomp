@@ -279,6 +279,113 @@ class DisasmEngine:
             self._sorted_addrs = None
         return added
 
+    def probes_as_returning_body(self, addr: int,
+                                 max_insns: int = 64) -> bool:
+        """
+        Read-only: does the stream at `addr` reach a `ret` without first
+        leaving through an unconditional `jmp`?
+
+        Used where the evidence that something is a function is weak -- an
+        address that merely appears as an immediate -- so the bar has to be
+        higher than "decodes to some terminator". Requiring a ret rejects data
+        that happens to disassemble, and stopping at a jmp that leaves keeps
+        this out of tail-call territory, which _pass_tail_jump_targets already
+        covers with better evidence. Conditional branches are fine: a real
+        function has them.
+
+        An unconditional jump forward that stays inside the probed window is
+        ordinary control flow -- MSVC emits it constantly to skip an
+        else-branch -- so the probe continues past it. Only a backward jump, or
+        one that leaves the window, ends it. Upstream measured the cost of
+        stopping at every jmp on Half-Life 2: CreateInterface's list walk at
+        0x00427F80 is a clean 90-byte function with one jmp over four
+        instructions, and rejecting it stopped interface lookup.
+
+        Ported from xboxrecomp work/v0.7.0-non-local (d89b8af, f2d3940).
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        section_data = self.image.get_section_data(section)
+        offset = addr - section.virtual_addr
+        if not section_data or not 0 <= offset < len(section_data):
+            return False
+        # Sliced from the section rather than read_bytes_at_va, which returns
+        # nothing at all when the window runs past the end of the file.
+        data = section_data[offset:offset + max_insns * 8]
+
+        limit = addr + len(data)
+        count = 0
+        for decoded in self._cs.disasm(data, addr):
+            count += 1
+            mnemonic = decoded.mnemonic.lower()
+            if mnemonic in config.RET_MNEMONICS:
+                return True
+            if mnemonic in config.JMP_MNEMONICS:
+                try:
+                    ops = decoded.operands
+                except Exception:
+                    return False
+                if not ops or ops[0].type != CS_OP_IMM:
+                    return False
+                target = ops[0].imm & 0xFFFFFFFF
+                if not (decoded.address < target < limit):
+                    return False
+            if count >= max_insns:
+                return False
+        return False
+
+    def probes_as_function_body(self, addr: int,
+                                max_insns: int = 8192) -> bool:
+        """
+        Read-only: does the stream starting at `addr` reach a ret or a tail
+        jump without running into bytes that will not decode?
+
+        Weaker than probes_as_returning_body, for callers that already have
+        other evidence the address is an entry point -- a code pointer held in
+        a data table, where MSVC's constructor thunks (`mov ecx, <this>;
+        jmp <ctor>`) end in a tail jump rather than a ret.
+
+        Follows instructions the sweep already decoded where they exist, and
+        decodes the rest here without recording them, so calling this never
+        changes what the sweep produced.
+
+        max_insns only bounds the walk's cost -- leaving the section already
+        terminates it.
+
+        Ported from xboxrecomp work/v0.7.0-non-local (0a8097e).
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.get_section_data(section)
+        if not data:
+            return False
+
+        for _ in range(max_insns):
+            insn = self.instructions.get(addr)
+            if insn is not None:
+                if insn.is_ret or insn.is_jump:
+                    return True
+                addr = insn.end_address
+            else:
+                offset = addr - section.virtual_addr
+                if offset < 0 or offset >= len(data):
+                    return False
+                decoded = next(self._cs.disasm(data[offset:], addr, count=1),
+                               None)
+                if decoded is None:
+                    return False  # undecodable: not code
+                mnemonic = decoded.mnemonic.lower()
+                if (mnemonic in config.RET_MNEMONICS
+                        or mnemonic in config.JMP_MNEMONICS):
+                    return True
+                addr += decoded.size
+            if not (section.virtual_addr <= addr
+                    < section.virtual_addr + section.virtual_size):
+                return False  # ran off the section without terminating
+        return False
+
     def recursive_descent(self, start_addresses: List[int],
                           section_bounds: List[Tuple[int, int]]) -> Set[int]:
         """

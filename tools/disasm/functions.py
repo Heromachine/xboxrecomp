@@ -136,6 +136,21 @@ class FunctionDetector:
             self.functions.clear()
             self._build_functions(sections)
 
+        # Functions whose address is only ever taken as an immediate. Runs
+        # once, after the bodies exist: the test is whether the target lands in
+        # a gap, which needs the gaps to be known. One rebuild picks up what it
+        # finds. A start in a gap cannot move an existing function's end: had
+        # that function reached past the start, the start would not be in a gap.
+        if self._pass_imm_ref_targets(sections):
+            self.functions.clear()
+            self._build_functions(sections)
+
+        # Then addresses that only ever exist as table entries. After the
+        # immediate pass, so its results narrow the gaps first. These become
+        # aliases rather than function starts, so no rebuild: aliases are
+        # materialised by _build_alias_entries once boundaries are final.
+        self._pass_data_ptr_targets(sections)
+
         self._build_alias_entries()
 
         # Populate call graph
@@ -301,6 +316,229 @@ class FunctionDetector:
         if realigned or unaligned:
             print(f"  Realigned {realigned} call targets the sweep stepped over"
                   f" ({unaligned} rejected as unaligned)")
+
+    def _pass_imm_ref_targets(self, sections: List[SectionInfo]) -> bool:
+        """
+        An immediate that points into unclaimed code and decodes to a ret is a
+        function whose address was taken.
+
+        C++ and callback-driven C install a function by writing its address
+        somewhere -- `mov dword ptr [eax+20h], 1B900h` -- and call it later as
+        `call dword ptr [reg+N]`. Nothing ever names it in a call or a jump,
+        so no other pass sees it, it gets no dispatch entry, and every
+        indirect call to it logs "[ICALL] Failed to resolve VA" and returns 0.
+
+        Breakdown hit four of these one after another. Once its boot sequence
+        finished, the front-end object switched its update callback to
+        0x0001B900, so nothing after the opening movie ran and the screen
+        stayed black. 0x00113630 and 0x00129240 had been failing every frame
+        since early boot. Each was found only by running the title, reading
+        the failure log and adding a seed.
+
+        The evidence is weak -- an address that merely appears as an immediate
+        -- so the filter carries the weight, and the *gap* does most of the
+        work. The target must land in a code section, in bytes no function
+        already covers, and must reach a ret (probes_as_returning_body). A
+        string or table address fails the decode; an offset into a real
+        function fails the gap. A start inside a function would truncate it,
+        which is worse than missing one.
+
+        Only the sections being analysed count as code. An XBE marks .rdata
+        and .data executable, and .rdata disassembles happily into
+        bound/popal/arpl; upstream had a string table become a function that
+        failed to compile before the pass took the caller's section list.
+
+        Two filters go beyond upstream, both measured on Breakdown. The target
+        must not begin on padding or zero fill: four immediates were constants
+        that landed in int3 runs, where a probe walks the padding into the next
+        function's ret. And a section only counts once some stronger pass has
+        found a function in it. Breakdown's DOLBY section is marked executable
+        but holds the audio DSP's firmware, and two immediates pointing at it
+        would otherwise have become x86 functions.
+
+        Distinct targets are collected before probing, since the same address
+        is taken over and over.
+
+        Ported from xboxrecomp work/v0.7.0-non-local (d89b8af, 572b8aa).
+        Returns whether anything was added, so the caller can rebuild.
+        """
+        bounds = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bounds]
+
+        def inside_a_function(addr: int) -> bool:
+            i = bisect.bisect_right(starts, addr) - 1
+            return i >= 0 and addr < bounds[i][1]
+
+        code_ranges = self._proven_code_ranges(sections)
+
+        def in_code_section(addr: int) -> bool:
+            return any(lo <= addr < hi for lo, hi in code_ranges)
+
+        targets = set()
+        for insn in self.engine.instructions.values():
+            target = insn.imm_ref
+            if target is None or target in self.functions:
+                continue
+            if inside_a_function(target) or not in_code_section(target):
+                continue
+            targets.add(target)
+
+        found = 0
+        for target in sorted(targets):
+            if self._starts_on_filler(target):
+                continue
+            if not self.engine.probes_as_returning_body(target):
+                continue
+            if target not in self.engine.instructions:
+                if not self.engine.decode_at(target):
+                    continue
+            self._add_candidate(target, config.CONFIDENCE_IMM_REF,
+                                "imm_ref_target")
+            found += 1
+
+        if found:
+            print(f"  {found} function address(es) taken as an immediate")
+        return found > 0
+
+    def _pass_data_ptr_targets(self, sections: List[SectionInfo]) -> bool:
+        """
+        A code pointer stored in a data section is an entry point whose
+        address is only ever taken at run time.
+
+        _pass_imm_ref_targets catches an address that appears as an immediate
+        in code. It cannot catch one that only ever exists as a *value in a
+        table* -- a vtable in .rdata, a callback array, a dispatch table.
+        Breakdown's seed list is mostly these: DSOUND vtable methods and
+        deleting destructors, each found by running the title and reading one
+        more "[ICALL] Failed to resolve VA".
+
+        These are alias entries, not candidates, and upstream measured why.
+        Registering them as starts on Half-Life 2 turned 5,305 C++ constructors
+        into 5,260, one clobbered callee-saved register into 13, and shrank the
+        generated code by 70%. A table scan is noisy enough to put starts where
+        bodies legitimately continue. An alias is built after every boundary is
+        final, so it adds an entry point without moving anyone's end.
+
+        Inside a function the bytes are already known to be code, and the
+        alias shares the enclosing end, as tail-jump aliases do. Upstream asked
+        only that the address be an instruction boundary. On Breakdown that
+        accepted 225 entries, and 194 of them were small integers from .data
+        and .XTLID that happened to hit a boundary mid-function: 0x00020007,
+        0x00030007, 0x000F0001. Real entries into a body are blocks nothing
+        falls into. The CRT's SEH filters and handlers, named by .rdata scope
+        tables, follow a `jmp` or `ret`; a run of merged constructor thunks
+        follows the previous thunk's `jmp`. So the address must also follow a
+        ret, an unconditional jmp or padding. That keeps 31 entries, 28 of them
+        SEH filter and handler blocks, and drops the 194.
+
+        In a gap nothing vouches for the bytes, so the address must be a
+        boundary the sweep already recorded, must not be padding, and must
+        reach a ret or a tail jump. A tail jump counts because a constructor
+        thunk is `mov ecx, <this>; jmp <ctor>`.
+
+        Ported from xboxrecomp work/v0.7.0-non-local (d9e7aaa, 1069312).
+        """
+        code_ranges = self._proven_code_ranges(sections)
+        code_names = {sec.name for sec in sections}
+
+        def in_code_section(addr: int) -> bool:
+            return any(lo <= addr < hi for lo, hi in code_ranges)
+
+        bounds = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bounds]
+
+        targets = set()
+        for sec in self.image.sections:
+            if sec.name in code_names:
+                continue                    # scan data, not code
+            data = self.image.get_section_data(sec)
+            if not data:
+                continue
+            for off in range(0, len(data) - 3, 4):
+                value = int.from_bytes(data[off:off + 4], "little")
+                if in_code_section(value):
+                    targets.add(value)
+
+        section_end = {sec.name: sec.virtual_addr + sec.virtual_size
+                       for sec in sections}
+
+        found = 0
+        for target in sorted(targets):
+            if target in self.functions or target in self._alias_entries:
+                continue
+            j = bisect.bisect_right(starts, target) - 1
+            if j >= 0 and bounds[j][0] < target < bounds[j][1]:
+                if target not in self.engine.instructions:
+                    continue
+                if not self._follows_terminator(target):
+                    continue
+                end = bounds[j][1]
+            else:
+                if target not in self.engine.instructions:
+                    continue
+                first = self.engine.instructions[target]
+                if first.mnemonic.lower() in ("int3", "nop"):
+                    continue
+                if not self.engine.probes_as_function_body(target,
+                                                           max_insns=64):
+                    continue
+                i = bisect.bisect_right(starts, target)
+                sec = self.image.get_section_at_va(target)
+                end = starts[i] if i < len(starts) else section_end.get(
+                    sec.name if sec else "", target + 4)
+            if end <= target:
+                continue
+            self._alias_entries[target] = end
+            found += 1
+
+        if found:
+            print(f"  {found} function address(es) found in data tables")
+        return found > 0
+
+    def _proven_code_ranges(self, sections: List[SectionInfo]):
+        """Ranges of the analysed sections that already hold a function.
+
+        The address-taken passes run on weak evidence, so they only trust a
+        section some stronger pass has already found x86 code in. The
+        executable bit is no help here: an XBE sets it on data and on firmware
+        for other processors alike.
+        """
+        ranges = []
+        for sec in sections:
+            lo, hi = sec.virtual_addr, sec.virtual_addr + sec.virtual_size
+            if any(lo <= start < hi for start in self.functions):
+                ranges.append((lo, hi))
+        return ranges
+
+    _FILLER_MNEMONICS = ("int3", "nop")
+
+    def _starts_on_filler(self, addr: int) -> bool:
+        """True if `addr` begins with padding or zero fill rather than code."""
+        insn = self.engine.instructions.get(addr)
+        if insn is not None and insn.mnemonic.lower() in self._FILLER_MNEMONICS:
+            return True
+        section = self.image.get_section_at_va(addr)
+        data = self.image.get_section_data(section) if section else None
+        if not data:
+            return False
+        offset = addr - section.virtual_addr
+        head = data[offset:offset + 2]
+        # 00 00 decodes as `add byte ptr [eax], al`; 0xCC and 0x90 are padding
+        # even where the sweep has not recorded an instruction.
+        return head == b"\x00\x00" or head[:1] in (b"\xcc", b"\x90")
+
+    def _follows_terminator(self, addr: int) -> bool:
+        """True if an instruction the sweep decoded ends exactly at `addr` and
+        is a ret, an unconditional jmp or padding -- nothing falls into it."""
+        for back in range(1, 16):
+            insn = self.engine.instructions.get(addr - back)
+            if insn is None or insn.end_address != addr:
+                continue
+            if insn.is_ret or (insn.is_jump and not insn.is_cond_jump):
+                return True
+            if insn.mnemonic.lower() in self._FILLER_MNEMONICS:
+                return True
+        return False
 
     def _pass_tail_jump_targets(self, sections: List[SectionInfo]) -> bool:
         """
