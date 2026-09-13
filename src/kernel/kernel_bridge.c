@@ -735,17 +735,19 @@ static void bridge_ExAllocatePoolWithTag(void)
     g_eax = xbox_va;
 }
 
-/* ── KfRaiseIrql / KfLowerIrql (ordinals 160, 161) ────── */
+/* ── KfRaiseIrql / KfLowerIrql (ordinals 160, 161) ──────
+ * Both __fastcall: the new IRQL arrives in cl, and the arg-size entries are 0
+ * accordingly. Reading STACK_ARG(0) instead took whatever the caller last left
+ * on its stack as the level. Breakdown's DSOUND brackets its allocator with
+ * `mov cl, 2 / call KfRaiseIrql` ... `mov cl, [saved] / call KfLowerIrql`. */
 static void bridge_KfRaiseIrql(void)
 {
-    uint32_t new_irql = STACK_ARG(0);
-    g_eax = (uint32_t)xbox_KfRaiseIrql((UCHAR)new_irql);
+    g_eax = (uint32_t)xbox_KfRaiseIrql((UCHAR)g_ecx);
 }
 
 static void bridge_KfLowerIrql(void)
 {
-    uint32_t new_irql = STACK_ARG(0);
-    xbox_KfLowerIrql((UCHAR)new_irql);
+    xbox_KfLowerIrql((UCHAR)g_ecx);
     g_eax = 0;
 }
 
