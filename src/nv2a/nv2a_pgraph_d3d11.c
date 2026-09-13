@@ -312,12 +312,9 @@ static struct {
 
         uint32_t const_accum[4];  /* in-progress float4 (raw bit patterns) */
         int      const_load;      /* hardware constant slot, set directly by
-                                    * SET_TRANSFORM_CONSTANT_LOAD. Hardware
-                                    * slot 96 == D3D8 API register c0 (this
-                                    * title writes CONSTANT_LOAD=96) --
-                                    * d3d8_vsh_set_constant() is API-relative
-                                    * (indexes c[0..191] directly), so the
-                                    * -96 bias is applied once, here. */
+                                    * SET_TRANSFORM_CONSTANT_LOAD, and the
+                                    * index each constant is stored at --
+                                    * see vsh_constant_write(). */
 
         int transform_mode;        /* last SET_TRANSFORM_EXECUTION_MODE MODE
                                      * field (2=program, 0=fixed). Read at
@@ -567,7 +564,18 @@ static void vsh_program_write(uint32_t method, uint32_t param)
  * that function's own dirty flag means the actual GPU constant buffer
  * upload still happens at most once per draw (in d3d8_vsh_prepare_draw(),
  * called from dev_DrawPrimitiveUP()), no matter how many individual
- * constant writes land here in between. */
+ * constant writes land here in between.
+ *
+ * Stored at the hardware slot CONSTANT_LOAD names, not 96 below it. The
+ * program reads c[] by the index in its microcode, which is that same hardware
+ * slot: d3d8_vsh emits c[<const reg>] straight from the instruction, and xemu
+ * stores and reads constants the same way. Slot 96 is D3D8's API register
+ * c0, which is where the bias came from, but nothing between here and the
+ * shader speaks API numbering. With it, a program that read its matrix from
+ * c[102]-c[105] -- Breakdown's title-screen sprites -- got zeros where the
+ * title had written the matrix at 6-9, a w of 0, and not one pixel on screen.
+ * Programs that read only c[58]/c[59], the viewport pair mirrored at hardware
+ * slots, never showed it. */
 static void vsh_constant_write(uint32_t method, uint32_t param)
 {
     int slot = (int)((method - NV097_SET_TRANSFORM_CONSTANT) / 4);
@@ -575,14 +583,14 @@ static void vsh_constant_write(uint32_t method, uint32_t param)
 
     g_pg.vsh.const_accum[word] = param;
     if (word == 3) {
-        int api_reg = g_pg.vsh.const_load - 96;  /* Xbox c0 == hw slot 96 */
-        if (api_reg >= 0 && api_reg < NV2A_VS_MAX_CONSTANTS) {
+        int hw_reg = g_pg.vsh.const_load;
+        if (hw_reg >= 0 && hw_reg < NV2A_VS_MAX_CONSTANTS) {
             float f4[4];
             f4[0] = u2f(g_pg.vsh.const_accum[0]);
             f4[1] = u2f(g_pg.vsh.const_accum[1]);
             f4[2] = u2f(g_pg.vsh.const_accum[2]);
             f4[3] = u2f(g_pg.vsh.const_accum[3]);
-            d3d8_vsh_set_constant(api_reg, f4, 1);
+            d3d8_vsh_set_constant(hw_reg, f4, 1);
 
             /* Opt-in instrument, same env var as d3d8_vsh.c's HLSL dump --
              * lets the two be read side by side (which c[] registers a
@@ -595,19 +603,19 @@ static void vsh_constant_write(uint32_t method, uint32_t param)
              * scale/offset pair) long before this ever got to show them. */
             if (getenv("XBOXRECOMP_VSHDUMP")) {
                 static int shown_reg[NV2A_VS_MAX_CONSTANTS];
-                if (!shown_reg[api_reg]) {
-                    fprintf(stderr, "[PGRAPH-D3D11] VSH const c[%d] (hw %d) = "
+                if (!shown_reg[hw_reg]) {
+                    fprintf(stderr, "[PGRAPH-D3D11] VSH const c[%d] = "
                             "(%.4f, %.4f, %.4f, %.4f)\n",
-                            api_reg, g_pg.vsh.const_load, f4[0], f4[1], f4[2], f4[3]);
-                    shown_reg[api_reg] = 1;
+                            hw_reg, f4[0], f4[1], f4[2], f4[3]);
+                    shown_reg[hw_reg] = 1;
                 }
             }
         } else {
             static int warned = 0;
             if (!warned) {
-                fprintf(stderr, "[PGRAPH-D3D11] VSH const hw slot %d (api %d, "
-                        "bias -96) outside 0-%d; ignoring\n",
-                        g_pg.vsh.const_load, api_reg, NV2A_VS_MAX_CONSTANTS - 1);
+                fprintf(stderr, "[PGRAPH-D3D11] VSH const hw slot %d outside "
+                        "0-%d; ignoring\n",
+                        g_pg.vsh.const_load, NV2A_VS_MAX_CONSTANTS - 1);
                 warned = 1;
             }
         }
