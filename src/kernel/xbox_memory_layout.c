@@ -62,8 +62,11 @@ static HANDLE g_mapping_handle = NULL;
 static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
 /* Contiguous / physical memory window (see MemoryLayoutInit).
  * XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE come from kernel.h - the bridges need
- * the same numbers for MmClaimGpuInstanceMemory. */
+ * the same numbers for MmClaimGpuInstanceMemory. A file mapping, so the same
+ * pages can also be viewed at the write-combined alias XBOX_CONTIG_WC_BASE. */
+static HANDLE g_contig_mapping = NULL;
 static void *g_contig_memory = NULL;
+static void *g_contig_wc_view = NULL;
 
 /* NV2A GPU register aperture (see MemoryLayoutInit). Backed as plain RAM so
  * that D3D8 code linked into the title can poke it without faulting. */
@@ -737,21 +740,52 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * aliases physical RAM, but we load the XBE image into the low addresses of
      * that same region, so aliasing would put a title's pinned pools on top of
      * its own code. Separate storage costs an extra mapping and behaves
-     * correctly; nothing here depends on the aliasing.
+     * correctly.
+     *
+     * It IS aliased at 0xF0000000, though. The NV2A sees physical RAM there
+     * too, and Xbox D3D locks a tiled surface by handing the CPU
+     * 0xF0000000 | physical (sub_001C6280 in Breakdown). Those surfaces are
+     * contiguous allocations, so the alias has to reach this storage. It used
+     * to be RAM mirror 60 -- low RAM -- so Breakdown's movie frames went to low
+     * 0x02232800 instead of their texture at 0x82232800, straight on top of
+     * base.pak's heap data, whose entry table then fed a runaway copy that
+     * wiped .data. Hence a file mapping, viewed twice.
      *
      * Reserved before the kernel page below, which lives inside it.
      */
     {
         uintptr_t contig_native = XBOX_CONTIG_BASE + g_memory_offset;
-        g_contig_memory = VirtualAlloc(
-            (LPVOID)contig_native,
-            XBOX_CONTIG_SIZE,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_READWRITE
-        );
+        uintptr_t wc_native = XBOX_CONTIG_WC_BASE + g_memory_offset;
+        g_contig_mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL,
+                                              PAGE_READWRITE, 0,
+                                              XBOX_CONTIG_SIZE, NULL);
+        if (g_contig_mapping) {
+            g_contig_memory = MapViewOfFileEx(g_contig_mapping, FILE_MAP_ALL_ACCESS,
+                                              0, 0, XBOX_CONTIG_SIZE,
+                                              (LPVOID)contig_native);
+            g_contig_wc_view = MapViewOfFileEx(g_contig_mapping, FILE_MAP_ALL_ACCESS,
+                                               0, 0, XBOX_CONTIG_SIZE,
+                                               (LPVOID)wc_native);
+        }
         if (g_contig_memory) {
-            fprintf(stderr, "  Contiguous window: %u MB at Xbox VA 0x%08X\n",
-                    XBOX_CONTIG_SIZE / (1024 * 1024), XBOX_CONTIG_BASE);
+            int aliased = 0;
+            if (g_contig_wc_view) {
+                /* Prove the two views share pages before anything relies on it:
+                 * a store through the alias must read back through the window.
+                 * Page 1 is below every allocation and outside the kernel page. */
+                uint32_t *probe = (uint32_t *)((uint8_t *)g_contig_memory + 0x1000);
+                uint32_t saved = *probe;
+                *(uint32_t *)((uint8_t *)g_contig_wc_view + 0x1000) = 0x5A17C0DEu;
+                aliased = (*probe == 0x5A17C0DEu);
+                *probe = saved;
+            }
+            fprintf(stderr, "  Contiguous window: %u MB at Xbox VA 0x%08X, "
+                    "write-combined alias at 0x%08X %s\n",
+                    XBOX_CONTIG_SIZE / (1024 * 1024), XBOX_CONTIG_BASE,
+                    XBOX_CONTIG_WC_BASE,
+                    aliased ? "(verified)" :
+                    g_contig_wc_view ? "(NOT aliased -- tiled writes will be lost)"
+                                     : "(failed to map)");
         } else {
             fprintf(stderr, "  WARNING: contiguous window at 0x%08X failed "
                     "(error %lu); pinned physical allocations will fault\n",
@@ -898,10 +932,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * writes at any mirror address correctly access the base data.
      */
     {
-        int mirrors_ok = 0;
+        int mirrors_ok = 0, mirrors_skipped = 0;
         for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
             uintptr_t mirror_base = (uintptr_t)g_memory_base +
                                     (uintptr_t)(m + 1) * g_memory_size;
+            uint64_t mirror_va = (uint64_t)XBOX_MAP_START +
+                                 (uint64_t)(m + 1) * g_memory_size;
+            /* The write-combined window belongs to contiguous memory (see the
+             * contiguous window above), not to a low-RAM mirror. */
+            if (g_contig_wc_view &&
+                mirror_va < (uint64_t)XBOX_CONTIG_WC_BASE + XBOX_CONTIG_SIZE &&
+                mirror_va + g_memory_size > XBOX_CONTIG_WC_BASE) {
+                mirrors_skipped++;
+                continue;
+            }
             g_mirror_views[m] = MapViewOfFileEx(
                 g_mapping_handle,
                 FILE_MAP_ALL_ACCESS,
@@ -916,9 +960,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                         m + 1, (void *)mirror_base, GetLastError());
             }
         }
-        fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)\n",
+        fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)%s\n",
                 mirrors_ok, XBOX_NUM_MIRRORS,
-                (int)((mirrors_ok + 1) * g_memory_size / (1024 * 1024)));
+                (int)((mirrors_ok + 1) * g_memory_size / (1024 * 1024)),
+                mirrors_skipped ? ", write-combined window left to contiguous memory" : "");
     }
 
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
@@ -1022,8 +1067,23 @@ BOOL xbox_ApuEnableTrapping(void)
 void xbox_MemoryLayoutShutdown(void)
 {
     if (g_kernel_memory) {
-        VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
+        /* Only a page of its own when the contiguous window failed; otherwise
+         * it is storage inside that window's view, released with it below. */
+        if (!g_contig_memory)
+            VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
         g_kernel_memory = NULL;
+    }
+    if (g_contig_wc_view) {
+        UnmapViewOfFile(g_contig_wc_view);
+        g_contig_wc_view = NULL;
+    }
+    if (g_contig_memory) {
+        UnmapViewOfFile(g_contig_memory);
+        g_contig_memory = NULL;
+    }
+    if (g_contig_mapping) {
+        CloseHandle(g_contig_mapping);
+        g_contig_mapping = NULL;
     }
     if (g_nv2a_ack_thread) {
         InterlockedExchange(&g_nv2a_ack_stop, 1);

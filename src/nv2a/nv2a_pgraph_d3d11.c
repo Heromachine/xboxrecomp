@@ -994,39 +994,21 @@ static TexCacheEntry *resolve_texture_stage(int stage)
          * stops holding. */
         return NULL;
     }
-    /* Textures live in the LOW map, not the contiguous mirror.
+    /* Every texture reads from the contiguous window, YUV movie surfaces
+     * included. Textures are contiguous allocations, and nv2a_get_guest_ram()
+     * is that window.
      *
-     * nv2a_get_guest_ram() returns kernel_base + 0x80000000, the physical
-     * mirror. That base is correct for the push buffer -- verified for that
-     * one object in nv2a_core.c's pfifo_pull() comment -- but it was never
-     * verified for textures, and it is wrong for them here.
+     * Movie surfaces used to read the LOW map instead (527f89f): the decoder
+     * writes them through D3D's tiled-lock alias 0xF0000000 | physical, and
+     * that alias was mapped onto low RAM, so the frames really were there --
+     * on top of whatever the heap had put at the same addresses. The alias
+     * now reaches the contiguous window (XBOX_CONTIG_WC_BASE), which is where
+     * both the frames and this read belong.
      *
-     * The two views are NOT aliases in this runtime: xbox_MemoryLayoutInit
-     * gives the contiguous window its own committed storage, and three of the
-     * launcher's 64 MB mirror views (30/31/32, the one at host +0x80000000
-     * among them) fail to map with ERROR_INVALID_ADDRESS. So a texture written
-     * by the CPU through the low map is simply not visible 2 GB up.
-     *
-     * Measured, both views printed side by side for every texture this title
-     * programs (XBOXRECOMP_TEXDUMP):
-     *     0x02232800  mirror 00000000    low 10801080 10801080 ...
-     *     0x022C8800  mirror 00000000    low 10801080 10801080 ...
-     * 0x10801080 is YUY2 video black (Y=0x10, U=V=0x80) -- a real decoded
-     * frame, not noise. Every byte the old base read was zero, which is what
-     * the "textures are empty" note in nv2a_core.c recorded without being able
-     * to explain. This is why: the decoder was writing frames the whole time,
-     * to an address the GPU side was not looking at.
-     *
-     * Scoped to the YUV movie surfaces deliberately. The A8R8G8B8 textures
-     * read zero through BOTH views in the same capture, so they are a
-     * different problem (not yet populated at the time sampled) and nothing
-     * here is evidence about which base they want. Widen this only when a
-     * measurement supports it. The real fix is DMA-object resolution
-     * (SET_CONTEXT_DMA_A/_B -> RAMIN descriptor, xemu's nv_dma_map), which
-     * would derive the base per object instead of assuming one; this is the
-     * narrow, evidenced step toward it. */
-    src = (is_yuv ? (guest_ram - 0x80000000u) : guest_ram)
-        + (g_pg.tex[stage].offset & (guest_ram_size - 1));
+     * The real fix is still DMA-object resolution (SET_CONTEXT_DMA_A/_B ->
+     * RAMIN descriptor, xemu's nv_dma_map), deriving the base per object
+     * instead of assuming one. */
+    src = guest_ram + (g_pg.tex[stage].offset & (guest_ram_size - 1));
 
     if (is_yuv) {
         uint32_t off = g_pg.tex[stage].offset & (guest_ram_size - 1);

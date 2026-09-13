@@ -326,6 +326,12 @@ void xbox_init_fake_tib(void);
  * with room to spare -- while stopping well short of the NV2A aperture at
  * 0xFD000000 and the MCPX apertures above it, which are mapped separately
  * at fixed addresses and must not overlap a mirror view.
+ *
+ * The mirror that would land on 0xF0000000 is no longer mapped: that window
+ * is the write-combined alias of the CONTIGUOUS window (XBOX_CONTIG_WC_BASE in
+ * kernel.h). The OR above is D3D locking a tiled surface, and the physical
+ * address it ORs belongs to a contiguous allocation -- so low RAM was the
+ * wrong backing, and Breakdown's movie frames overwrote heap data through it.
  */
 #define XBOX_NUM_MIRRORS    60
 

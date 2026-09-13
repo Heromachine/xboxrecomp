@@ -389,6 +389,10 @@ typedef VOID (__stdcall *PXBOX_SYSTEM_ROUTINE)(PVOID StartContext);
  * the layout and the bridges cannot disagree about where it is. */
 #define XBOX_CONTIG_BASE 0x80000000u
 #define XBOX_CONTIG_SIZE (64u * 1024u * 1024u)
+/* Write-combined alias of the same window: Xbox D3D locks a tiled surface as
+ * 0xF0000000 | physical, so these addresses must reach the contiguous storage,
+ * not low RAM. See xbox_MemoryLayoutInit. */
+#define XBOX_CONTIG_WC_BASE 0xF0000000u
 
 /* Default GPU instance size, used when a caller asks to claim everything. */
 #define XBOX_GPU_INSTANCE_DEFAULT (128u * 1024u)
