@@ -190,6 +190,49 @@ void xbox_ProtectMirrorsForDebug(void);
 #define KDATA_DISK_SERIAL_BUF   0x470  /* serial text (up to 32 bytes) */
 #define KDATA_DISK_CACHE_PARTS  0x4A0  /* HalDiskCachePartitionCount (4 bytes) */
 
+/* ================================================================
+ * Guest-visible thread objects
+ * ================================================================
+ *
+ * ObReferenceObjectByHandle hands the guest a POINTER to a kernel object, and
+ * a title is entitled to read fields out of it. That pointer used to be the
+ * handle value itself (kernel_ob.c) or a plain 0 (the ordinal-246 bridge), so
+ * every field read came from an address that was never a thread object.
+ *
+ * Breakdown's GetExitCodeThread (sub_001A837D) reads exactly two:
+ *
+ *   +0x004  byte   DISPATCHER_HEADER.SignalState -- a thread object signals
+ *                  when the thread terminates, which is what makes waiting on
+ *                  a thread handle work at all. Read as `cmp byte [ecx+4], 0`.
+ *   +0x120  dword  ExitStatus, read only once the above is set.
+ *
+ * With no object behind them the poll read arbitrary guest memory, never saw a
+ * finish, and the caller busy-waited forever -- 1.2 billion kernel calls in a
+ * 185 s run (HeroLab task f6bd2dbc).
+ *
+ * These objects live in their own reserved slice of guest RAM rather than on
+ * the guest heap: they must outlive the thread (a title can poll a handle
+ * after the worker is gone) and they must be at a stable address, and the heap
+ * is a bump allocator with no free. The region sits just above the kernel data
+ * exports, in the gap between the last XBE section (~0x00460D58) and the stack
+ * base, which nothing else claims.
+ *
+ * ONLY the two fields above are populated. The rest is deliberately left zero:
+ * the real ETHREAD is not a Windows ETHREAD and nothing here has been ground-
+ * truthed against xemu, so anything else would be invented. If a title turns
+ * out to read a third field, measure it -- do not extrapolate a layout.
+ */
+#define XBOX_THREAD_OBJ_BASE   (XBOX_KERNEL_DATA_BASE + XBOX_KERNEL_DATA_SIZE)
+#define XBOX_THREAD_OBJ_STRIDE 0x200   /* > 0x124, and keeps objects page-tidy */
+#define XBOX_THREAD_OBJ_COUNT  128     /* 64 KB total */
+#define XBOX_THREAD_OBJ_END    (XBOX_THREAD_OBJ_BASE + \
+                                XBOX_THREAD_OBJ_STRIDE * XBOX_THREAD_OBJ_COUNT)
+
+/* Field offsets inside one object. Kept as names so the two places that write
+ * them and the test that checks them cannot drift apart. */
+#define XBOX_THREAD_OBJ_SIGNALSTATE 0x004
+#define XBOX_THREAD_OBJ_EXITSTATUS  0x120
+
 /** Size of the simulated Xbox stack (8 MB).
  *  Increased from 1 MB because failed RECOMP_ICALL indirect calls
  *  can leak stdcall args onto the stack each frame. An 8 MB stack

@@ -67,6 +67,18 @@ VOID __fastcall xbox_ObfDereferenceObject(PVOID Object)
  * a pointer to the kernel object structure. On Windows, we simply pass
  * the handle through as the "object pointer" since our Ke* functions
  * treat object pointers as HANDLEs.
+ *
+ * NOT THE LIVE PATH for a recompiled title. Ordinal 246 is routed by
+ * bridge_ObReferenceObjectByHandle in kernel_bridge.c, which never calls this
+ * -- so returning the handle here does not describe what a running title sees,
+ * and an investigation that reads only this function will misattribute. That
+ * happened once already (HeroLab task f6bd2dbc). The bridge is where thread
+ * handles resolve to a real guest-visible object; see XBOX_THREAD_OBJ_* in
+ * xbox_memory_layout.h.
+ *
+ * Passing the handle through is still wrong for the same reason it was wrong
+ * in the bridge -- a caller that READS the object gets handle bytes -- but it
+ * is left alone here rather than half-fixed in a function nothing reaches.
  * ============================================================================ */
 
 NTSTATUS __stdcall xbox_ObReferenceObjectByHandle(

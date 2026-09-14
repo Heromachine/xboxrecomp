@@ -284,15 +284,173 @@ static int g_kernel_call_count = 0;
  */
 static int g_thread_call_count = 0;
 
+/* ── Guest-visible thread objects ─────────────────────────────────────────
+ *
+ * ObReferenceObjectByHandle gives the guest a pointer to a kernel object and
+ * the guest reads fields out of it. There was no object: the ordinal-246
+ * bridge wrote a plain 0, so Breakdown's GetExitCodeThread polled
+ * `byte [0 + 4]` -- arbitrary guest memory the title itself writes to -- and
+ * never saw a worker finish. See XBOX_THREAD_OBJ_* in xbox_memory_layout.h
+ * for the layout, the two fields that are real, and why nothing else is.
+ *
+ * One slot per live thread. A slot is NOT recycled when the thread exits: a
+ * title may poll a handle after its worker is gone, and a reused slot would
+ * answer for the wrong thread. It is released by NtClose, which is the point
+ * at which the guest gives up its reference to the handle.
+ */
+struct bridge_thread_obj {
+    volatile LONG in_use;    /* slot claimed (interlocked) */
+    HANDLE        handle;    /* native thread handle; NULL for an inline run */
+    uint32_t      token;     /* 32-bit handle token the guest holds */
+};
+static struct bridge_thread_obj s_thread_objs[XBOX_THREAD_OBJ_COUNT];
+
+/* Slot 0 is reserved: it is the object handed back for a thread handle this
+ * bridge did not create, and it is never signalled. A title that polls such a
+ * handle gets a stable STILL_ACTIVE rather than whatever byte happened to be
+ * at the old bogus address -- which on this title was genuinely live memory,
+ * since Breakdown does a plain `mov [4], eax` of its own. */
+#define BRIDGE_THREAD_OBJ_UNKNOWN 0
+
+static uint32_t bridge_thread_obj_va(int slot)
+{
+    return XBOX_THREAD_OBJ_BASE + (uint32_t)slot * XBOX_THREAD_OBJ_STRIDE;
+}
+
+/* Claim a slot for a thread and present it as running. Returns -1 when the
+ * table is full; the caller carries on without an object, which is the old
+ * behaviour (a poll that never finishes) rather than a failure. */
+static int bridge_thread_obj_alloc(HANDLE h, uint32_t token)
+{
+    int i;
+
+    for (i = BRIDGE_THREAD_OBJ_UNKNOWN + 1; i < XBOX_THREAD_OBJ_COUNT; i++) {
+        if (InterlockedCompareExchange(&s_thread_objs[i].in_use, 1, 0) != 0)
+            continue;
+        s_thread_objs[i].handle = h;
+        s_thread_objs[i].token  = token;
+        memset(XBOX_TO_NATIVE(bridge_thread_obj_va(i)), 0,
+               XBOX_THREAD_OBJ_STRIDE);
+        return i;
+    }
+    fprintf(stderr, "  [KERNEL] thread-object table full (%d); GetExitCodeThread "
+            "cannot report this thread finishing\n", XBOX_THREAD_OBJ_COUNT);
+    fflush(stderr);
+    return -1;
+}
+
+/* Signal the object: the thread is finished and this was its exit status.
+ *
+ * The status is written BEFORE the signal byte, because the guest reads them
+ * in that order -- `cmp byte [ecx+4], 0` and only then `mov eax, [ecx+0x120]`
+ * -- and the poller runs on a different thread from the one exiting. The
+ * barrier between them is what keeps a poller that has just seen the signal
+ * from reading a status that has not landed yet. */
+static void bridge_thread_obj_signal(int slot, uint32_t exit_status)
+{
+    uint32_t va;
+
+    if (slot < 0 || slot >= XBOX_THREAD_OBJ_COUNT)
+        return;
+    va = bridge_thread_obj_va(slot);
+    BRIDGE_MEM32(va + XBOX_THREAD_OBJ_EXITSTATUS) = exit_status;
+    MemoryBarrier();
+    BRIDGE_MEM8(va + XBOX_THREAD_OBJ_SIGNALSTATE) = 1;
+}
+
+/* The object for a handle token the guest passed back, or 0 if that token was
+ * never a thread this bridge created. */
+static uint32_t bridge_thread_obj_for_token(uint32_t token)
+{
+    int i;
+
+    if (!token)
+        return 0;
+    for (i = BRIDGE_THREAD_OBJ_UNKNOWN + 1; i < XBOX_THREAD_OBJ_COUNT; i++)
+        if (s_thread_objs[i].in_use && s_thread_objs[i].token == token)
+            return bridge_thread_obj_va(i);
+    return 0;
+}
+
+/* Reverse of the above: the native thread handle behind an object pointer.
+ *
+ * Needed because the guest does not keep the handle once it has the object.
+ * Breakdown's SetThreadPriority (sub_001A8277) hands the object straight to
+ * KeSetBasePriorityThread -- its Object* out-parameter aliases the handle
+ * argument slot (`lea eax, [ebp+8]`), so the handle is overwritten by the
+ * object before that call is made. */
+static HANDLE bridge_thread_handle_for_object(uint32_t object_va)
+{
+    uint32_t off;
+    int slot;
+
+    if (object_va < XBOX_THREAD_OBJ_BASE || object_va >= XBOX_THREAD_OBJ_END)
+        return NULL;
+    off = object_va - XBOX_THREAD_OBJ_BASE;
+    if (off % XBOX_THREAD_OBJ_STRIDE)
+        return NULL;
+    slot = (int)(off / XBOX_THREAD_OBJ_STRIDE);
+    return s_thread_objs[slot].in_use ? s_thread_objs[slot].handle : NULL;
+}
+
+/* Give a slot back. Only ever called once the guest has dropped the handle
+ * (NtClose) or when the thread it was claimed for never started. */
+static void bridge_thread_obj_release(int slot)
+{
+    if (slot <= BRIDGE_THREAD_OBJ_UNKNOWN || slot >= XBOX_THREAD_OBJ_COUNT)
+        return;
+    s_thread_objs[slot].handle = NULL;
+    s_thread_objs[slot].token  = 0;
+    InterlockedExchange(&s_thread_objs[slot].in_use, 0);
+}
+
+/* Release the slot behind a handle token (NtClose). */
+static void bridge_thread_obj_release_token(uint32_t token)
+{
+    int i;
+
+    if (!token)
+        return;
+    for (i = BRIDGE_THREAD_OBJ_UNKNOWN + 1; i < XBOX_THREAD_OBJ_COUNT; i++) {
+        if (s_thread_objs[i].in_use && s_thread_objs[i].token == token) {
+            bridge_thread_obj_release(i);
+            return;
+        }
+    }
+}
+
+/* Clear the whole object region and reserve slot 0. Guest RAM is already
+ * zeroed when it is mapped, but this region is read by the title as a kernel
+ * structure, so it is spelled out here rather than assumed -- and it has to be
+ * re-cleared if a run ever re-initialises the bridge. */
+static void bridge_thread_objs_init(void)
+{
+    int i;
+
+    memset(XBOX_TO_NATIVE(XBOX_THREAD_OBJ_BASE), 0,
+           XBOX_THREAD_OBJ_END - XBOX_THREAD_OBJ_BASE);
+    for (i = 0; i < XBOX_THREAD_OBJ_COUNT; i++) {
+        s_thread_objs[i].handle = NULL;
+        s_thread_objs[i].token  = 0;
+        s_thread_objs[i].in_use = (i == BRIDGE_THREAD_OBJ_UNKNOWN);
+    }
+}
+
 /* Thread entry shim. Sets up the new thread's own simulated stack, pushes the
  * two Xbox start-context arguments plus the dummy return address the callee's
  * `ret` consumes, and runs. */
 /* Set on threads this bridge spawned; see PsTerminateSystemThread. */
 static RECOMP_TLS int g_is_spawned_thread = 0;
 
+/* This thread's own object slot, so PsTerminateSystemThread -- which never
+ * returns and so cannot report back to bridge_thread_main -- can signal it.
+ * -1 on the main thread and on any thread with no object. */
+static RECOMP_TLS int g_thread_obj_slot = -1;
+
 struct bridge_thread_start {
     recomp_func_t fn;
     uint32_t ctx1, ctx2, stack_top;
+    int obj_slot;
 };
 
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
@@ -324,10 +482,16 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
      * fake-TIB state mid-execution. */
     g_is_spawned_thread = 1;
     g_esp = s->stack_top;
+    g_thread_obj_slot = s->obj_slot;
     xbox_init_fake_tib();
     free(s);
 
     bridge_run_thread_inline(fn, ctx1, ctx2);
+
+    /* Returning off the end of the start routine is an exit too -- a worker
+     * that finishes this way never reaches PsTerminateSystemThread, and a
+     * title polling its handle would wait for a thread that is already gone. */
+    bridge_thread_obj_signal(g_thread_obj_slot, g_eax);
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
     fflush(stderr);
@@ -335,13 +499,15 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 }
 
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
-                                  uint32_t ctx2, uint32_t stack_top)
+                                  uint32_t ctx2, uint32_t stack_top,
+                                  int obj_slot)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
 
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+    s->obj_slot = obj_slot;
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
     if (!th) free(s);
@@ -425,22 +591,66 @@ static void bridge_PsCreateSystemThreadEx(void)
                  * spawned thread gets its own, and the caller's is untouched by
                  * construction rather than by save/restore. */
                 uint32_t stack_top = xbox_AllocThreadStack();
+                /* Claimed before the thread starts so the thread can carry its
+                 * own slot; the handle and token are filled in below, once
+                 * CreateThread has produced them. A thread that finishes in
+                 * between signals its object by slot, which needs neither. */
+                int obj_slot = bridge_thread_obj_alloc(NULL, 0);
 
                 if (!stack_top) {
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: out of "
                             "thread stacks, running worker 0x%08X inline\n",
                             start_routine);
                     fflush(stderr);
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
+                    {
+                        /* The routine runs on the CALLING thread, so for the
+                         * duration it is the thread this slot describes --
+                         * otherwise a PsTerminateSystemThread inside it would
+                         * signal (and report the exit status of) whichever
+                         * thread happens to be hosting it. Saved and restored
+                         * because an inline run can nest. */
+                        int outer = g_thread_obj_slot;
+                        g_thread_obj_slot = obj_slot;
+                        bridge_run_thread_inline(fn, start_context1,
+                                                 start_context2);
+                        g_thread_obj_slot = outer;
+                    }
+                    /* It has already finished, so its object is signalled at
+                     * once. It still needs a handle the guest can hand back to
+                     * GetExitCodeThread: there is no native thread to name, so
+                     * the token is synthetic and distinct from the 0xBEEF0001
+                     * written above (which belongs to the main thread and is
+                     * never polled). Without this, a title that polls a worker
+                     * the stack pool could not accommodate waits forever for a
+                     * routine that has in fact already run. */
+                    if (obj_slot >= 0) {
+                        uint32_t token = 0xBEEF0100u | (uint32_t)obj_slot;
+                        s_thread_objs[obj_slot].token = token;
+                        bridge_thread_obj_signal(obj_slot, g_eax);
+                        if (xbox_handle_ptr)
+                            BRIDGE_MEM32(xbox_handle_ptr) = token;
+                    }
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
+                                                    start_context2, stack_top,
+                                                    obj_slot);
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
                     fflush(stderr);
                     if (xbox_handle_ptr && th) {
                         bridge_write_handle(xbox_handle_ptr, th);
+                        if (obj_slot >= 0) {
+                            s_thread_objs[obj_slot].handle = th;
+                            s_thread_objs[obj_slot].token =
+                                BRIDGE_MEM32(xbox_handle_ptr);
+                        }
+                    } else if (!th && obj_slot >= 0) {
+                        /* The thread never started, so nothing will ever name
+                         * or signal this slot. (A thread that DID start keeps
+                         * its slot even with no handle out-parameter -- it is
+                         * still going to signal it by slot when it exits.) */
+                        bridge_thread_obj_release(obj_slot);
                     }
                 }
             }
@@ -471,6 +681,13 @@ static void bridge_NtClose(void)
         fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X\n", raw_handle);
         fflush(stderr);
     }
+
+    /* Giving up the handle is giving up the reference to the object behind it,
+     * so this is where a thread object's slot goes back -- not when the thread
+     * exits, because a title is entitled to read the exit status afterwards
+     * (that is the whole point of GetExitCodeThread). No-op for every handle
+     * that is not a thread's. */
+    bridge_thread_obj_release_token(raw_handle);
 
     /* Close real handles but skip fake/synthetic ones */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
@@ -1235,6 +1452,12 @@ static void bridge_PsTerminateSystemThread(void)
     fflush(stderr);
 
     g_eax = exit_status;
+
+    /* Publish the exit before the thread goes away. This is the ordinary way a
+     * worker finishes, so it is the path that has to make GetExitCodeThread
+     * stop polling; bridge_thread_main covers the routine that just returns
+     * instead. Harmless on the main thread, which has no object slot. */
+    bridge_thread_obj_signal(g_thread_obj_slot, exit_status);
 
     /*
      * This does not return on hardware. Returning was survivable while every
@@ -2443,15 +2666,47 @@ static void bridge_IoCreateSymbolicLink(void)
     g_eax = 0;  /* STATUS_SUCCESS */
 }
 
-/* ── ObReferenceObjectByHandle (ordinal 246) ─────────────── */
+/* ── ObReferenceObjectByHandle (ordinal 246) ───────────────
+ *
+ * Xbox: NTSTATUS ObReferenceObjectByHandle(HANDLE Handle, PVOID ObjectType,
+ *                                          PVOID* Object)
+ * 3 args, not the 6 of Windows NT.
+ *
+ * This wrote a plain 0 for every type, which is not a pointer to anything. A
+ * title that only passes the result back to another kernel call never noticed;
+ * one that READS the object did, silently. Breakdown's GetExitCodeThread reads
+ * a thread object's signal state and exit status, got neither, and busy-waited
+ * forever -- 1.2 billion kernel calls in 185 s (HeroLab task f6bd2dbc).
+ *
+ * Thread handles now resolve to a real guest-visible object (see
+ * XBOX_THREAD_OBJ_* in xbox_memory_layout.h). Every other type still gets 0:
+ * no title here has been observed reading one, and inventing a layout for an
+ * object nothing has measured is what produced this bug in the first place.
+ *
+ * NOTE for callers downstream: the out-parameter commonly ALIASES the handle
+ * argument (Breakdown does `lea eax, [ebp+8]`), so after this returns the
+ * guest may no longer hold the handle at all -- only the object. Anything that
+ * then takes "a thread" from the guest must accept an object pointer too; see
+ * bridge_KeSetBasePriorityThread.
+ */
 static void bridge_ObReferenceObjectByHandle(void)
 {
-    /* Xbox: NTSTATUS ObReferenceObjectByHandle(HANDLE Handle, PVOID ObjectType, PVOID* Object)
-     * 3 args (not 6 like Windows NT) */
-    uint32_t handle = STACK_ARG(0);
-    uint32_t obj_type = STACK_ARG(1);
+    uint32_t handle     = STACK_ARG(0);
+    uint32_t obj_type   = STACK_ARG(1);
     uint32_t object_ptr = STACK_ARG(2);
-    if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
+    uint32_t object     = 0;
+
+    if (obj_type == XBOX_KERNEL_DATA_BASE + KDATA_THREAD_OBJ_TYPE) {
+        object = bridge_thread_obj_for_token(handle);
+        if (!object) {
+            /* A thread handle this bridge did not create -- the inline main
+             * thread, or a handle the title made up. Answer with the reserved
+             * never-signalled object so the poll is at least consistent. */
+            object = bridge_thread_obj_va(BRIDGE_THREAD_OBJ_UNKNOWN);
+        }
+    }
+
+    if (object_ptr) BRIDGE_MEM32(object_ptr) = object;
     g_eax = 0;  /* STATUS_SUCCESS */
 }
 
@@ -2719,11 +2974,22 @@ static void bridge_KeDisconnectInterrupt(void)
         (PXBOX_KINTERRUPT)XBOX_TO_NATIVE(STACK_ARG(0)));
 }
 
-/* ── KeSetBasePriorityThread (ordinal 143, 2 args) */
+/* ── KeSetBasePriorityThread (ordinal 143, 2 args)
+ *
+ * The "thread" argument is whatever the title has in hand, and that is usually
+ * NOT a handle: Breakdown's SetThreadPriority (sub_001A8277) calls
+ * ObReferenceObjectByHandle first, whose out-parameter overwrites the handle
+ * slot with the object, and passes the object here. Resolve it back to the
+ * native thread before falling through to the handle-token reading that any
+ * other caller needs. */
 static void bridge_KeSetBasePriorityThread(void)
 {
-    g_eax = (uint32_t)xbox_KeSetBasePriorityThread(
-        XBOX_TO_NATIVE(STACK_ARG(0)), (LONG)STACK_ARG(1));
+    uint32_t thread = STACK_ARG(0);
+    HANDLE   h      = bridge_thread_handle_for_object(thread);
+
+    if (!h) h = bridge_resolve_handle(thread);
+
+    g_eax = (uint32_t)xbox_KeSetBasePriorityThread(h, (LONG)STACK_ARG(1));
 }
 
 /* ── KeStallExecutionProcessor (ordinal 151, 1 arg) */
@@ -3650,6 +3916,7 @@ void xbox_kernel_bridge_init(void)
 
     /* Initialize kernel data export values first */
     kernel_data_init();
+    bridge_thread_objs_init();
 
     for (i = 0; i < g_thunk_table_count; i++) {
         uint32_t va = g_thunk_table_base + i * 4;
