@@ -38,10 +38,97 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
     return ObjectAttributes->ObjectName->Buffer;
 }
 
+/* Copy NtQueryDirectoryFile's guest search pattern out of its ANSI_STRING,
+ * bounded (platform-independent).
+ *
+ * FileName->Length is a 16-bit byte count the *guest* chose; nothing in the
+ * bridge validates it, and it is not a host buffer index. The Win32 backend
+ * used to pass it to MultiByteToWideChar and then write
+ *
+ *     pattern_wide[FileName->Length] = L'\0';
+ *
+ * into a WCHAR[MAX_PATH]. MultiByteToWideChar was bounded, that terminator
+ * write was not, so any Length >= MAX_PATH wrote a zero WCHAR up to 0xFFFF
+ * elements past the end of a stack array. It crashed on Breakdown at
+ * kernel_file.c:604 (see HeroLab task 17f002cc) because the ordinal-207 bridge
+ * was decoding the argument list one slot short and handing this function the
+ * FILE_INFORMATION_CLASS value as the ANSI_STRING pointer -- but the write was
+ * reachable from any title with a long or malformed descriptor regardless.
+ *
+ * On success `out` holds a NUL-terminated pattern; an EMPTY result means the
+ * guest supplied no pattern and the caller should enumerate everything ("*").
+ * `out_size` is the full size of `out`; one byte of it is reserved for the
+ * terminator, so a pattern of exactly out_size bytes is rejected rather than
+ * truncated -- a silently truncated pattern matches the wrong files, which is
+ * worse than an honest error.
+ */
+static NTSTATUS dir_pattern_from_ansi(const XBOX_ANSI_STRING* FileName,
+                                      char* out, size_t out_size)
+{
+    size_t n;
+
+    if (!out || out_size == 0)
+        return STATUS_INVALID_PARAMETER;
+    out[0] = '\0';
+
+    if (!FileName || !FileName->Buffer || FileName->Length == 0)
+        return STATUS_SUCCESS;              /* no pattern -> caller uses "*" */
+
+    /* A descriptor claiming more bytes than its own buffer holds is malformed;
+     * honouring Length there would read past the guest's allocation. */
+    if (FileName->MaximumLength != 0 && FileName->Length > FileName->MaximumLength)
+        return STATUS_INVALID_PARAMETER;
+
+    n = (size_t)FileName->Length;
+    if (n >= out_size)
+        return STATUS_OBJECT_NAME_INVALID;  /* overlong for any host path */
+
+    memcpy(out, FileName->Buffer, n);
+    out[n] = '\0';
+    /* Length may or may not count a terminator depending on how the guest
+     * built the string; stop at the first NUL either way so the pattern can
+     * never carry an embedded one into a host path API. */
+    return STATUS_SUCCESS;
+}
+
+/* Is this directory entry "." or ".."? (platform-independent)
+ *
+ * FATX stores no "." / ".." entries in a subdirectory, so the Xbox kernel's
+ * NtQueryDirectoryFile never reports them. Both host backends do -- Win32's
+ * FindFirstFileW and POSIX's readdir each hand them back -- and passing them
+ * through is not a cosmetic difference.
+ *
+ * The evidence is in the title, not in a spec: Breakdown's recursive
+ * directory delete (sub_001AE48A, 0x001AE48A in
+ * tools/disasm/output/asm/text.asm) enumerates a directory, opens each entry
+ * relative to the parent handle, and if the entry is itself a directory calls
+ * ITSELF on it -- with no name filter of any kind. A kernel that returned "."
+ * there would send retail Breakdown into unbounded recursion on real hardware
+ * the first time it cleared its cache partition, so the kernel plainly does
+ * not. Once the ordinal-207 bridge was fixed and this enumeration started
+ * working at all, that is exactly what the recomp did: a run walked down
+ * Z:\area\.\.\.\... until the path hit MAX_PATH (HeroLab task 17f002cc,
+ * ~/xbox-investigation/seed-1b900/run32-ord207fix-newgame.log).
+ */
+#if !defined(_WIN32)   /* the Win32 backend uses the WCHAR form below */
+static int dir_entry_is_dot(const char* name)
+{
+    return name && name[0] == '.' &&
+           (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'));
+}
+#endif
+
 /* ======================================================================== */
 #if defined(_WIN32)
 /* ====================  Win32 backend  =================================== */
 /* ======================================================================== */
+
+/* dir_entry_is_dot for FindFirstFileW's wide names. See the comment there. */
+static int dir_entry_is_dot_w(const WCHAR* name)
+{
+    return name && name[0] == L'.' &&
+           (name[1] == L'\0' || (name[1] == L'.' && name[2] == L'\0'));
+}
 
 /* Convert Xbox create disposition to Win32 */
 static DWORD xbox_disposition_to_win32(ULONG Disposition)
@@ -597,14 +684,30 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         WCHAR* clean_path = dir_path;
         if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
             clean_path += 4;
-        if (FileName && FileName->Buffer) {
-            WCHAR pattern_wide[MAX_PATH];
-            MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
-                                pattern_wide, MAX_PATH);
-            pattern_wide[FileName->Length] = L'\0';
-            swprintf_s(search_path, MAX_PATH, L"%s\\%s", clean_path, pattern_wide);
-        } else {
-            swprintf_s(search_path, MAX_PATH, L"%s\\*", clean_path);
+        {
+            char     pattern_ansi[MAX_PATH];
+            NTSTATUS pst = dir_pattern_from_ansi(FileName, pattern_ansi,
+                                                 sizeof(pattern_ansi));
+            if (!NT_SUCCESS(pst)) {
+                IoStatusBlock->Status = pst;
+                return pst;
+            }
+            if (pattern_ansi[0] == '\0') {
+                swprintf_s(search_path, MAX_PATH, L"%s\\*", clean_path);
+            } else {
+                WCHAR pattern_wide[MAX_PATH];
+                /* -1 converts up to and including the terminator and returns
+                 * the count with it, or 0 if it would not fit -- so the
+                 * terminator is written by the conversion, never indexed in
+                 * by a guest-supplied length. */
+                int wide = MultiByteToWideChar(CP_ACP, 0, pattern_ansi, -1,
+                                               pattern_wide, MAX_PATH);
+                if (wide <= 0) {
+                    IoStatusBlock->Status = STATUS_OBJECT_NAME_INVALID;
+                    return STATUS_OBJECT_NAME_INVALID;
+                }
+                swprintf_s(search_path, MAX_PATH, L"%s\\%s", clean_path, pattern_wide);
+            }
         }
         ctx->find_handle = FindFirstFileW(search_path, &ctx->find_data);
         if (ctx->find_handle == INVALID_HANDLE_VALUE) {
@@ -613,14 +716,25 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             return STATUS_NO_MORE_FILES;
         }
         ctx->first_done = TRUE;
-    } else {
-        if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
-            FindClose(ctx->find_handle);
-            ctx->find_handle = NULL;
-            ctx->file_handle = NULL;
-            IoStatusBlock->Status = STATUS_NO_MORE_FILES;
-            return STATUS_NO_MORE_FILES;
+        while (dir_entry_is_dot_w(ctx->find_data.cFileName)) {
+            if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
+                FindClose(ctx->find_handle);
+                ctx->find_handle = NULL;
+                ctx->file_handle = NULL;
+                IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+                return STATUS_NO_MORE_FILES;
+            }
         }
+    } else {
+        do {
+            if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
+                FindClose(ctx->find_handle);
+                ctx->find_handle = NULL;
+                ctx->file_handle = NULL;
+                IoStatusBlock->Status = STATUS_NO_MORE_FILES;
+                return STATUS_NO_MORE_FILES;
+            }
+        } while (dir_entry_is_dot_w(ctx->find_data.cFileName));
     }
 
     entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
@@ -1055,7 +1169,7 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 typedef struct {
     HANDLE handle;
     DIR*   dir;
-    char   pattern[64];
+    char   pattern[MAX_PATH];
 } DIR_CONTEXT;
 
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
@@ -1096,13 +1210,21 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }
-        if (FileName && FileName->Buffer && FileName->Length > 0) {
-            USHORT n = FileName->Length;
-            if (n >= sizeof(ctx->pattern)) n = sizeof(ctx->pattern) - 1;
-            memcpy(ctx->pattern, FileName->Buffer, n);
-            ctx->pattern[n] = '\0';
-        } else {
-            strcpy(ctx->pattern, "*");
+        {
+            /* Same bounded conversion as the Win32 backend: this one clamped
+             * instead of overflowing, but a silently truncated pattern matches
+             * the wrong files. Reject rather than truncate. */
+            NTSTATUS pst = dir_pattern_from_ansi(FileName, ctx->pattern,
+                                                 sizeof(ctx->pattern));
+            if (!NT_SUCCESS(pst)) {
+                closedir(ctx->dir);
+                ctx->dir = NULL;
+                LeaveCriticalSection(&s_dir_cs);
+                IoStatusBlock->Status = pst;
+                return pst;
+            }
+            if (ctx->pattern[0] == '\0')
+                strcpy(ctx->pattern, "*");
         }
     }
 
@@ -1120,6 +1242,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             IoStatusBlock->Status = STATUS_NO_MORE_FILES;
             return STATUS_NO_MORE_FILES;
         }
+        if (dir_entry_is_dot(de->d_name))
+            continue;   /* FATX has no dot entries; see dir_entry_is_dot */
         if (fnmatch(ctx->pattern, de->d_name, FNM_CASEFOLD) == 0)
             break;
     }

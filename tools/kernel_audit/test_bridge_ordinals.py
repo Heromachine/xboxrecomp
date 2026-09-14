@@ -144,6 +144,96 @@ def test_every_routed_ordinal_has_an_arg_size():
     print(f"ok  every_routed_ordinal_has_an_arg_size ({len(sized)} sized)")
 
 
+# Arity of kernel exports whose real signature has been established against
+# evidence, with the evidence named. The arg-size table is hand-maintained and
+# its comment only names the function, so nothing previously checked that the
+# NUMBER was right -- test_arg_size_comments_match_their_ordinal passes just as
+# happily on a wrong count.
+#
+# Ordinal 207 is why this table exists. Its entry said 9 args / 36 bytes; the
+# Xbox export takes 10, with a FILE_INFORMATION_CLASS between Length and
+# FileName (NT's has it too, plus a ReturnSingleEntry the Xbox kernel drops).
+# Every argument from index 7 on was therefore read one slot early: the bridge
+# took the class constant 1 as the ANSI_STRING pointer, read a garbage 16-bit
+# Length out of guest address 0, and drove kernel_file.c's pattern conversion
+# out of bounds -- plus popped 36 bytes where the callee owed 40, leaving esp
+# 4 low after every call. HeroLab task 17f002cc.
+KNOWN_ARITY = {
+    # ordinal: (args, evidence)
+    207: (10, "Breakdown pushes 10 args at all three call sites "
+              "(0x001ABA08, 0x001ABA6F, 0x001AE4B2), with the constant 1 "
+              "(FileDirectoryInformation) at index 7 and the ANSI_STRING "
+              "at index 8"),
+    200: (10, "NtFsControlFile; Breakdown pushes 10 at 0x001AE460"),
+    255: (10, "PsCreateSystemThreadEx; Breakdown pushes 10 at 0x001A8531, and "
+              "the worker thread this starts is what boots the title at all"),
+    190: (9,  "NtCreateFile; the published Xbox signature, and the FATX "
+              "cache-partition bring-up (HeroLab task e9bd5c57) depends on "
+              "it -- every file the title opens goes through this"),
+}
+
+
+def test_known_arities_match_the_arg_size_table():
+    """Pin the arg COUNT, not just the name, for signatures we have evidence for.
+
+    A wrong count is invisible at the call: the bridge reads a plausible value
+    from the next slot and the stdcall cleanup walks esp by a wrong amount,
+    which surfaces later as a function returning into the wrong frame. Adding
+    an entry here requires stating what established the number.
+    """
+    with open(BRIDGE_C, encoding="utf-8", errors="replace") as fh:
+        src = fh.read()
+    m = re.search(r"stdcall_args_for_ordinal.*?\n\}", src, re.S)
+    assert m, "could not locate stdcall_args_for_ordinal"
+    entries = {
+        int(o): (int(b), int(a)) for o, b, a in re.findall(
+            r"case\s+(\d+):\s*return\s+(\d+);\s*/\*\s*[A-Za-z_][A-Za-z0-9_]*"
+            r"\s*\((\d+)\)", m.group(0))}
+
+    bad = []
+    for ordinal, (want, why) in sorted(KNOWN_ARITY.items()):
+        got = entries.get(ordinal)
+        if got is None:
+            bad.append(f"ordinal {ordinal} has no arg-size entry at all")
+            continue
+        got_bytes, got_args = got
+        if got_args != want:
+            bad.append(f"ordinal {ordinal} declares {got_args} args, "
+                       f"but takes {want}: {why}")
+        elif got_bytes != want * 4:
+            bad.append(f"ordinal {ordinal} takes {want} args but pops "
+                       f"{got_bytes} bytes (should be {want * 4})")
+    assert not bad, "arg-size table disagrees with known signatures:\n  " + \
+                    "\n  ".join(bad)
+    print(f"ok  known_arities_match_the_arg_size_table "
+          f"({len(KNOWN_ARITY)} pinned)")
+
+
+def test_arg_byte_counts_match_their_declared_arity():
+    """Every entry's byte count must be four times the arity in its own comment.
+
+    This needs no external reference: the comment already states the count, so
+    a byte figure that disagrees with it is self-contradictory regardless of
+    which half is right.
+    """
+    with open(BRIDGE_C, encoding="utf-8", errors="replace") as fh:
+        src = fh.read()
+    m = re.search(r"stdcall_args_for_ordinal.*?\n\}", src, re.S)
+    assert m, "could not locate stdcall_args_for_ordinal"
+    bad = []
+    n = 0
+    for o, b, name, a in re.findall(
+            r"case\s+(\d+):\s*return\s+(\d+);\s*/\*\s*"
+            r"([A-Za-z_][A-Za-z0-9_]*)\s*\((\d+)\)", m.group(0)):
+        n += 1
+        if int(b) != int(a) * 4:
+            bad.append(f"ordinal {o} ({name}) pops {b} bytes for {a} args "
+                       f"(should be {int(a) * 4})")
+    assert n > 100, f"only parsed {n} arg-size entries"
+    assert not bad, "\n  ".join(bad)
+    print(f"ok  arg_byte_counts_match_their_declared_arity ({n} entries)")
+
+
 def test_arg_sizes_are_dword_multiples():
     """stdcall cleanup pops whole dwords; an odd size corrupts the stack."""
     with open(BRIDGE_C, encoding="utf-8", errors="replace") as fh:

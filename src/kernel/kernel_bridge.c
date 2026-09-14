@@ -2290,20 +2290,52 @@ static void bridge_NtDeleteFile(void)
     g_eax = (uint32_t)xbox_NtDeleteFile(&oa);
 }
 
-/* ── NtQueryDirectoryFile (ordinal 207, 9 args = 36 bytes) ─ */
+/* ── NtQueryDirectoryFile (ordinal 207, 10 args = 40 bytes) ─
+ *
+ * The Xbox export takes a FILE_INFORMATION_CLASS between Length and FileName,
+ * exactly as NT's does (NT additionally has ReturnSingleEntry, which the Xbox
+ * kernel drops because it is always single-entry). This bridge was written for
+ * 9 arguments with no class slot, so every argument from index 7 on was read
+ * one slot early: FileName came back as the class constant 1, and RestartScan
+ * as the FileName pointer. Reading a "descriptor" at guest VA 1 produced a
+ * 16-bit Length of whatever happens to sit at guest address 0, which is how
+ * this call reached kernel_file.c's unbounded pattern_wide[Length] write.
+ * On top of that the stdcall cleanup popped 36 bytes where the callee owed 40,
+ * leaving g_esp 4 low after every enumeration call.
+ *
+ * Ground truth is the title's own code: all three call sites in Breakdown
+ * (0x001ABA08, 0x001ABA6F, 0x001AE4B2 in tools/disasm/output/asm/text.asm)
+ * push exactly ten arguments, with the constant 1 (FileDirectoryInformation)
+ * at index 7 and the ANSI_STRING at index 8. See HeroLab task 17f002cc.
+ */
 static void bridge_NtQueryDirectoryFile(void)
 {
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t ios_va      = STACK_ARG(4);
     uint32_t info_va     = STACK_ARG(5);
     uint32_t length      = STACK_ARG(6);
-    uint32_t filename_va = STACK_ARG(7);  /* PXBOX_ANSI_STRING */
-    uint32_t restart     = STACK_ARG(8);  /* BOOLEAN */
+    uint32_t info_class  = STACK_ARG(7);  /* FILE_INFORMATION_CLASS */
+    uint32_t filename_va = STACK_ARG(8);  /* PXBOX_ANSI_STRING */
+    uint32_t restart     = STACK_ARG(9);  /* BOOLEAN */
     XBOX_IO_STATUS_BLOCK ios;
     XBOX_ANSI_STRING     fn;
     PXBOX_ANSI_STRING    pfn = NULL;
 
     memset(&ios, 0, sizeof(ios));
+    /* The Xbox kernel only implements FileDirectoryInformation (1) here, and
+     * that is the only layout xbox_NtQueryDirectoryFile fills in. Warn once
+     * rather than fail, so a title using something else is visible instead of
+     * silently mis-served. */
+    if (info_class != 1) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "  [KERNEL] NtQueryDirectoryFile: unsupported "
+                    "FileInformationClass %u (only FileDirectoryInformation=1 "
+                    "is implemented); serving it as class 1\n", info_class);
+            fflush(stderr);
+        }
+    }
     if (filename_va) {
         /* Xbox ANSI_STRING: 0=Length(u16), 2=MaximumLength(u16), 4=Buffer(u32) */
         uint32_t fn_buf  = BRIDGE_MEM32(filename_va + 4);
@@ -2983,7 +3015,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 204: return 16;  /* NtProtectVirtualMemory (4) */
     case 205: return  8;  /* NtPulseEvent (2) */
     case 206: return 20;  /* NtQueueApcThread (5) */
-    case 207: return 36;  /* NtQueryDirectoryFile (9) */
+    case 207: return 40;  /* NtQueryDirectoryFile (10) */
     case 210: return  8;  /* NtQueryFullAttributesFile (2) */
     case 211: return 20;  /* NtQueryInformationFile (5) */
     case 215: return 12;  /* NtQuerySymbolicLinkObject (3) */
