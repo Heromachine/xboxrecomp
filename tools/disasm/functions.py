@@ -388,7 +388,15 @@ class FunctionDetector:
             if self._starts_on_filler(target):
                 continue
             if not self.engine.probes_as_returning_body(target):
-                continue
+                # A ret further in counts when a function boundary stands in
+                # front -- padding, or a ret/jmp ending there. Breakdown's
+                # 0x00034570, an update callback after int3 padding, reaches
+                # its first ret at instruction 72. Without the boundary this
+                # window found garbage in XMV's decoder tables.
+                if not (self._follows_terminator(target)
+                        and self.engine.probes_as_returning_body(
+                            target, max_insns=256)):
+                    continue
             if target not in self.engine.instructions:
                 if not self.engine.decode_at(target):
                     continue
@@ -481,7 +489,17 @@ class FunctionDetector:
                     continue
                 if not self.engine.probes_as_function_body(target,
                                                            max_insns=64):
-                    continue
+                    # A body that runs longer before its first ret or jmp is
+                    # still taken when a function boundary stands in front of
+                    # it -- padding, or a ret/jmp ending right there. Without
+                    # that, 64 instructions was the whole test, and it lost
+                    # Breakdown's 0x000316A0 (after int3 padding, named only by
+                    # a .data table, first ret at instruction 368), which the
+                    # first level calls.
+                    if not (self._follows_terminator(target)
+                            and self.engine.probes_as_function_body(
+                                target, max_insns=1024)):
+                        continue
                 i = bisect.bisect_right(starts, target)
                 sec = self.image.get_section_at_va(target)
                 end = starts[i] if i < len(starts) else section_end.get(

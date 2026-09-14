@@ -86,6 +86,23 @@ DSP = 0x00030000      # marked executable, but no function was ever found in it
 #        10055  jmp 0x10040        <- tail jump, no ret of its own
 #   F3 0x10060  xor eax, eax
 #        10062  ret
+#   S  0x10070  mov eax, [esp+4]
+#        10074  jmp [eax*4 + 0x10090]  <- a switch through a table in .text
+#        1007B  ret
+#   S2 0x10080  mov eax, [esp+4]
+#        10084  jmp [eax*4 + 0x20000]  <- a "table" in .rdata: not a switch
+#        1008B  ret
+#   F5 0x10090  mov eax, 0x10070       -> S
+#        10095  mov ecx, 0x10080       -> S2
+#        1009A  ret
+#   T  0x100A0  jne 0x100A7            <- a later case, past the jump out
+#        100A2  jmp 0x10000            <- a tail call on one path only
+#        100A7  ret
+#   L  0x100B0  inc eax x70, ret       <- 71 instructions, after int3 padding
+#   L2 0x10110  inc eax x70, ret       <- the same, after an inc eax
+#   F6 0x10158  mov eax, 0x100B0       -> L
+#        1015D  mov ecx, 0x10110       -> L2
+#        10162  ret
 F1 = (b"\x56" + b"\xb8" + _u32(0x10030) + b"\xb9" + _u32(0x10003)
       + b"\xba" + _u32(0x20000) + b"\xbb" + _u32(0x10050)
       + b"\xbe" + _u32(0x1002C) + b"\xbf" + _u32(0x30000)
@@ -94,14 +111,24 @@ G = b"\x33\xc0\xeb\x01\x40\xc3"
 F2 = b"\x8b\xc1\xc3" + b"\x00\x00\xc3"
 H = b"\xb9" + _u32(0x20000) + b"\xe9" + _u32((0x10040 - 0x1005A) & 0xFFFFFFFF)
 F3 = b"\x33\xc0\xc3"
+S = b"\x8b\x44\x24\x04" + b"\xff\x24\x85" + _u32(0x10090) + b"\xc3"
+S2 = b"\x8b\x44\x24\x04" + b"\xff\x24\x85" + _u32(0x20000) + b"\xc3"
+F5 = b"\xb8" + _u32(0x10070) + b"\xb9" + _u32(0x10080) + b"\xc3"
+T = b"\x75\x05" + b"\xe9" + _u32((0x10000 - 0x100A7) & 0xFFFFFFFF) + b"\xc3"
+LONG = b"\x40" * 70 + b"\xc3"
+F6 = b"\xb8" + _u32(0x100B0) + b"\xb9" + _u32(0x10110) + b"\xc3"
 
-FUNCTIONS = ((0x10000, 0x1002A), (0x10040, 0x10043), (0x10060, 0x10063))
+FUNCTIONS = ((0x10000, 0x1002A), (0x10040, 0x10043), (0x10060, 0x10063),
+             (0x10090, 0x1009B), (0x10158, 0x10163))
 
 
 def _layout():
-    text = bytearray(b"\xcc" * 0x70)
+    text = bytearray(b"\xcc" * 0x170)
     for va, code in ((0x10000, F1), (0x10030, G), (0x10040, F2),
-                     (0x10050, H), (0x10060, F3)):
+                     (0x10050, H), (0x10060, F3), (0x10070, S),
+                     (0x10080, S2), (0x10090, F5), (0x100A0, T),
+                     (0x100B0, LONG), (0x1010F, b"\x40" + LONG),
+                     (0x10158, F6)):
         text[va - TEXT:va - TEXT + len(code)] = code
     rdata = (b"\x33\xc0\xc3\x00"   # disassembles to a returning body
              + _u32(0x10001)       # inside F1, straight after `push esi`
@@ -110,7 +137,9 @@ def _layout():
              + _u32(0x1002C)       # int3 padding in the gap before G
              + _u32(0x10040)       # F2's own start
              + _u32(0x10027)       # inside F1, the block after its ret
-             + _u32(0x30000))      # DSP
+             + _u32(0x30000)       # DSP
+             + _u32(0x100B0)       # L, long, after padding
+             + _u32(0x10110))      # L2, long, after an ordinary instruction
     return (_Section(".text", TEXT, bytes(text)),
             _Section(".rdata", RDATA, rdata),
             _Section("DSP", DSP, b"\x33\xc0\xc3"))
@@ -152,10 +181,12 @@ def test_immediate_refusals():
         0x1002C: "int3 padding, which walks into G's ret",
         0x10043: "zero fill",
         0x30000: "a section no stronger pass found code in",
+        0x10080: "an indexed jump through a table in another section",
+        0x10110: "a ret past 64 instructions with no boundary in front",
     }
     for addr, why in refused.items():
         assert addr not in det._candidates, f"{addr:#x}: {why}"
-    assert set(det._candidates) == {0x10030}, det._candidates
+    assert set(det._candidates) == {0x10030, 0x10070, 0x100B0}, det._candidates
 
 
 def test_returning_probe_follows_forward_jumps_only():
@@ -164,6 +195,20 @@ def test_returning_probe_follows_forward_jumps_only():
         "a forward jmp over one instruction must not end the probe"
     assert not det.engine.probes_as_returning_body(0x10050), \
         "a backward jmp is tail-call shaped and must end the probe"
+
+
+def test_returning_probe_continues_past_a_jump_out_an_earlier_branch_skips():
+    det, _ = _detector()
+    assert det.engine.probes_as_returning_body(0x100A0), \
+        "jne past a tail call leaves the ret after it reachable"
+
+
+def test_returning_probe_steps_over_a_switch():
+    det, _ = _detector()
+    assert det.engine.probes_as_returning_body(0x10070), \
+        "jmp [reg*4 + table in the same section] is a switch, not an exit"
+    assert not det.engine.probes_as_returning_body(0x10080), \
+        "a table in another section is not a switch this probe trusts"
 
 
 def test_data_pointer_to_a_block_after_a_ret_aliases_its_body():
@@ -188,10 +233,18 @@ def test_data_pointer_refusals():
         0x10040: "already a function start",
         0x30000: "a section no stronger pass found code in",
         0x10030: "an immediate in code, not a data-section value",
+        0x10110: "a long body with no function boundary in front of it",
     }
     for addr, why in refused.items():
         assert addr not in det._alias_entries, f"{addr:#x}: {why}"
-    assert set(det._alias_entries) == {0x10027, 0x10050}, det._alias_entries
+    assert set(det._alias_entries) == {0x10027, 0x10050, 0x100B0}, \
+        det._alias_entries
+
+
+def test_data_pointer_to_a_long_body_after_padding_is_taken():
+    det, sections = _detector()
+    det._pass_data_ptr_targets(sections)
+    assert 0x100B0 in det._alias_entries, det._alias_entries
 
 
 if __name__ == "__main__":

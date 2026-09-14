@@ -295,13 +295,29 @@ class DisasmEngine:
 
         An unconditional jump forward that stays inside the probed window is
         ordinary control flow -- MSVC emits it constantly to skip an
-        else-branch -- so the probe continues past it. Only a backward jump, or
-        one that leaves the window, ends it. Upstream measured the cost of
-        stopping at every jmp on Half-Life 2: CreateInterface's list walk at
-        0x00427F80 is a clean 90-byte function with one jmp over four
+        else-branch -- so the probe continues past it. Upstream measured the
+        cost of stopping at every jmp on Half-Life 2: CreateInterface's list
+        walk at 0x00427F80 is a clean 90-byte function with one jmp over four
         instructions, and rejecting it stopped interface lookup.
 
-        Ported from xboxrecomp work/v0.7.0-non-local (d89b8af, f2d3940).
+        A backward jump, or one that leaves the window, ends the probe unless
+        an earlier branch inside the window lands past it. Then the jump only
+        ends one path: a case that tail-calls, or a loop's back edge, with the
+        rest of the function still ahead. Breakdown's 0x00034570 tail-calls
+        0x0018C310 from one case and reaches its ret from another.
+
+        A compiled switch -- `jmp [reg*4 + table]` with its table in the same
+        section -- is ordinary control flow too: its cases are the rest of the
+        function. The probe used to end at any indirect jump. That rejected the
+        commonest callback there is, a state machine doing `switch (this->state)`
+        up front. Breakdown lost three of them in a row: 0x0011C4C0 on reaching
+        the main menu, 0x00115650 on NEW GAME (the screen went black), and
+        0x0002CEB0 while the opening credits played (black again after them).
+        A jump through a table in another section, or through a register,
+        still ends the probe.
+
+        Ported from xboxrecomp work/v0.7.0-non-local (d89b8af, f2d3940); the
+        switch rule is this fork's.
         """
         section = self.image.get_section_at_va(addr)
         if section is None or not section.executable:
@@ -316,20 +332,44 @@ class DisasmEngine:
 
         limit = addr + len(data)
         count = 0
+        # Furthest address an earlier branch inside the window jumps to. Code
+        # before it is still reachable after a jump that leaves.
+        reach = addr
         for decoded in self._cs.disasm(data, addr):
             count += 1
             mnemonic = decoded.mnemonic.lower()
             if mnemonic in config.RET_MNEMONICS:
                 return True
-            if mnemonic in config.JMP_MNEMONICS:
+            branch = (mnemonic in config.JMP_MNEMONICS
+                      or mnemonic in config.COND_JMP_MNEMONICS)
+            if branch:
                 try:
                     ops = decoded.operands
                 except Exception:
                     return False
-                if not ops or ops[0].type != CS_OP_IMM:
+                if not ops:
                     return False
-                target = ops[0].imm & 0xFFFFFFFF
-                if not (decoded.address < target < limit):
+                if ops[0].type == CS_OP_IMM:
+                    target = ops[0].imm & 0xFFFFFFFF
+                    if decoded.address < target < limit and target > reach:
+                        reach = target
+            if mnemonic in config.JMP_MNEMONICS:
+                leaves = True
+                if ops[0].type == CS_OP_MEM:
+                    mem = ops[0].mem
+                    table = mem.disp & 0xFFFFFFFF
+                    if (mem.index != 0 and mem.scale == 4 and mem.base == 0
+                            and section.virtual_addr <= table
+                            < section.virtual_addr + section.virtual_size):
+                        leaves = False  # a switch: its cases follow
+                elif ops[0].type == CS_OP_IMM:
+                    target = ops[0].imm & 0xFFFFFFFF
+                    leaves = not (decoded.address < target < limit)
+                # A jump out -- a tail call, or a loop's backward jump -- ends
+                # this path, not the function, when an earlier branch lands
+                # past it. Breakdown's 0x00034570 tail-calls 0x0018C310 from one
+                # case and reaches its ret from another.
+                if leaves and reach <= decoded.address + decoded.size - 1:
                     return False
             if count >= max_insns:
                 return False
