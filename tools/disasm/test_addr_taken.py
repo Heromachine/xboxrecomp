@@ -103,6 +103,12 @@ DSP = 0x00030000      # marked executable, but no function was ever found in it
 #   F6 0x10158  mov eax, 0x100B0       -> L
 #        1015D  mov ecx, 0x10110       -> L2
 #        10162  ret
+#   J  0x101A0  mov eax, [esp+4]
+#        101A4  jmp [eax*4 + 0x101C0]  <- a switch whose table follows its arms
+#        101AB  ret                    <- arm 0
+#        101B8  xor eax, eax; ret      <- arm 1
+#        101C0  dd 101ABh, 101B8h      <- `00 b8 ...` sweeps out of phase
+#   K  0x101C8  mov eax, [esp+4]; ret  <- starts on the byte after the table
 F1 = (b"\x56" + b"\xb8" + _u32(0x10030) + b"\xb9" + _u32(0x10003)
       + b"\xba" + _u32(0x20000) + b"\xbb" + _u32(0x10050)
       + b"\xbe" + _u32(0x1002C) + b"\xbf" + _u32(0x30000)
@@ -117,18 +123,22 @@ F5 = b"\xb8" + _u32(0x10070) + b"\xb9" + _u32(0x10080) + b"\xc3"
 T = b"\x75\x05" + b"\xe9" + _u32((0x10000 - 0x100A7) & 0xFFFFFFFF) + b"\xc3"
 LONG = b"\x40" * 70 + b"\xc3"
 F6 = b"\xb8" + _u32(0x100B0) + b"\xb9" + _u32(0x10110) + b"\xc3"
+J = (b"\x8b\x44\x24\x04" + b"\xff\x24\x85" + _u32(0x101C0) + b"\xc3"
+     + b"\xcc" * 12 + b"\x33\xc0\xc3" + b"\xcc" * 5
+     + _u32(0x101AB) + _u32(0x101B8))
+K = b"\x8b\x44\x24\x04\xc3"
 
 FUNCTIONS = ((0x10000, 0x1002A), (0x10040, 0x10043), (0x10060, 0x10063),
-             (0x10090, 0x1009B), (0x10158, 0x10163))
+             (0x10090, 0x1009B), (0x10158, 0x10163), (0x101A0, 0x101C0))
 
 
 def _layout():
-    text = bytearray(b"\xcc" * 0x170)
+    text = bytearray(b"\xcc" * 0x1D0)
     for va, code in ((0x10000, F1), (0x10030, G), (0x10040, F2),
                      (0x10050, H), (0x10060, F3), (0x10070, S),
                      (0x10080, S2), (0x10090, F5), (0x100A0, T),
                      (0x100B0, LONG), (0x1010F, b"\x40" + LONG),
-                     (0x10158, F6)):
+                     (0x10158, F6), (0x101A0, J), (0x101C8, K)):
         text[va - TEXT:va - TEXT + len(code)] = code
     rdata = (b"\x33\xc0\xc3\x00"   # disassembles to a returning body
              + _u32(0x10001)       # inside F1, straight after `push esi`
@@ -139,7 +149,8 @@ def _layout():
              + _u32(0x10027)       # inside F1, the block after its ret
              + _u32(0x30000)       # DSP
              + _u32(0x100B0)       # L, long, after padding
-             + _u32(0x10110))      # L2, long, after an ordinary instruction
+             + _u32(0x10110)       # L2, long, after an ordinary instruction
+             + _u32(0x101C8))      # K, straight after J's switch table
     return (_Section(".text", TEXT, bytes(text)),
             _Section(".rdata", RDATA, rdata),
             _Section("DSP", DSP, b"\x33\xc0\xc3"))
@@ -237,7 +248,7 @@ def test_data_pointer_refusals():
     }
     for addr, why in refused.items():
         assert addr not in det._alias_entries, f"{addr:#x}: {why}"
-    assert set(det._alias_entries) == {0x10027, 0x10050, 0x100B0}, \
+    assert set(det._alias_entries) == {0x10027, 0x10050, 0x100B0, 0x101C8}, \
         det._alias_entries
 
 
@@ -245,6 +256,17 @@ def test_data_pointer_to_a_long_body_after_padding_is_taken():
     det, sections = _detector()
     det._pass_data_ptr_targets(sections)
     assert 0x100B0 in det._alias_entries, det._alias_entries
+
+
+def test_data_pointer_after_a_switch_table_realigns_the_sweep():
+    det, sections = _detector()
+    assert 0x101C8 not in det.engine.instructions, \
+        "the table must leave the sweep out of phase for this to test anything"
+    assert det._follows_jump_table(0x101C8)
+    assert not det._follows_jump_table(0x101C4), "mid-table"
+    det._pass_data_ptr_targets(sections)
+    assert det._alias_entries.get(0x101C8) == sections[0].virtual_addr \
+        + sections[0].virtual_size, det._alias_entries
 
 
 if __name__ == "__main__":

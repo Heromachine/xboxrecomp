@@ -474,6 +474,14 @@ class FunctionDetector:
         for target in sorted(targets):
             if target in self.functions or target in self._alias_entries:
                 continue
+            if (target not in self.engine.instructions
+                    and self._follows_jump_table(target)):
+                # MSVC parks a switch table after its function, and the next
+                # function starts on the byte after it. The sweep leaves a
+                # table out of phase -- Breakdown's `bb 2d 0f 00` decodes as
+                # `mov ebx, imm32` and swallows the first byte of the level
+                # callback at 0x000F2E30 -- so realign there first.
+                self.engine.decode_at(target)
             j = bisect.bisect_right(starts, target) - 1
             if j >= 0 and bounds[j][0] < target < bounds[j][1]:
                 if target not in self.engine.instructions:
@@ -556,6 +564,49 @@ class FunctionDetector:
                 return True
             if insn.mnemonic.lower() in self._FILLER_MNEMONICS:
                 return True
+        return self._follows_jump_table(addr)
+
+    def _follows_jump_table(self, addr: int) -> bool:
+        """True if a compiled switch table ends exactly at `addr`.
+
+        The table is a run of dwords, each an arm between its own indexed
+        `jmp [reg*4 + table]` and the table itself, starting at an address
+        that jmp names. It ends at `addr` only if the dword there is not one
+        more such arm. Nothing falls into the byte after a table.
+        """
+        section = self.image.get_section_at_va(addr)
+        data = self.image.get_section_data(section) if section else None
+        if not data:
+            return False
+
+        def dword(va):
+            off = va - section.virtual_addr
+            if off < 0 or off + 4 > len(data):
+                return None
+            return int.from_bytes(data[off:off + 4], "little")
+
+        bases = getattr(self, "_jump_table_bases", None)
+        if bases is None:
+            bases = self._jump_table_bases = {
+                insn.jump_table_base: insn.address
+                for insn in self.engine.instructions.values()
+                if insn.is_jump and not insn.is_cond_jump
+                and insn.jump_table_base is not None}
+
+        entries = []
+        for n in range(1, self._JUMP_TABLE_MAX_ENTRIES + 1):
+            base = addr - 4 * n
+            value = dword(base)
+            if value is None or not value < base:
+                return False
+            entries.append(value)
+            jmp = bases.get(base)
+            if jmp is None:
+                continue
+            if not all(jmp < arm < base for arm in entries):
+                return False
+            after = dword(addr)
+            return after is None or not jmp < after < base
         return False
 
     def _pass_tail_jump_targets(self, sections: List[SectionInfo]) -> bool:
