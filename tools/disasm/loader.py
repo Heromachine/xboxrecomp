@@ -22,6 +22,9 @@ DATA_SECTION_NAMES = frozenset({
     ".data", ".data1", ".rdata", ".idata", ".edata", ".reloc", ".tls",
 })
 
+# The longest legal x86 instruction.
+MAX_INSN_LEN = 15
+
 
 @dataclass
 class SectionInfo:
@@ -118,8 +121,20 @@ class BinaryImage:
         return struct.unpack_from('<I', data)[0]
 
     def get_section_data(self, section: SectionInfo) -> bytes:
-        """Get the raw bytes for a section."""
-        return self.raw_data[section.raw_addr:section.raw_addr + section.raw_size]
+        """Get the bytes for a section, plus the start of its zero-filled tail.
+
+        The Xbox loader maps virtual_size bytes and zero-fills past the file
+        data, and linkers trim trailing zeros off that data. When the last
+        instruction ends in a 00 byte, the trim cuts it in half: Breakdown's
+        D3DX section stops at `c2 10` of the `ret 10h` closing
+        D3DXMatrixLookAtRH, so the sweep lost the ret, the lifter ended the
+        function at `leave`, and every call left esp 20 bytes low -- a /GS
+        abort on level load. One maximum-length instruction of the tail is
+        enough to finish it; the whole tail would sweep as `add [eax], al`.
+        """
+        data = self.raw_data[section.raw_addr:section.raw_addr + section.raw_size]
+        tail = min(MAX_INSN_LEN, section.virtual_size - len(data))
+        return data + b"\x00" * tail if tail > 0 else data
 
     def get_kernel_import_at_thunk(self, thunk_addr: int) -> Optional[KernelImport]:
         """Look up a kernel import by its thunk address."""

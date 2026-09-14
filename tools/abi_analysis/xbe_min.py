@@ -110,21 +110,22 @@ class XbeFile:
 
     def read_bytes_at_va(self, va, size, name_hint=None):
         """
-        Read `size` raw bytes starting at virtual address `va`. Returns None
-        if the address doesn't fall in any known section, or if the read
-        would run past the section's raw (on-disk) data - which happens for
-        addresses in the tail of a section that's zero-padded in memory but
-        not backed by file bytes (bss-like tail).
+        Read `size` bytes starting at virtual address `va`. Returns None if
+        the address doesn't fall in any known section or starts past the
+        section's raw (on-disk) data. A read that runs from file bytes into
+        the virtual-only tail gets zeros there, as the loader maps it, up to
+        virtual_size: a function whose closing `ret 10h` lost its 00 byte to
+        the linker's trim must still read as ending in that ret.
         """
         section = self.find_section(va, name_hint)
         if section is None:
             return None
         offset_in_section = va - section.virtual_address
-        if offset_in_section + size > section.raw_size:
-            # Falls into the virtual-only (zero-filled) tail of the section.
-            available = max(0, section.raw_size - offset_in_section)
-            if available <= 0:
-                return None
-            size = available
+        available = section.raw_size - offset_in_section
+        if available <= 0:
+            return None
+        size = min(size, max(section.virtual_size, section.raw_size)
+                   - offset_in_section)
         file_off = section.raw_address + offset_in_section
-        return self.data[file_off:file_off + size]
+        raw = self.data[file_off:file_off + min(size, available)]
+        return raw + b"\x00" * (size - len(raw))
