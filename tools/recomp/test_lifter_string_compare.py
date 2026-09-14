@@ -14,10 +14,10 @@ class StringCompareLifterTest(unittest.TestCase):
 
         self.assertIn("while (ecx != 0)", generated)
         self.assertIn("_flags = (LO8(eax) == MEM8(edi));", generated)
-        self.assertIn("edi++; ecx--;", generated)
+        self.assertIn("edi += RECOMP_DF_STEP(1); ecx--;", generated)
         self.assertIn("if (_flags) break;", generated)
         self.assertLess(
-            generated.index("edi++; ecx--;"),
+            generated.index("edi += RECOMP_DF_STEP(1); ecx--;"),
             generated.index("if (_flags) break;"),
         )
 
@@ -40,7 +40,7 @@ class StringCompareLifterTest(unittest.TestCase):
         generated = "\n".join(lifted)
 
         self.assertIn("_flags = (MEM8(esi) == MEM8(edi));", generated)
-        self.assertIn("esi++; edi++; ecx--;", generated)
+        self.assertIn("esi += RECOMP_DF_STEP(1); edi += RECOMP_DF_STEP(1); ecx--;", generated)
         self.assertIn("if (!_flags) break;", generated)
         self.assertIn("if ((_flags != 0)) goto loc_00000010;", generated)
 

@@ -429,6 +429,7 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if _sf_width is None and len(flag_ops) > 1:
         _sf_width = _operand_width(flag_ops[1])
     _sf_cast = {1: "(int8_t)", 2: "(int16_t)"}.get(_sf_width, "(int32_t)")
+    _sf_value = f"{_sf_cast}({lhs})"
 
     # ── cmp: flags from (a - b), operands unchanged ──
     if flag_setter == "cmp":
@@ -474,9 +475,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_value} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_value} >= 0)", desc
         # Ordered: reconstruct original a = result + b
         if cmp_macro and rhs:
             return f"{cmp_macro}((uint32_t){lhs} + (uint32_t){rhs}, (uint32_t){rhs})", desc
@@ -501,9 +502,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_value} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_value} >= 0)", desc
         if jcc in ("jb", "jnae", "jc"):
             return f"({lhs} < (uint32_t){rhs})", desc
         if jcc in ("jae", "jnb", "jnc"):
@@ -525,9 +526,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_value} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_value} >= 0)", desc
         return None
 
     # ── and/or/xor: result-based, CF=0, OF=0 ──
@@ -537,13 +538,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc in ("js", "jl"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_value} < 0)", desc
         if jcc in ("jns", "jge"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_value} >= 0)", desc
         if jcc == "jle":
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({_sf_value} <= 0)", desc
         if jcc == "jg":
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({_sf_value} > 0)", desc
         if jcc in ("jb", "jnae", "jbe", "jna"):
             return "0", desc  # CF=0 after and/or/xor
         if jcc in ("jae", "jnb", "ja", "jnbe"):
@@ -557,9 +558,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_value} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_value} >= 0)", desc
         if jcc in ("jl", "jle", "jg", "jge"):
             cast = "(int32_t)" + lhs
             op = {"jl": "<", "jle": "<=", "jg": ">", "jge": ">="}[jcc]
@@ -578,9 +579,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jae", "jnb", "jnc"):
             return f"({lhs} == 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_value} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_value} >= 0)", desc
         if jcc in ("jg", "jnle"):
             return f"((int32_t){lhs} > 0)", desc
         if jcc in ("jge", "jnl"):
@@ -598,9 +599,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_value} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_value} >= 0)", desc
         return None
 
     # ── shld/shrd: double-precision shift, result-based ──
@@ -610,9 +611,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_value} < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_value} >= 0)", desc
         return None
 
     # ── rol/ror/rcl/rcr: rotation, only CF/OF affected ──
@@ -1016,8 +1017,10 @@ class Lifter:
             return ["__debugbreak(); /* int3 */"]
         if m in ("leave",):
             return ["esp = ebp;", "POP32(esp, ebp); /* leave */"]
-        if m in ("cld", "std"):
-            return [f"/* {m} - direction flag */"]
+        if m == "cld":
+            return ["g_df = 0; /* cld */"]
+        if m == "std":
+            return ["g_df = 1; /* std */"]
         if m == "lahf":
             return ["/* lahf - load AH from flags (used in FPU compare idiom) */"]
         if m == "sahf":
@@ -1844,35 +1847,45 @@ class Lifter:
     # ── String operations ──
 
     def _lift_rep_string(self, insn, m):
-        if "movsb" in m:
-            return ["memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx);",
-                    "esi += ecx; edi += ecx; ecx = 0; /* rep movsb */"]
-        if "movsd" in m:
-            return ["memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx * 4);",
-                    "esi += ecx * 4; edi += ecx * 4; ecx = 0; /* rep movsd */"]
-        if "movsw" in m:
-            return ["memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), ecx * 2);",
-                    "esi += ecx * 2; edi += ecx * 2; ecx = 0; /* rep movsw */"]
+        # Every rep form honours the direction flag. With g_df set the x86
+        # steps esi/edi DOWN after each element, so a backward copy starts at
+        # the last element and must be done element by element from the top
+        # -- memcpy from the end pointers writes past the destination.
+        for op, size, mem in (("movsb", 1, "MEM8"), ("movsw", 2, "MEM16"),
+                              ("movsd", 4, "MEM32")):
+            if op in m:
+                n = "ecx" if size == 1 else f"ecx * {size}"
+                return [
+                    "if (g_df) {",
+                    f"    uint32_t _i; for (_i = 0; _i < ecx; _i++) "
+                    f"{mem}(edi - _i*{size}) = {mem}(esi - _i*{size});",
+                    f"    esi -= {n}; edi -= {n};",
+                    "} else {",
+                    f"    memcpy((void*)XBOX_PTR(edi), (void*)XBOX_PTR(esi), {n});",
+                    f"    esi += {n}; edi += {n};",
+                    f"}} ecx = 0; /* rep {op} */",
+                ]
         if "stosb" in m:
-            return ["memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx);",
-                    "edi += ecx; ecx = 0; /* rep stosb */"]
-        if "stosd" in m:
             return [
-                "{ uint32_t _i; for (_i = 0; _i < ecx; _i++) MEM32(edi + _i*4) = eax; }",
-                "edi += ecx * 4; ecx = 0; /* rep stosd */"
+                "if (g_df) { memset((void*)XBOX_PTR(edi - ecx + 1), (uint8_t)eax, ecx); edi -= ecx; }",
+                "else { memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx); edi += ecx; }",
+                "ecx = 0; /* rep stosb */",
             ]
-        if "stosw" in m:
-            return [
-                "{ uint32_t _i; for (_i = 0; _i < ecx; _i++) MEM16(edi + _i*2) = LO16(eax); }",
-                "edi += ecx * 2; ecx = 0; /* rep stosw */"
-            ]
+        for op, size, mem, val in (("stosw", 2, "MEM16", "LO16(eax)"),
+                                   ("stosd", 4, "MEM32", "eax")):
+            if op in m:
+                return [
+                    f"{{ uint32_t _i, _d = RECOMP_DF_STEP({size}); "
+                    f"for (_i = 0; _i < ecx; _i++) {{ {mem}(edi) = {val}; edi += _d; }} }}",
+                    f"ecx = 0; /* rep {op} */",
+                ]
         if "cmpsb" in m:
             continue_on_equal = "repne" not in m and "repnz" not in m
             stop_condition = "!_flags" if continue_on_equal else "_flags"
             return [
                 "while (ecx != 0) {",
                 "    _flags = (MEM8(esi) == MEM8(edi));",
-                "    esi++; edi++; ecx--;",
+                "    esi += RECOMP_DF_STEP(1); edi += RECOMP_DF_STEP(1); ecx--;",
                 f"    if ({stop_condition}) break;",
                 f"}} /* {m} */",
             ]
@@ -1882,7 +1895,7 @@ class Lifter:
             return [
                 "while (ecx != 0) {",
                 "    _flags = (LO8(eax) == MEM8(edi));",
-                "    edi++; ecx--;",
+                "    edi += RECOMP_DF_STEP(1); ecx--;",
                 f"    if ({stop_condition}) break;",
                 f"}} /* {m} */",
             ]
@@ -1894,23 +1907,23 @@ class Lifter:
 
     def _lift_string_op(self, insn, m):
         if m == "movsb":
-            return ["MEM8(edi) = MEM8(esi); esi++; edi++; /* movsb */"]
+            return ["MEM8(edi) = MEM8(esi); esi += RECOMP_DF_STEP(1); edi += RECOMP_DF_STEP(1); /* movsb */"]
         if m == "movsd":
-            return ["MEM32(edi) = MEM32(esi); esi += 4; edi += 4; /* movsd */"]
+            return ["MEM32(edi) = MEM32(esi); esi += RECOMP_DF_STEP(4); edi += RECOMP_DF_STEP(4); /* movsd */"]
         if m == "stosb":
-            return ["MEM8(edi) = LO8(eax); edi++; /* stosb */"]
+            return ["MEM8(edi) = LO8(eax); edi += RECOMP_DF_STEP(1); /* stosb */"]
         if m == "stosd":
-            return ["MEM32(edi) = eax; edi += 4; /* stosd */"]
+            return ["MEM32(edi) = eax; edi += RECOMP_DF_STEP(4); /* stosd */"]
         if m == "lodsb":
-            return ["SET_LO8(eax, MEM8(esi)); esi++; /* lodsb */"]
+            return ["SET_LO8(eax, MEM8(esi)); esi += RECOMP_DF_STEP(1); /* lodsb */"]
         if m == "lodsd":
-            return ["eax = MEM32(esi); esi += 4; /* lodsd */"]
+            return ["eax = MEM32(esi); esi += RECOMP_DF_STEP(4); /* lodsd */"]
         if m == "movsw":
-            return ["MEM16(edi) = MEM16(esi); esi += 2; edi += 2; /* movsw */"]
+            return ["MEM16(edi) = MEM16(esi); esi += RECOMP_DF_STEP(2); edi += RECOMP_DF_STEP(2); /* movsw */"]
         if m == "stosw":
-            return ["MEM16(edi) = LO16(eax); edi += 2; /* stosw */"]
+            return ["MEM16(edi) = LO16(eax); edi += RECOMP_DF_STEP(2); /* stosw */"]
         if m == "lodsw":
-            return ["SET_LO16(eax, MEM16(esi)); esi += 2; /* lodsw */"]
+            return ["SET_LO16(eax, MEM16(esi)); esi += RECOMP_DF_STEP(2); /* lodsw */"]
         return [f"/* {m} */"]
 
     # ── FPU (x87) ──

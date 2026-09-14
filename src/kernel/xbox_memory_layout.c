@@ -335,6 +335,8 @@ RECOMP_TLS int g_fp_top = 0;
  * rounds to nearest, which is what the CRT expects before _control87. */
 RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
 RECOMP_TLS int g_fp_cmp = 0;
+/* Direction flag (std/cld); see recomp_types.h. */
+RECOMP_TLS int g_df = 0;
 
 /* SSE. 128 bits of architectural state, per-thread like the rest. */
 RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;

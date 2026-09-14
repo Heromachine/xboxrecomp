@@ -186,6 +186,16 @@ extern RECOMP_TLS int g_fp_cmp;
  * The unordered case is not a curiosity: `fucompp` of a value with itself
  * followed by `test ah, 0x44; jp` is how this era's CRT asks "is this a NaN",
  * and collapsing it to "equal" answers no every time. */
+/* Direction flag. `std; rep movsd; cld` is how the CRT's memmove copies an
+ * overlapping block whose destination is above its source: backward, from the
+ * last element down. Dropping std copied forward from the END pointers --
+ * ecx*4 bytes past the destination, pointers moving the wrong way -- and on
+ * Breakdown that smeared text over live objects the first time a menu shuffled
+ * a list. Thread-local like the other flags, and clear at thread start as the
+ * ABI requires. */
+extern RECOMP_TLS int g_df;
+#define RECOMP_DF_STEP(n)     (g_df ? (uint32_t)0 - (uint32_t)(n) : (uint32_t)(n))
+
 #define RECOMP_FCMP(a, b)     (((a) != (a) || (b) != (b)) ? 2 : (a) < (b) ? -1 : (a) > (b) ? 1 : 0)
 
 /* ================================================================
