@@ -56,6 +56,10 @@ typedef struct {
     uint32_t vsh_rebuilds;   /* d3d8_vsh_create_shader() calls -- should be
                               * far smaller than vsh_draws; see the comment
                               * above g_pg.vsh.program_dirty */
+    uint32_t array_draws;    /* draws sourced from vertex-data arrays
+                              * (ARRAY_ELEMENT16/32, DRAW_ARRAYS) */
+    uint32_t array_gather_failures; /* array draws dropped because a vertex
+                                     * span did not resolve to guest RAM */
 } PgraphD3D11Stats;
 
 void pgraph_d3d11_get_stats(PgraphD3D11Stats *out);

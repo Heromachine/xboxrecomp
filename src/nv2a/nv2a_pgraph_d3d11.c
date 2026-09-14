@@ -30,6 +30,7 @@
                           * through the exact same base/size the push
                           * buffer puller uses, not a second copy of it. */
 #include "nv2a_texconv.h"  /* S3TC and palettised texture decode */
+#include "nv2a_vtxarray.h" /* ARRAY_ELEMENT / DRAW_ARRAYS vertex gather */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -146,12 +147,20 @@ static int nv2a_draw_mode_to_d3d(uint32_t mode) {
 }
 
 /* NV2A blend factors → D3D blend */
+/* NV097_SET_BLEND_FUNC_SFACTOR/DFACTOR take OpenGL blend enums. */
 static uint32_t nv2a_blend_to_d3d(uint32_t nv) {
     switch (nv) {
         case 0x0000: return D3DBLEND_ZERO;
         case 0x0001: return D3DBLEND_ONE;
+        case 0x0300: return D3DBLEND_SRCCOLOR;
+        case 0x0301: return D3DBLEND_INVSRCCOLOR;
         case 0x0302: return D3DBLEND_SRCALPHA;
         case 0x0303: return D3DBLEND_INVSRCALPHA;
+        case 0x0304: return D3DBLEND_DESTALPHA;
+        case 0x0305: return D3DBLEND_INVDESTALPHA;
+        case 0x0306: return D3DBLEND_DESTCOLOR;
+        case 0x0307: return D3DBLEND_INVDESTCOLOR;
+        case 0x0308: return D3DBLEND_SRCALPHASAT;
         default:     return D3DBLEND_ONE;
     }
 }
@@ -173,16 +182,6 @@ typedef struct {
     float u, v;
 } OutputVertex;
 
-/* Per-slot state mirrored from NV097_SET_VERTEX_DATA_ARRAY_FORMAT, one
- * entry per of the 16 NV2A vertex attribute slots (NV2A_VERTEX_ATTR_* in
- * nv2a_regs.h). count == 0 means the title has not enabled this slot, so
- * it contributes nothing to the INLINE_ARRAY per-vertex byte layout. */
-typedef struct {
-    uint32_t format;  /* NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_* */
-    uint32_t count;   /* component count (the FORMAT register's SIZE field) */
-    uint32_t size;     /* bytes per component, derived from format */
-} VertexAttrFmt;
-
 static struct {
     /* Draw state */
     int in_draw;           /* Between BEGIN and END */
@@ -194,8 +193,13 @@ static struct {
     uint32_t inline_count; /* Number of dwords accumulated */
 
     /* Real vertex attribute layout, decoded from the title's own
-     * NV097_SET_VERTEX_DATA_ARRAY_FORMAT writes -- see the file header. */
-    VertexAttrFmt vattr[16];
+     * NV097_SET_VERTEX_DATA_ARRAY_FORMAT writes -- see the file header.
+     * count == 0 means the slot is disabled. offset/stride only matter for
+     * array-sourced draws; INLINE_ARRAY packing is tight. */
+    NV2AVtxAttr vattr[16];
+
+    /* ARRAY_ELEMENT16/32 indices and DRAW_ARRAYS runs since BEGIN. */
+    NV2AVtxBatch batch;
 
     /* "Current" diffuse color, for draws where NV2A_VERTEX_ATTR_DIFFUSE is
      * not one of the enabled attributes. Defaults to opaque white.
@@ -392,6 +396,8 @@ void pgraph_d3d11_init(void)
     g_pg.current_diffuse = 0xFFFFFFFF;  /* opaque white; see struct comment */
     g_pg.clear_color = 0xFF000000;
     g_pg.color_mask = 0x01010101;
+    g_pg.blend_sfactor = 0x0001;        /* GL_ONE / GL_ZERO: blending a no-op */
+    g_pg.blend_dfactor = 0x0000;
     g_pg.initialized = 1;
 
     fprintf(stderr, "[PGRAPH-D3D11] Translator initialized\n");
@@ -485,6 +491,12 @@ static void decode_attr_floats(const uint8_t *vbase, const uint32_t byte_offset[
     uint32_t format = g_pg.vattr[slot].format;
     uint32_t size = g_pg.vattr[slot].size ? g_pg.vattr[slot].size : 4;
     const uint8_t *p = vbase + byte_offset[slot];
+    if (format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_CMP) {
+        uint32_t packed;
+        memcpy(&packed, p, 4);
+        nv2a_vtx_decode_cmp(packed, out);
+        return;
+    }
     for (uint32_t c = 0; c < 4; c++) {
         out[c] = (c < count) ? read_component_as_float(format, p + c * size)
                               : (c == 3 ? 1.0f : 0.0f);
@@ -1404,26 +1416,101 @@ static TexCacheEntry *resolve_texture_stage(int stage)
  * Draw Submission
  * ══════════════════════════════════════════════════════════════════════ */
 
+/* Host scratch that grows to the largest draw seen. A level mesh can run to
+ * tens of thousands of vertices, which the former _alloca put on the stack. */
+static void *scratch_grow(void **buf, size_t *cap, size_t need)
+{
+    if (need > *cap) {
+        void *grown = realloc(*buf, need);
+        if (!grown)
+            return NULL;
+        *buf = grown;
+        *cap = need;
+    }
+    return *buf;
+}
+
+static void submit_vertices(const uint8_t *base, uint32_t num_verts,
+                            const uint32_t byte_offset[16], uint32_t stride_bytes);
+
+/* Decode the real per-vertex layout from what the title actually programmed
+ * via SET_VERTEX_DATA_ARRAY_FORMAT -- see the block comment above
+ * compute_vertex_layout(). */
 static void submit_draw(void)
 {
     if (g_pg.inline_count == 0)
         return;
 
-    /* Decode the real per-vertex layout from what the title actually
-     * programmed via SET_VERTEX_DATA_ARRAY_FORMAT -- see the block comment
-     * above compute_vertex_layout(). This replaces a former hardcoded
-     * 5-dword (X,Y,U,V,Color) assumption that only accidentally matched
-     * the simplest draw's dword count and was wrong for everything else. */
     uint32_t byte_offset[16];
     uint32_t stride_bytes = compute_vertex_layout(byte_offset);
     if (stride_bytes == 0)
         return;  /* Title has not enabled any attribute -- nothing to draw */
 
-    uint32_t num_verts = (g_pg.inline_count * 4) / stride_bytes;
+    submit_vertices((const uint8_t *)g_pg.inline_data,
+                    (g_pg.inline_count * 4) / stride_bytes, byte_offset, stride_bytes);
+}
+
+/* Vertex-array memory under the same "whole of RAM, zero base" DMA convention
+ * textures use (tex_guest_span). Both vertex DMA objects resolve the same way
+ * until real DMA-object lookup exists. */
+static const uint8_t *vtx_guest_span(void *ctx, uint32_t dma_select,
+                                     uint32_t addr, size_t len)
+{
+    (void)ctx;
+    (void)dma_select;
+    return tex_guest_span(addr, len);
+}
+
+/* Gather `n` array-sourced vertices into the packed inline layout and draw
+ * them through the same path as INLINE_ARRAY. */
+static void submit_array_elements(const uint32_t *elements, uint32_t n)
+{
+    static void *packed;
+    static size_t packed_cap;
+    uint32_t byte_offset[16];
+    uint32_t stride_bytes = compute_vertex_layout(byte_offset);
+
+    if (n == 0 || stride_bytes == 0)
+        return;
+    if (!scratch_grow(&packed, &packed_cap, (size_t)n * stride_bytes))
+        return;
+    if (nv2a_vtx_gather(g_pg.vattr, elements, n, vtx_guest_span, NULL,
+                        byte_offset, stride_bytes, packed) != 0) {
+        g_pg.stats.array_gather_failures++;
+        return;
+    }
+    g_pg.stats.array_draws++;
+    submit_vertices(packed, n, byte_offset, stride_bytes);
+}
+
+/* Draw DRAW_ARRAYS runs [0, count) as separate primitives -- joining two
+ * strips would bridge them with stray triangles. */
+static void submit_array_runs(uint32_t count)
+{
+    static uint32_t *seq;
+    static size_t seq_cap;
+
+    for (uint32_t r = 0; r < count; r++) {
+        uint32_t start = g_pg.batch.run_start[r];
+        uint32_t len = g_pg.batch.run_count[r];
+        if (!scratch_grow((void **)&seq, &seq_cap, (size_t)len * sizeof(*seq)))
+            return;
+        for (uint32_t i = 0; i < len; i++)
+            seq[i] = start + i;
+        submit_array_elements(seq, len);
+    }
+    memmove(g_pg.batch.run_start, g_pg.batch.run_start + count,
+            (g_pg.batch.run_total - count) * sizeof(g_pg.batch.run_start[0]));
+    memmove(g_pg.batch.run_count, g_pg.batch.run_count + count,
+            (g_pg.batch.run_total - count) * sizeof(g_pg.batch.run_count[0]));
+    g_pg.batch.run_total -= count;
+}
+
+static void submit_vertices(const uint8_t *base, uint32_t num_verts,
+                            const uint32_t byte_offset[16], uint32_t stride_bytes)
+{
     if (num_verts < 3)
         return;
-
-    const uint8_t *base = (const uint8_t *)g_pg.inline_data;
     int actual_prim_type = g_pg.d3d_prim_type;
     uint32_t out_vert_count = num_verts;
 
@@ -1539,7 +1626,12 @@ static void submit_draw(void)
          * Source values still come from the title's real, decoded
          * SET_VERTEX_DATA_ARRAY_FORMAT layout (base/byte_offset/stride_
          * bytes) computed above -- unchanged from the fixed-function path. */
-        vsh_verts = (uint8_t *)_alloca((size_t)out_vert_count * vsh_stride);
+        static void *vsh_buf;
+        static size_t vsh_cap;
+        vsh_verts = (uint8_t *)scratch_grow(&vsh_buf, &vsh_cap,
+                                            (size_t)out_vert_count * vsh_stride);
+        if (!vsh_verts)
+            return;
         #define CONVERT_VSH_VERT(dst_idx, src_idx) \
             convert_vsh_vertex(base + (size_t)(src_idx) * stride_bytes, byte_offset, \
                                 g_pg.vsh.inputs_read, \
@@ -1565,7 +1657,12 @@ static void submit_draw(void)
     } else {
         /* Fixed-function 2D fallback (unchanged from before this task --
          * pre-transformed XYZRHW position, packed diffuse, one texcoord). */
-        out = (OutputVertex *)_alloca(out_vert_count * sizeof(OutputVertex));
+        static void *ff_buf;
+        static size_t ff_cap;
+        out = (OutputVertex *)scratch_grow(&ff_buf, &ff_cap,
+                                           (size_t)out_vert_count * sizeof(OutputVertex));
+        if (!out)
+            return;
 
         /* Helper to convert one inline vertex. Reads whichever attributes the
          * title actually enabled (see compute_vertex_layout()); position and
@@ -1679,9 +1776,12 @@ static void submit_draw(void)
     dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, FALSE);
     dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
     dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
-    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, TRUE);
-    dev->lpVtbl->SetRenderState(dev, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-    dev->lpVtbl->SetRenderState(dev, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    /* The title's own blend state. Forcing SRCALPHA/INVSRCALPHA on for every
+     * draw made opaque world geometry, whose vertex program leaves alpha at
+     * 0, fully transparent while alpha-carrying HUD quads still showed. */
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, g_pg.blend_enable ? TRUE : FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_SRCBLEND, nv2a_blend_to_d3d(g_pg.blend_sfactor));
+    dev->lpVtbl->SetRenderState(dev, D3DRS_DESTBLEND, nv2a_blend_to_d3d(g_pg.blend_dfactor));
 
     if (use_vsh) {
         /* Programmable path: position is a shader input now, not a
@@ -1947,6 +2047,11 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
             /* END: submit accumulated vertices */
             if (g_pg.in_draw) {
                 submit_draw();
+                submit_array_runs(g_pg.batch.run_total);
+                if (!g_pg.batch.oom)
+                    submit_array_elements(g_pg.batch.elements,
+                                          g_pg.batch.element_count);
+                nv2a_vtx_batch_reset(&g_pg.batch);
                 g_pg.in_draw = 0;
             }
         } else {
@@ -1955,6 +2060,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
             g_pg.draw_mode = param;
             g_pg.d3d_prim_type = nv2a_draw_mode_to_d3d(param);
             g_pg.inline_count = 0;
+            nv2a_vtx_batch_reset(&g_pg.batch);
         }
         return 1;
 
@@ -2199,13 +2305,9 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
     case NV097_SET_VERTEX_DATA_ARRAY_FORMAT + 0x3C:
     {
         int slot = (method - NV097_SET_VERTEX_DATA_ARRAY_FORMAT) / 4;
-        /* TYPE is bits 0-3, SIZE (component count) is bits 4-7 -- see the
-         * NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE/_SIZE masks in
-         * nv2a_regs.h. STRIDE (bits 8-31) is for a VRAM-sourced vertex
-         * array and does not apply to INLINE_ARRAY, whose packing is
-         * always tight (compute_vertex_layout() derives it), so it is
-         * intentionally not read here. */
-        uint32_t fmt = param & NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE;
+        /* TYPE bits 0-3, SIZE (component count) bits 4-7, STRIDE bits 8-31.
+         * STRIDE applies only to array-sourced draws; INLINE_ARRAY packing is
+         * always tight (compute_vertex_layout()). */
         uint32_t cnt = (param & NV097_SET_VERTEX_DATA_ARRAY_FORMAT_SIZE) >> 4;
         /* TEMPORARY diagnostic (XBOXRECOMP_TEXDUMP): is per-vertex diffuse
          * ever actually part of the stream for any draw, independent of
@@ -2215,25 +2317,49 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
             fprintf(stderr, "[PGRAPH-D3D11] vattr[DIFFUSE] count: %u -> %u\n",
                     g_pg.vattr[slot].count, cnt);
         }
-        g_pg.vattr[slot].format = fmt;
-        g_pg.vattr[slot].count = cnt;
-        switch (fmt) {
-        case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_D3D:
-        case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_OGL:
-            g_pg.vattr[slot].size = 1;
-            break;
-        case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S1:
-        case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S32K:
-            g_pg.vattr[slot].size = 2;
-            break;
-        case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F:
-        case NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_CMP:
-        default:
-            g_pg.vattr[slot].size = 4;
-            break;
-        }
+        nv2a_vtx_set_format(&g_pg.vattr[slot], param);
         return 1;
     }
+
+    case NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x00:
+    case NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x04:
+    case NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x08:
+    case NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x0C:
+    case NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x10:
+    case NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x14:
+    case NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x18:
+    case NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x1C:
+    case NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x20:
+    case NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x24:
+    case NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x28:
+    case NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x2C:
+    case NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x30:
+    case NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x34:
+    case NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x38:
+    case NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0x3C:
+        nv2a_vtx_set_offset(&g_pg.vattr[(method - NV097_SET_VERTEX_DATA_ARRAY_OFFSET) / 4],
+                            param);
+        return 1;
+
+    case NV097_ARRAY_ELEMENT16:
+    case NV097_ARRAY_ELEMENT32:
+        if (g_pg.in_draw) {
+            /* xemu draws every DRAW_ARRAYS run but the last before an
+             * ARRAY_ELEMENT expands that last run into the element list. */
+            uint32_t lead = nv2a_vtx_batch_leading_runs(&g_pg.batch);
+            if (lead)
+                submit_array_runs(lead);
+            if (method == NV097_ARRAY_ELEMENT16)
+                nv2a_vtx_batch_element16(&g_pg.batch, param);
+            else
+                nv2a_vtx_batch_element32(&g_pg.batch, param);
+        }
+        return 1;
+
+    case NV097_DRAW_ARRAYS:
+        if (g_pg.in_draw)
+            nv2a_vtx_batch_draw_arrays(&g_pg.batch, param);
+        return 1;
 
     /* Constant ("current") diffuse color for vertices where DIFFUSE is not
      * one of the enabled per-vertex attributes -- see g_pg.current_diffuse.
@@ -2334,7 +2460,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
                                                         * label was wrong -- that
                                                         * register is 0x0B80,
                                                         * handled above now. */
-            (method >= 0x1680 && method < 0x1780) ||  /* Vertex array format/offset */
+            (method >= 0x1680 && method < 0x1720) ||  /* Fog coord, skin weights */
             (method >= 0x1B00 && method < 0x1C00) ||  /* Texture registers */
             (method >= 0x1D60 && method < 0x1D8C) ||  /* Semaphore, ZMIN/MAX, AA */
             (method >= 0x1DA0 && method < 0x1EA0) ||  /* Fog, combiner OCW, shader */

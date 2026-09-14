@@ -598,10 +598,11 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
             PgraphD3D11Stats st;
             pgraph_d3d11_get_stats(&st);
             fprintf(stderr, "[PGRAPH] Frame %u: %u methods (%u ignored), "
-                    "%u draws, %u verts, %u clears\n",
+                    "%u draws, %u verts, %u clears, %u array draws, "
+                    "%u array gather failures\n",
                     g_pgraph_flip_count, g_pgraph_method_count,
                     st.methods_ignored, st.draw_calls, st.vertices_submitted,
-                    st.clears);
+                    st.clears, st.array_draws, st.array_gather_failures);
             fflush(stderr);
         }
         d3d8_PresentFrame();
