@@ -1728,8 +1728,20 @@ class Lifter:
     def _analyze_switch_table(self, ops):
         """Detect if an indirect jmp operand is an intra-function switch table.
         Pattern: jmp [reg*scale + table_base] or jmp [reg + table_base]
-        Returns (targets: list[int]) if ALL table entries are within the current
-        function, else empty list."""
+        Returns the table's leading run of entries inside the current function,
+        or an empty list if the first entry is already outside it.
+
+        The run ends at the first entry outside the function. _read_jump_table
+        can only stop at a word that isn't a code address, and what MSVC parks
+        after a pointer table is often the byte index table of a two-level
+        switch (`movzx edx, byte [eax+idx]; jmp [edx*4+tbl]`), whose small
+        values can read as one. Breakdown's sub_000411D0 has four real cases at
+        0x00041294 followed by index bytes 00 00 03 00, which is 0x00030000,
+        inside .text. That fifth "case" used to reject the whole switch, so
+        every case went through RECOMP_ITAIL, found no function at 0x00041276,
+        and silently returned -- 6,324 times in a five-minute run. The lifted
+        switch still ends in RECOMP_ITAIL(_jt), so an index past the run
+        behaves exactly as the whole switch did before."""
         if not ops or ops[0].type != "mem":
             return []
         op = ops[0]
@@ -1740,12 +1752,12 @@ class Lifter:
         targets = self.jump_table_targets.get(table_va)
         if targets is None:
             targets = self._read_jump_table(table_va)
-        if not targets:
-            return []
-        # Check that ALL targets are within the current function
-        if all(self.func_start <= t < self.func_end for t in targets):
-            return targets
-        return []
+        inside = []
+        for t in targets or ():
+            if not (self.func_start <= t < self.func_end):
+                break
+            inside.append(t)
+        return inside
 
     def _lift_jmp(self, insn, ops):
         if insn.jump_target:
