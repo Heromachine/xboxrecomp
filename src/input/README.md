@@ -6,8 +6,25 @@ Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGe
 
 | File | LOC | Purpose |
 |------|-----|---------|
-| `xinput_xbox.h` | 189 | Public header — types, button constants, function prototypes |
-| `xinput_device.c` | 23 | Implementation (maps Xbox calls to Windows XInput) |
+| `xinput_xbox.h` | 123 | Public header — types, button constants, function prototypes |
+| `xinput_device.c` | 408 | Implementation: Windows XInput backend (with the keyboard stand-in and scripted presses), SDL2 backend on POSIX |
+| `pad_script.c/.h` | 224 | `XBOXRECOMP_PAD_SCRIPT` parser, portable C (tested by `tools/recomp/test_pad_script.py`) |
+
+## Wiring a title
+
+On the Xbox, `XInputGetState` and its siblings are not kernel exports. They are
+XDK library code linked into the title's XPP section, and they drive the USB
+host controller, which the runtime does not emulate. A recompiled title never
+sees a controller until those entry points are replaced with this layer.
+
+Find them in the title, then define them in its `recomp_manual.c` so
+`--exclude-manual` drops the recompiled bodies, and register each in
+`recomp_lookup_manual()` too. Callers of a manually defined function reach it
+through the dispatch lookup. Breakdown's overrides are the worked example:
+`XGetDeviceChanges` reports ports from `xbox_InputConnectedMask()`, `XInputOpen`
+hands out a handle per port, and `XInputGetState`, `XInputGetCapabilities` and
+`XInputSetState` read and write guest memory in the XDK layouts through this
+layer.
 
 ## Quick Start
 
@@ -52,6 +69,10 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);
 
 // Check if controller is connected
 BOOL xbox_InputIsConnected(DWORD dwPort);
+
+// Bit n set for each port with a controller (host pad, or on port 0 the
+// keyboard stand-in or a pad script) -- what XGetDeviceChanges should report
+DWORD xbox_InputConnectedMask(void);
 
 // Query controller capabilities
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps);
@@ -127,6 +148,42 @@ XBOX_ANALOG_BUTTON_THRESHOLD  30   // Recommended press threshold
 | D-pad | D-pad | Digital only |
 | L Stick | L Stick | Click = L3 |
 | R Stick | R Stick | Click = R3 |
+
+## Keyboard stand-in (Windows backend)
+
+With no controller on port 0, the keyboard acts as one while one of the
+game's windows has focus. `XBOXRECOMP_KEYBOARD_PAD=0` turns it off. A real
+controller on port 0 always takes over.
+
+| Pad | Key |
+|-----|-----|
+| Start | Enter |
+| Back | Esc |
+| D-pad | Arrow keys |
+| Left stick | W A S D |
+| Right stick | I J K L |
+| A / B / X / Y | Space / Backspace / F / R |
+| Black / White | G / T |
+| Left / right trigger | Q / E |
+| Left / right stick click | Z / C |
+
+## Scripted presses (Windows backend)
+
+`XBOXRECOMP_PAD_SCRIPT` presses buttons on port 0 at set times, so a run can
+get past a title screen with nobody at the keyboard. Events are
+`SECONDS=BUTTONS`, separated by `;` or `,`. The buttons are `+`-separated and
+held until the next event, and an empty list releases them all. Times count
+from the title's first input call, early in boot.
+
+`XBOXRECOMP_PAD_SCRIPT="132=START;132.3=;140=DOWN;140.2=;143=A;143.2="`
+
+Names: `START BACK A B X Y BLACK WHITE LT RT UP DOWN LEFT RIGHT LTHUMB RTHUMB`.
+A script that doesn't parse is ignored as a whole, with a message on stderr.
+It is ORed onto whatever port 0 reports, so it also works alongside a
+connected controller.
+
+The packet number a title reads changes exactly when the state does, whichever
+source the state came from.
 
 ## Ports
 

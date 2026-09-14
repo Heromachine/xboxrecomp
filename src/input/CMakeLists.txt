@@ -2,6 +2,7 @@
 
 add_library(xbox_input STATIC
     xinput_device.c
+    pad_script.c
 )
 
 target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

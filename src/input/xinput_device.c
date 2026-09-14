@@ -11,6 +11,9 @@
  */
 
 #include "xinput_xbox.h"
+#include "pad_script.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ======================================================================== */
@@ -22,58 +25,205 @@
 #pragma comment(lib, "xinput.lib")
 
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
-static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
+
+/* A disconnected port is probed again no sooner than this. XInputGetState on
+ * an empty port is slow on real Windows, and titles ask every frame. */
+#define PROBE_INTERVAL_MS 1000
+static DWORD g_next_probe_ms[XBOX_MAX_CONTROLLERS];
+
+/* The packet number a title sees changes exactly when the state does, whatever
+ * the source -- host pad, keyboard stand-in or script. */
+static XBOX_GAMEPAD g_last_pad[XBOX_MAX_CONTROLLERS];
+static DWORD g_packet[XBOX_MAX_CONTROLLERS];
+
+static int g_setup_done;
+static int g_keyboard_pad = 1;          /* XBOXRECOMP_KEYBOARD_PAD=0 turns it off */
+static XboxPadScript g_script;          /* XBOXRECOMP_PAD_SCRIPT */
+static LARGE_INTEGER g_t0, g_freq;
+
+static void input_setup(void)
+{
+    const char *e;
+
+    if (g_setup_done)
+        return;
+    g_setup_done = 1;
+    QueryPerformanceFrequency(&g_freq);
+    QueryPerformanceCounter(&g_t0);
+
+    e = getenv("XBOXRECOMP_KEYBOARD_PAD");
+    if (e && e[0] == '0')
+        g_keyboard_pad = 0;
+
+    e = getenv("XBOXRECOMP_PAD_SCRIPT");
+    if (e && *e) {
+        int n = xbox_pad_script_parse(e, &g_script);
+        if (n < 0)
+            fprintf(stderr, "[INPUT] XBOXRECOMP_PAD_SCRIPT does not parse; ignoring it\n");
+        else
+            fprintf(stderr, "[INPUT] pad script: %d event(s) on port 0\n", n);
+    }
+    fprintf(stderr, "[INPUT] keyboard stand-in pad on port 0 when no controller is: %s\n",
+            g_keyboard_pad ? "on" : "off");
+}
+
+/* Seconds since the input layer was first used -- early in boot, when the
+ * title initialises its devices. XBOXRECOMP_PAD_SCRIPT times count from here. */
+static double input_seconds(void)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (double)(now.QuadPart - g_t0.QuadPart) / (double)g_freq.QuadPart;
+}
+
+/* Port 0 has a controller even with no host pad when either stand-in is on. */
+static int port0_virtual(void)
+{
+    return g_keyboard_pad || g_script.count > 0;
+}
+
+/* A host XInput pad in Xbox layout. */
+static DWORD read_xinput(DWORD port, XBOX_GAMEPAD *pad)
+{
+    XINPUT_STATE xi_state;
+    DWORD result = XInputGetState(port, &xi_state);
+
+    if (result != ERROR_SUCCESS)
+        return result;
+
+    pad->wButtons = xi_state.Gamepad.wButtons & 0x00FF;
+    pad->bAnalogButtons[XBOX_BUTTON_A] =
+        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_A) ? 255 : 0;
+    pad->bAnalogButtons[XBOX_BUTTON_B] =
+        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_B) ? 255 : 0;
+    pad->bAnalogButtons[XBOX_BUTTON_X] =
+        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_X) ? 255 : 0;
+    pad->bAnalogButtons[XBOX_BUTTON_Y] =
+        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_Y) ? 255 : 0;
+    pad->bAnalogButtons[XBOX_BUTTON_BLACK] =
+        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 255 : 0;
+    pad->bAnalogButtons[XBOX_BUTTON_WHITE] =
+        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 255 : 0;
+    pad->bAnalogButtons[XBOX_BUTTON_LTRIGGER] = xi_state.Gamepad.bLeftTrigger;
+    pad->bAnalogButtons[XBOX_BUTTON_RTRIGGER] = xi_state.Gamepad.bRightTrigger;
+    pad->sThumbLX = xi_state.Gamepad.sThumbLX;
+    pad->sThumbLY = xi_state.Gamepad.sThumbLY;
+    pad->sThumbRX = xi_state.Gamepad.sThumbRX;
+    pad->sThumbRY = xi_state.Gamepad.sThumbRY;
+    return ERROR_SUCCESS;
+}
+
+/* The keyboard stand-in, read only while one of this process's windows has
+ * focus so typing in another window doesn't press buttons. The layout is in
+ * README.md. */
+static void read_keyboard(XBOX_GAMEPAD *pad)
+{
+    static const struct { int vk; WORD digital; int analog; } keys[] = {
+        { VK_RETURN, XBOX_GAMEPAD_START,       -1 },
+        { VK_ESCAPE, XBOX_GAMEPAD_BACK,        -1 },
+        { VK_UP,     XBOX_GAMEPAD_DPAD_UP,     -1 },
+        { VK_DOWN,   XBOX_GAMEPAD_DPAD_DOWN,   -1 },
+        { VK_LEFT,   XBOX_GAMEPAD_DPAD_LEFT,   -1 },
+        { VK_RIGHT,  XBOX_GAMEPAD_DPAD_RIGHT,  -1 },
+        { 'Z',       XBOX_GAMEPAD_LEFT_THUMB,  -1 },
+        { 'C',       XBOX_GAMEPAD_RIGHT_THUMB, -1 },
+        { VK_SPACE,  0, XBOX_BUTTON_A },
+        { VK_BACK,   0, XBOX_BUTTON_B },
+        { 'F',       0, XBOX_BUTTON_X },
+        { 'R',       0, XBOX_BUTTON_Y },
+        { 'G',       0, XBOX_BUTTON_BLACK },
+        { 'T',       0, XBOX_BUTTON_WHITE },
+        { 'Q',       0, XBOX_BUTTON_LTRIGGER },
+        { 'E',       0, XBOX_BUTTON_RTRIGGER },
+    };
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    size_t i;
+
+    if (!fg)
+        return;
+    GetWindowThreadProcessId(fg, &pid);
+    if (pid != GetCurrentProcessId())
+        return;
+
+#define KEY_DOWN(vk) ((GetAsyncKeyState(vk) & 0x8000) != 0)
+    for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        if (!KEY_DOWN(keys[i].vk))
+            continue;
+        pad->wButtons |= keys[i].digital;
+        if (keys[i].analog >= 0)
+            pad->bAnalogButtons[keys[i].analog] = 255;
+    }
+    /* Sticks at full deflection; the Xbox Y axis points up. */
+    pad->sThumbLX = (SHORT)((KEY_DOWN('D') ? 32767 : 0) - (KEY_DOWN('A') ? 32767 : 0));
+    pad->sThumbLY = (SHORT)((KEY_DOWN('W') ? 32767 : 0) - (KEY_DOWN('S') ? 32767 : 0));
+    pad->sThumbRX = (SHORT)((KEY_DOWN('L') ? 32767 : 0) - (KEY_DOWN('J') ? 32767 : 0));
+    pad->sThumbRY = (SHORT)((KEY_DOWN('I') ? 32767 : 0) - (KEY_DOWN('K') ? 32767 : 0));
+#undef KEY_DOWN
+}
 
 void xbox_InputInit(void)
 {
-    for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
-        XINPUT_STATE state;
-        DWORD result = XInputGetState(i, &state);
-        g_controller_connected[i] = (result == ERROR_SUCCESS);
+    input_setup();
+    xbox_InputConnectedMask();
+}
+
+DWORD xbox_InputConnectedMask(void)
+{
+    DWORD mask = 0, now = GetTickCount();
+
+    input_setup();
+    for (DWORD port = 0; port < XBOX_MAX_CONTROLLERS; port++) {
+        if (g_controller_connected[port] || now >= g_next_probe_ms[port]) {
+            XINPUT_STATE state;
+            g_controller_connected[port] =
+                (XInputGetState(port, &state) == ERROR_SUCCESS);
+            if (!g_controller_connected[port])
+                g_next_probe_ms[port] = now + PROBE_INTERVAL_MS;
+        }
+        if (g_controller_connected[port])
+            mask |= 1u << port;
     }
+    if (port0_virtual())
+        mask |= 1u;
+    return mask;
 }
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
-    XINPUT_STATE xi_state;
+    XBOX_GAMEPAD pad;
     DWORD result;
 
+    input_setup();
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    result = XInputGetState(dwPort, &xi_state);
+    memset(&pad, 0, sizeof(pad));
+    result = read_xinput(dwPort, &pad);
+    g_controller_connected[dwPort] = (result == ERROR_SUCCESS);
     if (result != ERROR_SUCCESS) {
-        g_controller_connected[dwPort] = FALSE;
-        return result;
+        if (dwPort != 0 || !port0_virtual())
+            return result;
+        if (g_keyboard_pad)
+            read_keyboard(&pad);
     }
 
-    g_controller_connected[dwPort] = TRUE;
-    g_last_packet[dwPort] = xi_state.dwPacketNumber;
+    if (dwPort == 0 && g_script.count > 0) {
+        XboxPadHeld held = xbox_pad_script_at(&g_script, input_seconds());
+        pad.wButtons |= held.buttons;
+        for (int i = 0; i < 8; i++)
+            if (held.analog[i] > pad.bAnalogButtons[i])
+                pad.bAnalogButtons[i] = held.analog[i];
+    }
+
+    if (g_packet[dwPort] == 0 || memcmp(&pad, &g_last_pad[dwPort], sizeof(pad)) != 0) {
+        g_last_pad[dwPort] = pad;
+        g_packet[dwPort]++;
+    }
 
     memset(pState, 0, sizeof(XBOX_INPUT_STATE));
-    pState->dwPacketNumber = xi_state.dwPacketNumber;
-    pState->Gamepad.wButtons = xi_state.Gamepad.wButtons & 0x00FF;
-
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_A) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_B) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_X) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_Y) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = xi_state.Gamepad.bLeftTrigger;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = xi_state.Gamepad.bRightTrigger;
-
-    pState->Gamepad.sThumbLX = xi_state.Gamepad.sThumbLX;
-    pState->Gamepad.sThumbLY = xi_state.Gamepad.sThumbLY;
-    pState->Gamepad.sThumbRX = xi_state.Gamepad.sThumbRX;
-    pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
-
+    pState->dwPacketNumber = g_packet[dwPort];
+    pState->Gamepad = pad;
     return ERROR_SUCCESS;
 }
 
@@ -92,7 +242,7 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 BOOL xbox_InputIsConnected(DWORD dwPort)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
-    return g_controller_connected[dwPort];
+    return (xbox_InputConnectedMask() >> dwPort) & 1;
 }
 
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
@@ -224,6 +374,20 @@ BOOL xbox_InputIsConnected(DWORD dwPort)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
     return g_controller_connected[dwPort];
+}
+
+/* No keyboard stand-in or XBOXRECOMP_PAD_SCRIPT on this backend yet. */
+DWORD xbox_InputConnectedMask(void)
+{
+    DWORD mask = 0;
+    open_controllers();
+    for (DWORD port = 0; port < XBOX_MAX_CONTROLLERS; port++) {
+        SDL_GameController *c = g_pads[port];
+        g_controller_connected[port] = c && SDL_GameControllerGetAttached(c);
+        if (g_controller_connected[port])
+            mask |= 1u << port;
+    }
+    return mask;
 }
 
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)

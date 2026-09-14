@@ -105,6 +105,13 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);
 BOOL xbox_InputIsConnected(DWORD dwPort);
 
 /**
+ * Bit n set for each port 0-3 with a controller: a host pad, or on port 0 the
+ * keyboard stand-in or an XBOXRECOMP_PAD_SCRIPT (see README.md). This is what
+ * a title's XGetDeviceChanges/XGetDevices should report.
+ */
+DWORD xbox_InputConnectedMask(void);
+
+/**
  * Get controller capabilities.
  */
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps);
