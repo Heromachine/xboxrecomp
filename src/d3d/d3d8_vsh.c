@@ -791,10 +791,16 @@ static void emit_ilu_op(StrBuf *sb, const NV2AVshInstruction *inst)
         break;
 
     case NV2A_VSH_ILU_RCC:
-        /* dst = clamp(1.0/C.x, 5.42101e-36, 1.884467e+19).xxxx */
-        sb_append(&expr, "clamp(1.0 / ");
+        /* dst = 1/C.x clamped AWAY from zero into [2^-64, 2^64], keeping its
+         * sign (xemu clampAwayZeroInf). A positive-only clamp collapsed every
+         * vertex behind the camera (w < 0) onto the viewport offset. */
+        sb_append(&expr, "float((1.0 / ");
         emit_source(&expr, &inst->ilu.inputs[0], 1);
-        sb_append(&expr, ", 5.42101e-36, 1.884467e+19).xxxx");
+        sb_append(&expr, ") >= 0.0 ? clamp(1.0 / ");
+        emit_source(&expr, &inst->ilu.inputs[0], 1);
+        sb_append(&expr, ", 5.421011e-20, 1.8446744e19) : clamp(1.0 / ");
+        emit_source(&expr, &inst->ilu.inputs[0], 1);
+        sb_append(&expr, ", -1.8446744e19, -5.421011e-20)).xxxx");
         break;
 
     case NV2A_VSH_ILU_RSQ:
@@ -1006,7 +1012,13 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
             "    if (c[%d].z != 0.0) {\n"
             "        oPos.z = oPos.z / c[%d].z;\n"
             "    }\n"
-            "    oPos.w = 1.0;\n\n",
+            /* Undo the program's divide by w and keep w, as xemu's vsh-prog.c
+             * does, so the rasterizer clips homogeneously. Forcing w = 1 left
+             * triangles that cross the camera plane with no way to clip. A 2D
+             * program's w is already 1, so its output is unchanged. */
+            "    oPos.w = (oPos.w >= 0.0) ? clamp(oPos.w, 5.421011e-20, 1.8446744e19)\n"
+            "                             : clamp(oPos.w, -1.8446744e19, -5.421011e-20);\n"
+            "    oPos.xyz *= oPos.w;\n\n",
             NV2A_VS_VPSCL_REG, NV2A_VS_VPSCL_REG, NV2A_VS_VPOFF_REG, NV2A_VS_VPSCL_REG,
             NV2A_VS_VPSCL_REG, NV2A_VS_VPSCL_REG);
     }
