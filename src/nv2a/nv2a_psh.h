@@ -37,6 +37,7 @@ typedef struct {
     uint8_t shadow_depth_func;     /* SET_SHADOW_DEPTH_FUNC, 0..7 */
     uint8_t alpha_test;
     uint8_t alpha_func;            /* GL enum minus 0x200: 0 NEVER .. 7 ALWAYS */
+    uint8_t z_perspective;         /* CONTROL0 Z_PERSPECTIVE_ENABLE: w-buffer */
 } NV2APshState;
 
 /* Pixel shader constant buffer at register(b0). 16-byte aligned; matches the
@@ -49,7 +50,8 @@ typedef struct {
     float bump_offset[4];
     float depth_max[4];    /* shadow map depth range per stage */
     float alpha_ref;       /* 0..255 */
-    float pad[3];
+    float depth_scale;     /* 1 / depth range top, for w-buffered depth */
+    float pad[2];
 } NV2APshConstants;
 
 /* NV097 texture colour codes that address texels by pitch (xemu's

@@ -40,6 +40,7 @@ int main(int argc, char **argv) {
     s.shadow_depth_func = v[10];
     s.alpha_test = v[11]; s.alpha_func = v[12];
     s.rgb_inputs[1] = v[13]; s.rgb_outputs[1] = v[14];
+    s.z_perspective = v[15];
     if (argc > 1 && !strcmp(argv[1], "tiny")) {
         printf("%d\n", nv2a_psh_generate(&s, buf, 64));
         return 0;
@@ -59,7 +60,7 @@ int main(int argc, char **argv) {
 
 # D3D's default: one stage, R0 = T0 * V0, final colour D = R0, alpha G = R0.
 DEFAULT = ["1", "1", "c", "1c00", "08040000", "c00", "18140000", "c00",
-           "0", "0", "0", "0", "0", "0", "0"]
+           "0", "0", "0", "0", "0", "0", "0", "0"]
 
 
 def _compiler():
@@ -161,6 +162,14 @@ class PshTest(unittest.TestCase):
                       self.gen(f))
         f[12] = "7"                 # ALWAYS: no test
         self.assertNotIn("alphaRef)) { discard; }", self.gen(f))
+
+    def test_w_buffer_writes_depth_from_clip_w(self):
+        self.assertNotIn("SV_Depth", self.gen(DEFAULT))
+        f = list(DEFAULT)
+        f[15] = "1"
+        out = self.gen(f)
+        self.assertIn("out float oDepth : SV_Depth", out)
+        self.assertIn("oDepth = saturate(input.pos.w * depthScale);", out)
 
     def test_overflow_is_reported(self):
         self.assertEqual(self.gen(DEFAULT, "tiny").strip(), "-1")

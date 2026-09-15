@@ -111,15 +111,20 @@ void d3d8_PresentFrame(void)
      */
     if (g_device_state.swap_chain) {
         static long want = -2;   /* -2 = not yet parsed, -1 = disabled */
+        static long every;       /* XBOXRECOMP_FRAMEDUMP_EVERY: repeat */
         static long frame;
         frame++;
         if (want == -2) {
             const char *e = getenv("XBOXRECOMP_FRAMEDUMP");
+            const char *ev = getenv("XBOXRECOMP_FRAMEDUMP_EVERY");
             want = e ? strtol(e, NULL, 0) : -1;
+            every = ev ? strtol(ev, NULL, 0) : 0;
             if (want >= 0)
-                fprintf(stderr, "[D3D8] frame dump armed for frame %ld\n", want);
+                fprintf(stderr, "[D3D8] frame dump armed for frame %ld (every %ld)\n",
+                        want, every);
         }
-        if (want >= 0 && frame == want) {
+        if (want >= 0 && (frame == want ||
+                          (every > 0 && frame > want && (frame - want) % every == 0))) {
             ID3D11Texture2D *bb = NULL, *stage = NULL;
             if (SUCCEEDED(IDXGISwapChain_GetBuffer(g_device_state.swap_chain, 0,
                                                    &IID_ID3D11Texture2D, (void **)&bb))) {

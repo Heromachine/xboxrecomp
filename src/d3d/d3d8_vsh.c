@@ -752,10 +752,14 @@ static void emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
         break;
 
     case NV2A_VSH_MAC_ARL:
-        /* a0 = floor(A.x) - special: writes address register, not a float reg */
+        /* a0 = floor(A.x + 0.001) - writes the address register, not a
+         * float register. The bias is xemu's (vsh-prog.c _ARL): an index
+         * stored as a byte arrives as 17/255, and scaled back up it is
+         * 16.99..., which a bare floor turns into the neighbouring bone --
+         * skinned vertices then tore holes in close-up faces. */
         sb_append(sb, "    a0 = (int)floor(");
         emit_source(sb, &inst->mac.inputs[0], 0);
-        sb_append(sb, ".x);\n");
+        sb_append(sb, ".x + 0.001);\n");
         return; /* No destination register write */
 
     default:

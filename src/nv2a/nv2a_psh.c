@@ -587,7 +587,8 @@ static const char k_preamble[] =
     "    float4 bumpOffset;\n"
     "    float4 depthMax;\n"
     "    float  alphaRef;\n"
-    "    float3 cbPad;\n"
+    "    float  depthScale;\n"
+    "    float2 cbPad;\n"
     "};\n"
     /* The same order as d3d8_vsh.c's VS_OUT: D3D11 links stages by
      * position, so every field up to the last one read must be present. */
@@ -740,7 +741,18 @@ int nv2a_psh_generate(const NV2APshState *s, char *buf, size_t cap)
         sb_printf(&vars, "float4 r1 = float4(0.0, 0.0, 0.0, 0.0);\n");
 
     sb_printf(&out, "%s", k_preamble);
-    sb_printf(&out, "float4 main(PS_IN input) : SV_TARGET {\n");
+    if (s->z_perspective) {
+        /* W-buffering: the stored depth is the pixel's eye w, not the
+         * rasterizer's screen-space-linear z/w. xemu reconstructs w per
+         * pixel from the triangle's vertices; D3D11 already hands the pixel
+         * shader the perspective-correct clip w in SV_Position.w. Left to
+         * z/w, large near triangles (a face in close-up) sorted wrongly and
+         * the back of the head showed through. */
+        sb_printf(&out, "float4 main(PS_IN input, out float oDepth : SV_Depth) : SV_TARGET {\n");
+        sb_printf(&out, "oDepth = saturate(input.pos.w * depthScale);\n");
+    } else {
+        sb_printf(&out, "float4 main(PS_IN input) : SV_TARGET {\n");
+    }
     sb_printf(&out, "%s", vars_buf);
     sb_printf(&out, "%s", code_buf);
     sb_printf(&out, "return fragColor;\n}\n");

@@ -53,7 +53,6 @@ extern IDirect3DDevice8 *xbox_GetD3DDevice(void);
  * the section below: every ID3D11*_* call failed as an implicit-declaration
  * error until the order was fixed here, not there). */
 #include "../d3d/d3d8_internal.h"
-#include <d3d11_1.h>       /* ID3D11DeviceContext1::ClearView, for clear rects */
 #include <d3dcompiler.h>
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -433,12 +432,17 @@ static float u2f(uint32_t u) {
  * draw of that one frame, in order. Off unless set. */
 static int surftrace_on(void)
 {
-    static long want = -2;
+    static long want = -2, every;
+    long f = (long)g_pg.stats.frames;
     if (want == -2) {
         const char *e = getenv("XBOXRECOMP_SURFTRACE");
+        const char *ev = getenv("XBOXRECOMP_SURFTRACE_EVERY");
         want = e ? strtol(e, NULL, 0) : -1;
+        every = ev ? strtol(ev, NULL, 0) : 0;
     }
-    return want >= 0 && (long)g_pg.stats.frames == want;
+    if (want < 0)
+        return 0;
+    return f == want || (every > 0 && f > want && (f - want) % every == 0);
 }
 
 static void surftrace(const char *fmt, ...)
@@ -580,6 +584,15 @@ static void decode_attr_floats(const uint8_t *vbase, const uint32_t byte_offset[
     for (uint32_t c = 0; c < 4; c++) {
         out[c] = (c < count) ? read_component_as_float(format, p + c * size)
                               : (c == 3 ? 1.0f : 0.0f);
+    }
+    /* UB_D3D with four components is stored B,G,R,A, and the vertex program
+     * sees it reordered -- xemu binds it GL_BGRA and its shader reads
+     * `v.bgra`. That holds for every slot, not only colours: skinning
+     * indices and weights ride in UB_D3D too. */
+    if (format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_D3D && count == 4) {
+        float t = out[0];
+        out[0] = out[2];
+        out[2] = t;
     }
 }
 
@@ -755,17 +768,18 @@ static void convert_vsh_vertex(const uint8_t *src_vb, const uint32_t src_offset[
              * for the DIFFUSE slot; an unused specular-family slot defaults
              * to 0, matching NV2A's (0,0,0,0) default for an attribute the
              * title never declared. */
-            uint32_t packed = 0;
-            if (g_pg.vattr[i].count) {
-                packed = decode_diffuse_color(src_vb, src_offset, i);
-            } else {
-                const float *v = g_pg.inline_value[i];
-                packed = ((uint32_t)(v[3] * 255.0f + 0.5f) << 24) |
-                         ((uint32_t)(v[0] * 255.0f + 0.5f) << 16) |
-                         ((uint32_t)(v[1] * 255.0f + 0.5f) << 8) |
-                          (uint32_t)(v[2] * 255.0f + 0.5f);
+            /* The input element is R8G8B8A8_UNORM: bytes in r,g,b,a order
+             * give the program the value xemu's does. Writing a D3DCOLOR
+             * (B,G,R,A in memory) here swapped red and blue for every
+             * colour a vertex program read. */
+            float v[4];
+            uint8_t *d = dst + dst_off;
+            memcpy(v, g_pg.inline_value[i], sizeof(v));
+            decode_attr_floats(src_vb, src_offset, i, v);
+            for (int c = 0; c < 4; c++) {
+                float x = v[c] < 0.0f ? 0.0f : (v[c] > 1.0f ? 1.0f : v[c]);
+                d[c] = (uint8_t)(x * 255.0f + 0.5f);
             }
-            memcpy(dst + dst_off, &packed, 4);
         } else {
             float f4[4];
             memcpy(f4, g_pg.inline_value[i], sizeof(f4));
@@ -1815,16 +1829,186 @@ static int bind_targets(int clearing, uint32_t clear_flags)
     vp.MinDepth = 0.0f;
     vp.MaxDepth = 1.0f;
     ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
+    {
+        /* NV2A draws only inside the surface clip rectangle; xemu scissors
+         * to it (gl/draw.c). Without it a letterboxed scene spilled into the
+         * letterbox, where the title's full-screen fade never reaches. */
+        D3D11_RECT sr;
+        sr.left = (LONG)(g_pg.surface_clip_h & 0xFFFF);
+        sr.top = (LONG)(g_pg.surface_clip_v & 0xFFFF);
+        sr.right = sr.left + (LONG)(g_pg.surface_clip_h >> 16);
+        sr.bottom = sr.top + (LONG)(g_pg.surface_clip_v >> 16);
+        if (((g_pg.surf_format >> 8) & 0xF) == 2) {   /* swizzle: whole surface */
+            sr.left = sr.top = 0;
+            sr.right = (LONG)w;
+            sr.bottom = (LONG)h;
+        }
+        ID3D11DeviceContext_RSSetScissorRects(ctx, 1, &sr);
+        d3d8_states_set_scissor(TRUE);
+    }
     d3d8_vsh_set_surface((float)w, (float)h, surface_zmax());
     d3d8_vsh_set_fog(g_pg.fog_enable, g_pg.fog_mode, g_pg.fog_param[0], g_pg.fog_param[1]);
     return 1;
+}
+
+/* A clear restricted to a rectangle, drawn as a quad. ID3D11DeviceContext1::
+ * ClearView would do it for colour, but Wine's d3d11 stubs it out (logs a
+ * fixme and clears nothing), and it never covered depth. The quad writes
+ * exactly the channels, depth and stencil the clear asks for. */
+static ID3D11VertexShader *g_clear_vs;
+static ID3D11PixelShader *g_clear_ps;
+static ID3D11Buffer *g_clear_cb;
+
+static const char k_clear_hlsl[] =
+    "cbuffer ClearRect : register(b2) {\n"
+    "    float4 rectNdc;   /* x0 y0 x1 y1 */\n"
+    "    float4 color;\n"
+    "    float  depth;\n"
+    "    float3 pad;\n"
+    "};\n"
+    "float4 vs_main(uint id : SV_VertexID) : SV_POSITION {\n"
+    "    float2 t = float2((id & 1) ? 1.0 : 0.0, (id & 2) ? 1.0 : 0.0);\n"
+    "    return float4(lerp(rectNdc.x, rectNdc.z, t.x), lerp(rectNdc.y, rectNdc.w, t.y), 0.0, 1.0);\n"
+    "}\n"
+    "float4 ps_main(float4 pos : SV_POSITION, out float oDepth : SV_Depth) : SV_TARGET {\n"
+    "    oDepth = depth;\n"
+    "    return color;\n"
+    "}\n";
+
+static int clear_quad_init(void)
+{
+    ID3D11Device *dev = d3d8_GetD3D11Device();
+    ID3DBlob *code = NULL, *err = NULL;
+    D3D11_BUFFER_DESC cbd;
+    HRESULT hr;
+
+    if (g_clear_vs && g_clear_ps && g_clear_cb)
+        return 1;
+    hr = D3DCompile(k_clear_hlsl, sizeof(k_clear_hlsl) - 1, "nv2a_clear", NULL, NULL,
+                    "vs_main", "vs_5_0", 0, 0, &code, &err);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[PGRAPH-D3D11] clear VS compile failed: %s\n",
+                err ? (char *)ID3D10Blob_GetBufferPointer(err) : "?");
+        if (err) ID3D10Blob_Release(err);
+        return 0;
+    }
+    ID3D11Device_CreateVertexShader(dev, ID3D10Blob_GetBufferPointer(code),
+                                    ID3D10Blob_GetBufferSize(code), NULL, &g_clear_vs);
+    ID3D10Blob_Release(code);
+    hr = D3DCompile(k_clear_hlsl, sizeof(k_clear_hlsl) - 1, "nv2a_clear", NULL, NULL,
+                    "ps_main", "ps_5_0", 0, 0, &code, &err);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[PGRAPH-D3D11] clear PS compile failed: %s\n",
+                err ? (char *)ID3D10Blob_GetBufferPointer(err) : "?");
+        if (err) ID3D10Blob_Release(err);
+        return 0;
+    }
+    ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(code),
+                                   ID3D10Blob_GetBufferSize(code), NULL, &g_clear_ps);
+    ID3D10Blob_Release(code);
+    memset(&cbd, 0, sizeof(cbd));
+    cbd.ByteWidth = 48;
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    ID3D11Device_CreateBuffer(dev, &cbd, NULL, &g_clear_cb);
+    return g_clear_vs && g_clear_ps && g_clear_cb;
+}
+
+static void clear_quad(uint32_t param, uint32_t x0, uint32_t y0, uint32_t x1,
+                       uint32_t y1, uint32_t w, uint32_t h, const float rgba[4],
+                       float depth, UINT8 stencil, int color, int zeta)
+{
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    ID3D11Device *dev = d3d8_GetD3D11Device();
+    D3D11_BLEND_DESC bd;
+    D3D11_DEPTH_STENCIL_DESC dsd;
+    D3D11_RASTERIZER_DESC rd;
+    ID3D11BlendState *bs = NULL;
+    ID3D11DepthStencilState *ds = NULL;
+    ID3D11RasterizerState *rs = NULL;
+    D3D11_MAPPED_SUBRESOURCE m;
+    float k[12];
+    float blend_factor[4] = { 1, 1, 1, 1 };
+
+    if (!clear_quad_init())
+        return;
+
+    memset(&bd, 0, sizeof(bd));
+    bd.RenderTarget[0].SrcBlend = bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlend = bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].BlendOp = bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = !color ? 0 :
+        (UINT8)(((param & NV097_CLEAR_SURFACE_R) ? 1 : 0) |
+                ((param & NV097_CLEAR_SURFACE_G) ? 2 : 0) |
+                ((param & NV097_CLEAR_SURFACE_B) ? 4 : 0) |
+                ((param & NV097_CLEAR_SURFACE_A) ? 8 : 0));
+    memset(&dsd, 0, sizeof(dsd));
+    dsd.DepthEnable = zeta && (param & NV097_CLEAR_SURFACE_Z);
+    dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    dsd.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    dsd.StencilEnable = zeta && (param & NV097_CLEAR_SURFACE_STENCIL);
+    dsd.StencilReadMask = 0xFF;
+    dsd.StencilWriteMask = 0xFF;
+    dsd.FrontFace.StencilFunc = D3D11_COMPARISON_ALWAYS;
+    dsd.FrontFace.StencilFailOp = D3D11_STENCIL_OP_REPLACE;
+    dsd.FrontFace.StencilDepthFailOp = D3D11_STENCIL_OP_REPLACE;
+    dsd.FrontFace.StencilPassOp = D3D11_STENCIL_OP_REPLACE;
+    dsd.BackFace = dsd.FrontFace;
+    memset(&rd, 0, sizeof(rd));
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = FALSE;
+    if (FAILED(ID3D11Device_CreateBlendState(dev, &bd, &bs)) ||
+        FAILED(ID3D11Device_CreateDepthStencilState(dev, &dsd, &ds)) ||
+        FAILED(ID3D11Device_CreateRasterizerState(dev, &rd, &rs)))
+        goto out;
+
+    /* Pixel rectangle -> NDC over the w x h viewport bind_targets() set. */
+    k[0] = 2.0f * x0 / w - 1.0f;
+    k[1] = 1.0f - 2.0f * y0 / h;
+    k[2] = 2.0f * x1 / w - 1.0f;
+    k[3] = 1.0f - 2.0f * y1 / h;
+    memcpy(k + 4, rgba, 4 * sizeof(float));
+    k[8] = depth;
+    k[9] = k[10] = k[11] = 0.0f;
+    if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_clear_cb, 0,
+                                       D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        goto out;
+    memcpy(m.pData, k, sizeof(k));
+    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_clear_cb, 0);
+
+    ID3D11DeviceContext_OMSetBlendState(ctx, bs, blend_factor, 0xFFFFFFFF);
+    ID3D11DeviceContext_OMSetDepthStencilState(ctx, ds, stencil);
+    ID3D11DeviceContext_RSSetState(ctx, rs);
+    ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    ID3D11DeviceContext_VSSetShader(ctx, g_clear_vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(ctx, 2, 1, &g_clear_cb);
+    ID3D11DeviceContext_PSSetShader(ctx, g_clear_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 2, 1, &g_clear_cb);
+    ID3D11DeviceContext_Draw(ctx, 4, 0);
+    /* The next draw re-applies every piece of state it uses (d3d8_states_
+     * apply, d3d8_vsh_prepare_draw, bind_pixel_stage), except these two. */
+    if (g_clear_vs) {
+        ID3D11PixelShader *null_ps = NULL;
+        ID3D11DeviceContext_PSSetShader(ctx, null_ps, NULL, 0);
+    }
+out:
+    if (bs) ID3D11BlendState_Release(bs);
+    if (ds) ID3D11DepthStencilState_Release(ds);
+    if (rs) ID3D11RasterizerState_Release(rs);
 }
 
 static void clear_surface(uint32_t param)
 {
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
     uint32_t w, h, x0, y0, x1, y1;
-    int full;
+    int want_color, want_zeta;
+    float rgba[4], depth;
+    UINT8 stencil = 0;
+    uint32_t c = g_pg.clear_color;   /* A8R8G8B8 */
+    uint32_t zs = g_pg.zstencil_clear;
 
     if (!bind_targets(1, param))
         return;
@@ -1832,47 +2016,43 @@ static void clear_surface(uint32_t param)
     if (!nv2a_surf_clear_rect(g_pg.clear_rect_h, g_pg.clear_rect_v, w, h,
                               &x0, &y0, &x1, &y1))
         return;
-    full = x0 == 0 && y0 == 0 && x1 >= w && y1 >= h;
 
-    if ((param & NV097_CLEAR_SURFACE_COLOR) && g_bound_color >= 0) {
-        Surface *s = &g_surf[g_bound_color];
-        uint32_t c = g_pg.clear_color;   /* A8R8G8B8 */
-        float rgba[4] = { ((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f,
-                          (c & 0xFF) / 255.0f, ((c >> 24) & 0xFF) / 255.0f };
-        int cleared = 0;
-        if (!full) {
-            ID3D11DeviceContext1 *ctx1 = NULL;
-            if (SUCCEEDED(ID3D11DeviceContext_QueryInterface(ctx,
-                    &IID_ID3D11DeviceContext1, (void **)&ctx1)) && ctx1) {
-                D3D11_RECT r = { (LONG)x0, (LONG)y0, (LONG)x1, (LONG)y1 };
-                ID3D11DeviceContext1_ClearView(ctx1, (ID3D11View *)s->rtv, rgba, &r, 1);
-                ID3D11DeviceContext1_Release(ctx1);
-                cleared = 1;
-            }
-        }
-        if (!cleared)
-            ID3D11DeviceContext_ClearRenderTargetView(ctx, s->rtv, rgba);
+    rgba[0] = ((c >> 16) & 0xFF) / 255.0f;
+    rgba[1] = ((c >> 8) & 0xFF) / 255.0f;
+    rgba[2] = (c & 0xFF) / 255.0f;
+    rgba[3] = ((c >> 24) & 0xFF) / 255.0f;
+    if (((g_pg.surf_format >> 4) & 0xF) == 1) {
+        depth = (zs & 0xFFFF) / 65535.0f;
+    } else {
+        depth = (zs >> 8) / 16777215.0f;
+        stencil = (UINT8)(zs & 0xFF);
     }
+    want_color = (param & NV097_CLEAR_SURFACE_COLOR) && g_bound_color >= 0;
+    want_zeta = (param & (NV097_CLEAR_SURFACE_Z | NV097_CLEAR_SURFACE_STENCIL)) &&
+                g_bound_zeta >= 0;
 
-    if ((param & (NV097_CLEAR_SURFACE_Z | NV097_CLEAR_SURFACE_STENCIL)) &&
-        g_bound_zeta >= 0) {
-        uint32_t zs = g_pg.zstencil_clear;
-        UINT flags = 0;
-        float depth;
-        UINT8 stencil = 0;
-        if (((g_pg.surf_format >> 4) & 0xF) == 1) {
-            depth = (zs & 0xFFFF) / 65535.0f;
+    /* The whole texture, every channel: the plain clears. Anything less --
+     * a letterbox rectangle, a surface bound smaller than its texture, a
+     * channel mask -- is drawn. */
+    if (want_color) {
+        Surface *sc = &g_surf[g_bound_color];
+        if (x0 == 0 && y0 == 0 && x1 >= sc->d.width && y1 >= sc->d.height &&
+            (param & NV097_CLEAR_SURFACE_COLOR) == NV097_CLEAR_SURFACE_COLOR) {
+            ID3D11DeviceContext_ClearRenderTargetView(ctx, sc->rtv, rgba);
         } else {
-            depth = (zs >> 8) / 16777215.0f;
-            stencil = (UINT8)(zs & 0xFF);
+            clear_quad(param, x0, y0, x1, y1, w, h, rgba, depth, stencil, 1, 0);
         }
-        if (param & NV097_CLEAR_SURFACE_Z)       flags |= D3D11_CLEAR_DEPTH;
-        if (param & NV097_CLEAR_SURFACE_STENCIL) flags |= D3D11_CLEAR_STENCIL;
-        /* ClearView can't take a depth view; a partial depth clear clears
-         * the whole buffer. Breakdown's partial clears are the letterboxed
-         * scene inside a surface it cleared whole just before. */
-        ID3D11DeviceContext_ClearDepthStencilView(ctx, g_surf[g_bound_zeta].dsv,
-                                                  flags, depth, stencil);
+    }
+    if (want_zeta) {
+        Surface *sz = &g_surf[g_bound_zeta];
+        if (x0 == 0 && y0 == 0 && x1 >= sz->d.width && y1 >= sz->d.height) {
+            UINT flags = 0;
+            if (param & NV097_CLEAR_SURFACE_Z)       flags |= D3D11_CLEAR_DEPTH;
+            if (param & NV097_CLEAR_SURFACE_STENCIL) flags |= D3D11_CLEAR_STENCIL;
+            ID3D11DeviceContext_ClearDepthStencilView(ctx, sz->dsv, flags, depth, stencil);
+        } else {
+            clear_quad(param, x0, y0, x1, y1, w, h, rgba, depth, stencil, 0, 1);
+        }
     }
 }
 
@@ -2143,6 +2323,7 @@ static int bind_pixel_stage(void)
     st.shadow_depth_func = (uint8_t)(g_pg.psh.shadow_func & 7);
     st.alpha_test = (uint8_t)g_pg.alpha_test;
     st.alpha_func = (uint8_t)(g_pg.psh.alpha_func & 0xF);
+    st.z_perspective = (g_pg.control0 & NV097_SET_CONTROL0_Z_PERSPECTIVE_ENABLE) ? 1 : 0;
 
     for (i = 0; i < 4; i++) {
         uint32_t mode = (st.shader_stage_program >> (i * 5)) & 0x1F;
@@ -2195,6 +2376,7 @@ static int bind_pixel_stage(void)
     memcpy(k.bump_scale, g_pg.psh.bump_scale, sizeof(k.bump_scale));
     memcpy(k.bump_offset, g_pg.psh.bump_offset, sizeof(k.bump_offset));
     k.alpha_ref = (float)(g_pg.psh.alpha_ref & 0xFF);
+    k.depth_scale = 1.0f / surface_zmax();
 
     if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_psh_cb, 0,
                                        D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
@@ -2635,10 +2817,10 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
     }
 
     if (surftrace_on()) {
-        fprintf(stderr, "[SURF] DRAW mode=%u verts=%u vsh=%d inputs=0x%04X c=0x%08X z=0x%08X "
+        fprintf(stderr, "[SURF] f=%u DRAW mode=%u verts=%u vsh=%d inputs=0x%04X c=0x%08X z=0x%08X "
                 "fmt=0x%X vp=(%.0f,%.0f s %.0f,%.0f) blend=%d %04X/%04X cmask=%08X "
                 "depth=%d/%04X/%d stencil=%d f=%04X ref=%u m=%02X wm=%02X ops=%04X/%04X/%04X",
-                g_pg.draw_mode, num_verts, use_vsh, g_pg.vsh.inputs_read,
+                g_pg.stats.frames, g_pg.draw_mode, num_verts, use_vsh, g_pg.vsh.inputs_read,
                 g_pg.surf_color_offset, g_pg.surf_zeta_offset, g_pg.surf_format,
                 g_pg.vp_offset[0], g_pg.vp_offset[1], g_pg.vp_scale[0], g_pg.vp_scale[1],
                 g_pg.blend_enable, g_pg.blend_sfactor, g_pg.blend_dfactor,
@@ -2646,6 +2828,23 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
                 g_pg.stencil_test, g_pg.stencil_func, g_pg.stencil_ref,
                 g_pg.stencil_func_mask, g_pg.stencil_mask, g_pg.stencil_op_fail,
                 g_pg.stencil_op_zfail, g_pg.stencil_op_zpass);
+        fprintf(stderr, " clip=%g..%g ctl0=%08X shf=%u prog=%05X ctl=%X",
+                u2f(g_pg.clip_min), u2f(g_pg.clip_max), g_pg.control0,
+                g_pg.psh.shadow_func, g_pg.psh.stage_program, g_pg.psh.control);
+        fprintf(stderr, " d3=%u/%u iv3=(%.2f,%.2f,%.2f,%.2f) d4=%u/%u",
+                g_pg.vattr[3].format, g_pg.vattr[3].count,
+                g_pg.inline_value[3][0], g_pg.inline_value[3][1],
+                g_pg.inline_value[3][2], g_pg.inline_value[3][3],
+                g_pg.vattr[4].format, g_pg.vattr[4].count);
+        if (g_pg.vattr[3].count && num_verts > 0) {
+            const uint8_t *q = base + byte_offset[3];
+            fprintf(stderr, " raw3=%02X%02X%02X%02X", q[0], q[1], q[2], q[3]);
+        }
+        for (int s = 0; s < 4; s++) {
+            if (g_pg.tex[s].enabled)
+                fprintf(stderr, " a%d=%X f%d=%X b%d=%08X c0_%d=%08X", s, g_pg.tex[s].address, s,
+                        g_pg.tex[s].filter, s, g_pg.tex[s].border_color, s, g_pg.tex[s].control0);
+        }
         for (int s = 0; s < 4; s++) {
             if (g_pg.tex[s].enabled)
                 fprintf(stderr, " t%d=0x%08X/%02X/%ux%u", s, g_pg.tex[s].offset,
@@ -2663,6 +2862,10 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
      * off: NV2A's front-face convention against this backend's y-down clip
      * mapping is unverified, and drawing a back face is only overdraw. */
     apply_raster_state(dev);
+    /* NV2A clamps depth rather than clipping to it (xemu's zvalue clamp
+     * with depth_clipping off). Clipping cut holes in close-up models whose
+     * vertices leave the depth range. */
+    d3d8_states_set_depth_clip(FALSE);
     dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
     dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
     /* The title's own blend state. Forcing SRCALPHA/INVSRCALPHA on for every

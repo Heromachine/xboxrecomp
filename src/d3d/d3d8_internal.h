@@ -154,6 +154,13 @@ void    d3d8_states_shutdown(void);
 
 /* Apply current D3D8 render states as D3D11 state objects */
 void    d3d8_states_apply(void);
+/* Clip primitives against the depth range (D3D's rule, the default) or
+ * clamp their depth instead. NV2A clamps unless ZCLAMP_EN says cull, and the
+ * PGRAPH translator turns clipping off for its draws. */
+void    d3d8_states_set_depth_clip(BOOL enable);
+/* Honour the scissor rectangle bound with RSSetScissorRects (off by
+ * default; the PGRAPH translator scissors to NV2A's surface clip). */
+void    d3d8_states_set_scissor(BOOL enable);
 
 /* Create sampler state from TSS and apply to slot */
 void    d3d8_states_apply_sampler(DWORD stage);

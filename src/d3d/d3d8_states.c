@@ -25,6 +25,20 @@ static ID3D11SamplerState      *g_sampler_states[4] = { NULL, NULL, NULL, NULL }
 
 /* Non-zero once the matching object was built from a description the update
  * functions keep; reset to force a rebuild. */
+static BOOL g_depth_clip = TRUE;
+
+void d3d8_states_set_depth_clip(BOOL enable)
+{
+    g_depth_clip = enable;
+}
+
+static BOOL g_scissor = FALSE;
+
+void d3d8_states_set_scissor(BOOL enable)
+{
+    g_scissor = enable;
+}
+
 static DWORD g_last_blend_hash = 0;
 static DWORD g_last_ds_hash = 0;
 static DWORD g_last_raster_hash = 0;
@@ -202,8 +216,8 @@ static void update_rasterizer_state(const DWORD *rs)
     }
 
     rd.FrontCounterClockwise = FALSE;
-    rd.DepthClipEnable = TRUE;
-    rd.ScissorEnable = FALSE;
+    rd.DepthClipEnable = g_depth_clip;
+    rd.ScissorEnable = g_scissor;
     rd.MultisampleEnable = FALSE;
     rd.AntialiasedLineEnable = FALSE;
 
