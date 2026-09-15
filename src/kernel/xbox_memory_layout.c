@@ -1180,6 +1180,19 @@ uint32_t xbox_AllocThreadStack(void)
     return XBOX_WORKER_STACK_TOP(slot + 1);
 }
 
+/* Give back the two slices xbox_AllocThreadStack claimed for stack_top. The
+ * slices were never freed before: Breakdown starts a short-lived loader thread
+ * on every area load, and after about a dozen the pool ran dry, the next
+ * worker ran inline on the loading thread and loading hung. */
+void xbox_FreeThreadStack(uint32_t stack_top)
+{
+    if (stack_top < XBOX_WORKER_STACK_BASE || stack_top >= XBOX_WORKER_STACK_END)
+        return;
+    int upper = (int)((stack_top + 16 - XBOX_WORKER_STACK_BASE) / XBOX_WORKER_STACK_SIZE) - 1;
+    xbox_worker_stack_free(upper);
+    xbox_worker_stack_free(upper - 1);
+}
+
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;

@@ -434,6 +434,7 @@ HANDLE xbox_GetMappingHandle(void);
 /* Carve a simulated stack for a spawned thread. Returns the Xbox VA of the
  * stack top, or 0 when the pool is exhausted. */
 uint32_t xbox_AllocThreadStack(void);
+void     xbox_FreeThreadStack(uint32_t stack_top);  /* on thread exit */
 
 /* Worker stack slices (see XBOX_WORKER_STACK_*): every guest stack except the
  * main thread's comes from this one table. Thread-safe. */

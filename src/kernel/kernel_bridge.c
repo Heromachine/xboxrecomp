@@ -447,6 +447,18 @@ static RECOMP_TLS int g_is_spawned_thread = 0;
  * -1 on the main thread and on any thread with no object. */
 static RECOMP_TLS int g_thread_obj_slot = -1;
 
+/* Top of the stack slices a spawned thread runs on, 0 elsewhere. Given back
+ * when the thread exits by either route. */
+static RECOMP_TLS uint32_t g_thread_stack_top = 0;
+
+static void bridge_release_thread_stack(void)
+{
+    if (g_thread_stack_top) {
+        xbox_FreeThreadStack(g_thread_stack_top);
+        g_thread_stack_top = 0;
+    }
+}
+
 struct bridge_thread_start {
     recomp_func_t fn;
     uint32_t ctx1, ctx2, stack_top;
@@ -482,6 +494,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
      * fake-TIB state mid-execution. */
     g_is_spawned_thread = 1;
     g_esp = s->stack_top;
+    g_thread_stack_top = s->stack_top;
     g_thread_obj_slot = s->obj_slot;
     xbox_init_fake_tib();
     free(s);
@@ -495,6 +508,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
     fflush(stderr);
+    bridge_release_thread_stack();
     return 0;
 }
 
@@ -1471,6 +1485,8 @@ static void bridge_PsTerminateSystemThread(void)
      * back to main() is how the process shuts down cleanly.
      */
     if (g_is_spawned_thread) {
+        /* Nothing runs on the guest stack past this point. */
+        bridge_release_thread_stack();
         ExitThread(exit_status);
     }
 }
