@@ -2853,8 +2853,15 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
         fprintf(stderr, " clip=%g..%g ctl0=%08X shf=%u prog=%05X ctl=%X",
                 u2f(g_pg.clip_min), u2f(g_pg.clip_max), g_pg.control0,
                 g_pg.psh.shadow_func, g_pg.psh.stage_program, g_pg.psh.control);
+        if (g_pg.psh.stage_program == 0x21 || g_pg.surf_color_offset == 0x021CA000) {
+            fprintf(stderr, " F0=%08X,%08X,%08X,%08X,%08X,%08X F1=%08X,%08X,%08X,%08X,%08X,%08X",
+                    g_pg.psh.factor0[0], g_pg.psh.factor0[1], g_pg.psh.factor0[2],
+                    g_pg.psh.factor0[3], g_pg.psh.factor0[4], g_pg.psh.factor0[5],
+                    g_pg.psh.factor1[0], g_pg.psh.factor1[1], g_pg.psh.factor1[2],
+                    g_pg.psh.factor1[3], g_pg.psh.factor1[4], g_pg.psh.factor1[5]);
+        }
         if (g_pg.vsh.inputs_read == 0x061D) {
-            static const int regs[] = { 96, 101, 106, 108, 109, 130, 131, 146, 147, 158, 159 };
+            static const int regs[] = { 96, 101, 106, 108, 109, 130, 131, 134, 135, 138, 139, 142, 143, 146, 147, 150, 151, 154, 155, 158, 159 };
             for (unsigned r = 0; r < sizeof(regs) / sizeof(regs[0]); r++) {
                 const float *cc = d3d8_vsh_get_constant(regs[r]);
                 fprintf(stderr, " c%d=(%.3g,%.3g,%.3g,%.3g)", regs[r], cc[0], cc[1], cc[2], cc[3]);
@@ -3174,6 +3181,9 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         return 0;
 
     g_pg.stats.methods_handled++;
+    if (((method >= 0x1500 && method < 0x1700) || (method >= 0x1880 && method < 0x1B00)) &&
+        surftrace_on())
+        fprintf(stderr, "[SURF] M %04X = %08X\n", method, param);
 
     switch (method) {
 
