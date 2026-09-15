@@ -421,6 +421,19 @@ static struct {
     int initialized;
 } g_pg;
 
+/* Recently built vertex programs and their d3d8_vsh handles (see the rebuild
+ * in the draw path). d3d8_vsh has 128 slots; this keeps at most 64 live. */
+#define VSH_PROG_CACHE_SIZE 64
+typedef struct {
+    uint32_t program[NV2A_VS_MAX_INSTRUCTIONS][4];
+    int      length;
+    uint32_t handle;       /* 0 = empty */
+    uint16_t inputs_read;
+    uint64_t last_used;
+} VshProgCacheEntry;
+static VshProgCacheEntry g_vsh_prog_cache[VSH_PROG_CACHE_SIZE];
+static uint64_t g_vsh_prog_tick;
+
 /* ══════════════════════════════════════════════════════════════════════
  * Float/uint32 conversion
  * ══════════════════════════════════════════════════════════════════════ */
@@ -2718,38 +2731,61 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
         }
 
         if (need_rebuild) {
-            DWORD new_handle = 0;
-            if (SUCCEEDED(d3d8_vsh_create_shader((const DWORD *)g_pg.vsh.program_data,
-                                                  g_pg.vsh.program_length, &new_handle))) {
-                /* Parse independently (cheap vs. the D3DCompile this also
-                 * triggers lazily on first use) just to learn which v#
-                 * registers the program reads, so the vertex buffer below
-                 * is packed to match -- d3d8_vsh.h exposes the program
-                 * struct/parser publicly for exactly this. */
-                NV2AVshProgram parsed;
-                d3d8_vsh_parse((const DWORD *)g_pg.vsh.program_data,
-                                g_pg.vsh.program_length, &parsed);
+            /* Recent programs keep their handles. A level can alternate two
+             * programs on every draw (hon_under's second area swaps a
+             * 0x065F-input and a 0x0047-input program), and with one handle
+             * each switch re-parsed, re-translated and logged the program:
+             * 350,000 rebuilds in 12 minutes of play, the frame rate halved
+             * and the DirectSound thread starved into audio dropouts. */
+            VshProgCacheEntry *hit = NULL, *victim = &g_vsh_prog_cache[0];
+            int n = g_pg.vsh.program_length;
+            size_t bytes = (size_t)n * sizeof(g_pg.vsh.program_data[0]);
+
+            g_vsh_prog_tick++;
+            for (int i = 0; i < VSH_PROG_CACHE_SIZE; i++) {
+                VshProgCacheEntry *e = &g_vsh_prog_cache[i];
+                if (e->handle && e->length == n &&
+                    memcmp(e->program, g_pg.vsh.program_data, bytes) == 0) {
+                    hit = e;
+                    break;
+                }
+                if (!e->handle || (victim->handle && e->last_used < victim->last_used))
+                    victim = e;
+            }
+
+            if (!hit) {
+                DWORD new_handle = 0;
+                if (SUCCEEDED(d3d8_vsh_create_shader((const DWORD *)g_pg.vsh.program_data,
+                                                      n, &new_handle))) {
+                    /* Parse independently (cheap vs. the D3DCompile this also
+                     * triggers lazily on first use) just to learn which v#
+                     * registers the program reads, so the vertex buffer below
+                     * is packed to match. */
+                    NV2AVshProgram parsed;
+                    d3d8_vsh_parse((const DWORD *)g_pg.vsh.program_data, n, &parsed);
+                    if (victim->handle)
+                        d3d8_vsh_delete_shader(victim->handle);
+                    memcpy(victim->program, g_pg.vsh.program_data, bytes);
+                    victim->length = n;
+                    victim->handle = new_handle;
+                    victim->inputs_read = parsed.inputs_read;
+                    hit = victim;
+                    g_pg.stats.vsh_rebuilds++;
+                    fprintf(stderr, "[PGRAPH-D3D11] VSH: rebuilt shader handle=0x%lX "
+                            "(%d insns, inputs=0x%04X)\n",
+                            (unsigned long)new_handle, n, (unsigned)parsed.inputs_read);
+                } else {
+                    fprintf(stderr, "[PGRAPH-D3D11] VSH: d3d8_vsh_create_shader failed "
+                            "(%d insns); falling back to fixed-function this draw\n", n);
+                }
+            }
+            if (hit) {
+                hit->last_used = g_vsh_prog_tick;
                 memcpy(g_pg.vsh.program_shadow, g_pg.vsh.program_data,
                        sizeof(g_pg.vsh.program_data));
-                g_pg.vsh.program_shadow_length = g_pg.vsh.program_length;
-                g_pg.stats.vsh_rebuilds++;
-                fprintf(stderr, "[PGRAPH-D3D11] VSH: rebuilt shader handle=0x%lX "
-                        "(%d insns, inputs=0x%04X)\n",
-                        (unsigned long)new_handle, g_pg.vsh.program_length,
-                        (unsigned)parsed.inputs_read);
-                /* Delete the OLD handle only now that the new one exists --
-                 * keeps steady-state slot usage at 1 out of the 128 d3d8_vsh
-                 * provides. Without this, a title whose microcode really
-                 * does change every few draws would still churn through
-                 * slots one-for-one even with the shadow-compare above. */
-                if (g_pg.vsh.shader_handle)
-                    d3d8_vsh_delete_shader(g_pg.vsh.shader_handle);
-                g_pg.vsh.shader_handle = new_handle;
-                g_pg.vsh.inputs_read = parsed.inputs_read;
-            } else {
-                fprintf(stderr, "[PGRAPH-D3D11] VSH: d3d8_vsh_create_shader failed "
-                        "(%d insns); falling back to fixed-function this draw\n",
-                        g_pg.vsh.program_length);
+                g_pg.vsh.program_shadow_length = n;
+                g_pg.vsh.shader_handle = hit->handle;
+                g_pg.vsh.inputs_read = hit->inputs_read;
             }
         }
         use_vsh = (g_pg.vsh.shader_handle != 0);
