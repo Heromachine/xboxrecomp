@@ -23,7 +23,8 @@ static ID3D11DepthStencilState *g_ds_state = NULL;
 static ID3D11RasterizerState   *g_raster_state = NULL;
 static ID3D11SamplerState      *g_sampler_states[4] = { NULL, NULL, NULL, NULL };
 
-/* Last known render state hash for dirty detection */
+/* Non-zero once the matching object was built from a description the update
+ * functions keep; reset to force a rebuild. */
 static DWORD g_last_blend_hash = 0;
 static DWORD g_last_ds_hash = 0;
 static DWORD g_last_raster_hash = 0;
@@ -47,6 +48,17 @@ static D3D11_BLEND d3d8_to_d3d11_blend(DWORD d3d8blend)
     case D3DBLEND_INVDESTCOLOR: return D3D11_BLEND_INV_DEST_COLOR;
     case D3DBLEND_SRCALPHASAT:  return D3D11_BLEND_SRC_ALPHA_SAT;
     default:                    return D3D11_BLEND_ONE;
+    }
+}
+
+static D3D11_BLEND blend_factor_for_alpha(D3D11_BLEND b)
+{
+    switch (b) {
+    case D3D11_BLEND_SRC_COLOR:      return D3D11_BLEND_SRC_ALPHA;
+    case D3D11_BLEND_INV_SRC_COLOR:  return D3D11_BLEND_INV_SRC_ALPHA;
+    case D3D11_BLEND_DEST_COLOR:     return D3D11_BLEND_DEST_ALPHA;
+    case D3D11_BLEND_INV_DEST_COLOR: return D3D11_BLEND_INV_DEST_ALPHA;
+    default:                         return b;
     }
 }
 
@@ -92,60 +104,41 @@ static D3D11_BLEND_OP d3d8_to_d3d11_blendop(DWORD op)
     }
 }
 
-/* Simple hash of relevant render state values for dirty detection */
-static DWORD hash_blend_states(const DWORD *rs)
-{
-    return rs[D3DRS_ALPHABLENDENABLE] ^
-           (rs[D3DRS_SRCBLEND] << 4) ^
-           (rs[D3DRS_DESTBLEND] << 8) ^
-           (rs[D3DRS_BLENDOP] << 12) ^
-           (rs[D3DRS_COLORWRITEENABLE] << 16);
-}
-
-static DWORD hash_ds_states(const DWORD *rs)
-{
-    return rs[D3DRS_ZENABLE] ^
-           (rs[D3DRS_ZWRITEENABLE] << 2) ^
-           (rs[D3DRS_ZFUNC] << 4) ^
-           (rs[D3DRS_STENCILENABLE] << 8) ^
-           (rs[D3DRS_STENCILFUNC] << 10) ^
-           (rs[D3DRS_STENCILREF] << 14) ^
-           (rs[D3DRS_STENCILMASK] << 18);
-}
-
-static DWORD hash_raster_states(const DWORD *rs)
-{
-    return rs[D3DRS_CULLMODE] ^
-           (rs[D3DRS_FILLMODE] << 4);
-}
-
 /* ================================================================
  * State object creation
  * ================================================================ */
 
 static void update_blend_state(const DWORD *rs)
 {
-    DWORD hash = hash_blend_states(rs);
+    static D3D11_BLEND_DESC last;
     D3D11_BLEND_DESC bd;
     HRESULT hr;
-
-    if (hash == g_last_blend_hash && g_blend_state) return;
-    g_last_blend_hash = hash;
-
-    if (g_blend_state) {
-        ID3D11BlendState_Release(g_blend_state);
-        g_blend_state = NULL;
-    }
 
     memset(&bd, 0, sizeof(bd));
     bd.RenderTarget[0].BlendEnable = rs[D3DRS_ALPHABLENDENABLE] ? TRUE : FALSE;
     bd.RenderTarget[0].SrcBlend = d3d8_to_d3d11_blend(rs[D3DRS_SRCBLEND]);
     bd.RenderTarget[0].DestBlend = d3d8_to_d3d11_blend(rs[D3DRS_DESTBLEND]);
     bd.RenderTarget[0].BlendOp = d3d8_to_d3d11_blendop(rs[D3DRS_BLENDOP] ? rs[D3DRS_BLENDOP] : 1);
-    bd.RenderTarget[0].SrcBlendAlpha = bd.RenderTarget[0].SrcBlend;
-    bd.RenderTarget[0].DestBlendAlpha = bd.RenderTarget[0].DestBlend;
+    /* D3D11 rejects *_COLOR factors for the alpha channel (CreateBlendState
+     * fails, and the draw then goes out with no blending at all); the alpha
+     * channel of a colour factor is the matching alpha factor. */
+    bd.RenderTarget[0].SrcBlendAlpha = blend_factor_for_alpha(bd.RenderTarget[0].SrcBlend);
+    bd.RenderTarget[0].DestBlendAlpha = blend_factor_for_alpha(bd.RenderTarget[0].DestBlend);
     bd.RenderTarget[0].BlendOpAlpha = bd.RenderTarget[0].BlendOp;
     bd.RenderTarget[0].RenderTargetWriteMask = (UINT8)(rs[D3DRS_COLORWRITEENABLE] & 0x0F);
+
+    /* Compare the whole description rather than a hash of the inputs: the
+     * XOR-of-shifts hash this used collided (a stencil or write-mask change
+     * could leave the old object bound), and a missed rebuild is a wrong
+     * picture, not a slow one. */
+    if (g_blend_state && g_last_blend_hash && !memcmp(&bd, &last, sizeof(bd)))
+        return;
+    if (g_blend_state) {
+        ID3D11BlendState_Release(g_blend_state);
+        g_blend_state = NULL;
+    }
+    last = bd;
+    g_last_blend_hash = 1;
 
     hr = ID3D11Device_CreateBlendState(d3d8_GetD3D11Device(), &bd, &g_blend_state);
     if (FAILED(hr))
@@ -154,17 +147,9 @@ static void update_blend_state(const DWORD *rs)
 
 static void update_depth_stencil_state(const DWORD *rs)
 {
-    DWORD hash = hash_ds_states(rs);
+    static D3D11_DEPTH_STENCIL_DESC last;
     D3D11_DEPTH_STENCIL_DESC dsd;
     HRESULT hr;
-
-    if (hash == g_last_ds_hash && g_ds_state) return;
-    g_last_ds_hash = hash;
-
-    if (g_ds_state) {
-        ID3D11DepthStencilState_Release(g_ds_state);
-        g_ds_state = NULL;
-    }
 
     memset(&dsd, 0, sizeof(dsd));
     dsd.DepthEnable = rs[D3DRS_ZENABLE] ? TRUE : FALSE;
@@ -181,6 +166,15 @@ static void update_depth_stencil_state(const DWORD *rs)
     dsd.FrontFace.StencilPassOp = d3d8_to_d3d11_stencilop(rs[D3DRS_STENCILPASS]);
     dsd.BackFace = dsd.FrontFace;
 
+    if (g_ds_state && g_last_ds_hash && !memcmp(&dsd, &last, sizeof(dsd)))
+        return;
+    if (g_ds_state) {
+        ID3D11DepthStencilState_Release(g_ds_state);
+        g_ds_state = NULL;
+    }
+    last = dsd;
+    g_last_ds_hash = 1;
+
     hr = ID3D11Device_CreateDepthStencilState(d3d8_GetD3D11Device(), &dsd, &g_ds_state);
     if (FAILED(hr))
         fprintf(stderr, "D3D8: CreateDepthStencilState failed: 0x%08lX\n", hr);
@@ -188,17 +182,9 @@ static void update_depth_stencil_state(const DWORD *rs)
 
 static void update_rasterizer_state(const DWORD *rs)
 {
-    DWORD hash = hash_raster_states(rs);
+    static D3D11_RASTERIZER_DESC last;
     D3D11_RASTERIZER_DESC rd;
     HRESULT hr;
-
-    if (hash == g_last_raster_hash && g_raster_state) return;
-    g_last_raster_hash = hash;
-
-    if (g_raster_state) {
-        ID3D11RasterizerState_Release(g_raster_state);
-        g_raster_state = NULL;
-    }
 
     memset(&rd, 0, sizeof(rd));
 
@@ -220,6 +206,15 @@ static void update_rasterizer_state(const DWORD *rs)
     rd.ScissorEnable = FALSE;
     rd.MultisampleEnable = FALSE;
     rd.AntialiasedLineEnable = FALSE;
+
+    if (g_raster_state && g_last_raster_hash && !memcmp(&rd, &last, sizeof(rd)))
+        return;
+    if (g_raster_state) {
+        ID3D11RasterizerState_Release(g_raster_state);
+        g_raster_state = NULL;
+    }
+    last = rd;
+    g_last_raster_hash = 1;
 
     hr = ID3D11Device_CreateRasterizerState(d3d8_GetD3D11Device(), &rd, &g_raster_state);
     if (FAILED(hr))

@@ -898,6 +898,8 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "\n"
         "cbuffer VSH_Constants : register(b1) {\n"
         "    float4 c[%d];\n"
+        "    float4 nv2aSurface;\n"
+        "    float4 nv2aFog;\n"
         "};\n"
         "\n", NV2A_VS_MAX_CONSTANTS);
 
@@ -949,18 +951,21 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
 
     /* Output register variables */
     sb_append(&sb,
-        "    /* Output registers (initialized to zero) */\n"
+        /* (0,0,0,1) for every output, as xemu's vsh.c. A texture
+         * coordinate the program never writes a w for must still divide by
+         * 1: the pixel stage samples projectively (xy / w). */
+        "    /* Output registers */\n"
         "    float4 oPos = float4(0,0,0,1);\n"
         "    float4 oD0  = float4(0,0,0,1);\n"
         "    float4 oD1  = float4(0,0,0,1);\n"
-        "    float4 oFog = float4(0,0,0,0);\n"
-        "    float4 oPts = float4(0,0,0,0);\n"
-        "    float4 oB0  = float4(0,0,0,0);\n"
-        "    float4 oB1  = float4(0,0,0,0);\n"
-        "    float4 oT0  = float4(0,0,0,0);\n"
-        "    float4 oT1  = float4(0,0,0,0);\n"
-        "    float4 oT2  = float4(0,0,0,0);\n"
-        "    float4 oT3  = float4(0,0,0,0);\n"
+        "    float4 oFog = float4(0,0,0,1);\n"
+        "    float4 oPts = float4(0,0,0,1);\n"
+        "    float4 oB0  = float4(0,0,0,1);\n"
+        "    float4 oB1  = float4(0,0,0,1);\n"
+        "    float4 oT0  = float4(0,0,0,1);\n"
+        "    float4 oT1  = float4(0,0,0,1);\n"
+        "    float4 oT2  = float4(0,0,0,1);\n"
+        "    float4 oT3  = float4(0,0,0,1);\n"
         "\n");
 
     /* R12 is aliased to oPos on NV2A */
@@ -1005,11 +1010,20 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
      * early draw divides by nothing rather than by zero. */
     if (program->uses_viewport_ctx) {
         sb_append(&sb,
-            "    /* Undo NV2A's viewport bake-in -> D3D11 clip space */\n"
-            "    if (c[%d].x != 0.0 && c[%d].y != 0.0) {\n"
+            "    /* NV2A pixel space -> D3D11 clip space. With the render target's\n"
+            "     * size known this is xemu's mapping, (2*xy - size) / size with y\n"
+            "     * pointing down; a viewport smaller than the target (a bloom pass\n"
+            "     * drawing 128x64 into a larger surface) then lands where the title\n"
+            "     * put it. Without it, undo c[VPSCL]/c[VPOFF] as before. */\n"
+            "    if (nv2aSurface.x > 0.0 && nv2aSurface.y > 0.0) {\n"
+            "        oPos.xy = float2((2.0 * oPos.x - nv2aSurface.x) / nv2aSurface.x,\n"
+            "                         (nv2aSurface.y - 2.0 * oPos.y) / nv2aSurface.y);\n"
+            "    } else if (c[%d].x != 0.0 && c[%d].y != 0.0) {\n"
             "        oPos.xy = (oPos.xy - c[%d].xy) / c[%d].xy;\n"
             "    }\n"
-            "    if (c[%d].z != 0.0) {\n"
+            "    if (nv2aSurface.z > 0.0) {\n"
+            "        oPos.z = oPos.z / nv2aSurface.z;\n"
+            "    } else if (c[%d].z != 0.0) {\n"
             "        oPos.z = oPos.z / c[%d].z;\n"
             "    }\n"
             /* Undo the program's divide by w and keep w, as xemu's vsh-prog.c
@@ -1022,6 +1036,27 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
             NV2A_VS_VPSCL_REG, NV2A_VS_VPSCL_REG, NV2A_VS_VPOFF_REG, NV2A_VS_VPSCL_REG,
             NV2A_VS_VPSCL_REG, NV2A_VS_VPSCL_REG);
     }
+
+    /* Fog factor, as xemu's vsh.c computes it after the program. Without
+     * this, a program that never writes oFog left the fog register at 0 --
+     * full fog -- and any combiner that mixes by fog drew the fog colour. */
+    sb_append(&sb,
+        "    if (nv2aFog.x == 0.0) {\n"
+        "        oFog = float4(1.0, 1.0, 1.0, 1.0);\n"
+        "    } else {\n"
+        "        float fogDistance = oFog.x;\n"
+        "        int fogMode = (int)nv2aFog.y;\n"
+        "        float fogFactor;\n"
+        "        if (fogMode == 0 || fogMode == 4) {\n"
+        "            fogFactor = nv2aFog.z + fogDistance * nv2aFog.w - 1.0;\n"
+        "        } else if (fogMode == 1 || fogMode == 5) {\n"
+        "            fogFactor = nv2aFog.z + pow(2.0, fogDistance * nv2aFog.w * 16.0) - 1.5;\n"
+        "        } else {\n"
+        "            fogFactor = nv2aFog.z + pow(2.0, -fogDistance * fogDistance * nv2aFog.w * nv2aFog.w * 32.0) - 1.5;\n"
+        "        }\n"
+        "        if (fogMode >= 4) fogFactor = abs(fogFactor);\n"
+        "        oFog = (float4)fogFactor;\n"
+        "    }\n\n");
 
     /* Populate output structure */
     sb_append(&sb,
@@ -1446,6 +1481,27 @@ HRESULT d3d8_vsh_delete_shader(DWORD handle)
     }
 
     return S_OK;
+}
+
+void d3d8_vsh_set_surface(float width, float height, float zmax)
+{
+    if (g_vsh_constants.surface[0] == width &&
+        g_vsh_constants.surface[1] == height &&
+        g_vsh_constants.surface[2] == zmax)
+        return;
+    g_vsh_constants.surface[0] = width;
+    g_vsh_constants.surface[1] = height;
+    g_vsh_constants.surface[2] = zmax;
+    g_vsh_constants_dirty = TRUE;
+}
+
+void d3d8_vsh_set_fog(int enable, int mode, float param0, float param1)
+{
+    float f[4] = { enable ? 1.0f : 0.0f, (float)mode, param0, param1 };
+    if (memcmp(g_vsh_constants.fog, f, sizeof(f)) == 0)
+        return;
+    memcpy(g_vsh_constants.fog, f, sizeof(f));
+    g_vsh_constants_dirty = TRUE;
 }
 
 void d3d8_vsh_set_constant(int start_reg, const float *data, int count)

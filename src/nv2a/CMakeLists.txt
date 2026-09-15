@@ -10,6 +10,8 @@ add_library(xbox_nv2a STATIC
     nv2a_pgraph_d3d11.c
     nv2a_texconv.c
     nv2a_vtxarray.c
+    nv2a_surface.c
+    nv2a_psh.c
     nv2a_pb_replay.c
     nv2a_mmio_hook.c
     nv2a_pb_test.c

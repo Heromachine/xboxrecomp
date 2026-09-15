@@ -439,6 +439,9 @@ typedef struct NV2AVshSlot {
 
 typedef struct NV2AVSConstants {
     float c[NV2A_VS_MAX_CONSTANTS][4];  /* 192 float4 constants */
+    float surface[4];  /* bound render target width, height, depth range
+                        * (0 when unknown); see d3d8_vsh_set_surface() */
+    float fog[4];      /* enable, mode, param0, param1; see d3d8_vsh_set_fog() */
 } NV2AVSConstants;
 
 /* ================================================================
@@ -488,6 +491,24 @@ HRESULT d3d8_vsh_delete_shader(DWORD handle);
  * @param count      Number of float4 registers to set
  */
 void d3d8_vsh_set_constant(int start_reg, const float *data, int count);
+
+/**
+ * Tell the epilogue the size of the render target being drawn into.
+ *
+ * A compiled NV2A vertex program leaves oPos in the target's pixel space;
+ * mapping that to clip space needs the target's size, as xemu's vsh-prog.c
+ * does with its surfaceSize uniform. zmax is the depth that maps to 1.0
+ * (SET_CLIP_MAX). A width of 0 falls back to undoing c[VPSCL]/c[VPOFF].
+ */
+void d3d8_vsh_set_surface(float width, float height, float zmax);
+
+/**
+ * Fog as NV2A computes it after the vertex program (xemu vsh.c): with fog
+ * off the fog output is 1 (no fog); with it on, the program's oFog.x is a
+ * distance turned into a factor by `mode` (NV_PGRAPH_CONTROL_3_FOG_MODE: 0
+ * linear, 1 exp, 3 exp2, 4/5/7 their abs forms) and SET_FOG_PARAMS[0..1].
+ */
+void d3d8_vsh_set_fog(int enable, int mode, float param0, float param1);
 
 /**
  * Check if a shader handle refers to a programmable vertex shader

@@ -31,7 +31,10 @@
                           * buffer puller uses, not a second copy of it. */
 #include "nv2a_texconv.h"  /* S3TC and palettised texture decode */
 #include "nv2a_vtxarray.h" /* ARRAY_ELEMENT / DRAW_ARRAYS vertex gather */
+#include "nv2a_surface.h"  /* render-target sizing and texture lookup */
+#include "nv2a_psh.h"      /* register combiners -> HLSL */
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
 #include <malloc.h>
@@ -50,6 +53,7 @@ extern IDirect3DDevice8 *xbox_GetD3DDevice(void);
  * the section below: every ID3D11*_* call failed as an implicit-declaration
  * error until the order was fixed here, not there). */
 #include "../d3d/d3d8_internal.h"
+#include <d3d11_1.h>       /* ID3D11DeviceContext1::ClearView, for clear rects */
 #include <d3dcompiler.h>
 #pragma comment(lib, "d3dcompiler.lib")
 
@@ -243,6 +247,13 @@ static struct {
      * this is now a real, live candidate for why theirs read as blank. */
     uint32_t current_diffuse;
 
+    /* The value a vertex attribute takes when it is not in the vertex
+     * stream (count 0): SET_VERTEX_DATA* / SET_DIFFUSE_COLOR4UB, as xemu's
+     * VertexAttribute.inline_value. Breakdown sets its full-screen passes'
+     * diffuse with SET_VERTEX_DATA4UB; ignored, those passes multiplied by
+     * black. */
+    float inline_value[16][4];
+
     /* Clear state */
     uint32_t clear_color;
     uint32_t clear_rect_h;  /* (width << 16) | x */
@@ -256,6 +267,38 @@ static struct {
     int cull_enable;
     int alpha_test;
     uint32_t color_mask;
+    uint32_t depth_func;     /* GL compare enum (0x0200 NEVER .. 0x0207 ALWAYS) */
+    int depth_mask;          /* depth write enable */
+    int stencil_test;
+    uint32_t stencil_mask;   /* write mask */
+    uint32_t stencil_func;   /* GL compare enum */
+    uint32_t stencil_ref;
+    uint32_t stencil_func_mask;
+    uint32_t stencil_op_fail, stencil_op_zfail, stencil_op_zpass;
+    uint32_t control0;       /* stencil write enable, Z format */
+    uint32_t clip_min, clip_max; /* depth range bits, as float bit patterns */
+
+    /* Render target selection (SET_SURFACE_*). Offsets are guest-RAM
+     * addresses under the same zero-based DMA convention as textures. */
+    uint32_t surf_color_offset;
+    uint32_t surf_zeta_offset;
+    uint32_t surf_format;
+    uint32_t surf_pitch;
+    uint32_t zstencil_clear;     /* SET_ZSTENCIL_CLEAR_VALUE */
+    int fog_enable, fog_mode;    /* mode as NV_PGRAPH_CONTROL_3_FOG_MODE */
+    float fog_param[2];          /* SET_FOG_PARAMS 0-1 */
+    uint32_t blend_equation;     /* GL enum */
+
+    /* Register combiners and the pixel-stage registers xemu's psh.c reads,
+     * stored raw -- nv2a_psh.c decodes them. */
+    struct {
+        uint32_t alpha_icw[8], alpha_ocw[8], color_icw[8], color_ocw[8];
+        uint32_t factor0[8], factor1[8];
+        uint32_t specfog_cw0, specfog_cw1, specfog_factor[2];
+        uint32_t control, stage_program, other_stage_input, clip_plane_mode;
+        uint32_t shadow_func, alpha_func, alpha_ref, fog_color;
+        float bump_mat[4][4], bump_scale[4], bump_offset[4];
+    } psh;
 
     /* Viewport */
     float vp_offset[4];
@@ -386,6 +429,30 @@ static float u2f(uint32_t u) {
     return x.f;
 }
 
+/* XBOXRECOMP_SURFTRACE=<frame>: log every render-target switch, clear and
+ * draw of that one frame, in order. Off unless set. */
+static int surftrace_on(void)
+{
+    static long want = -2;
+    if (want == -2) {
+        const char *e = getenv("XBOXRECOMP_SURFTRACE");
+        want = e ? strtol(e, NULL, 0) : -1;
+    }
+    return want >= 0 && (long)g_pg.stats.frames == want;
+}
+
+static void surftrace(const char *fmt, ...)
+{
+    va_list ap;
+    if (!surftrace_on())
+        return;
+    fprintf(stderr, "[SURF] ");
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * Initialization
  * ══════════════════════════════════════════════════════════════════════ */
@@ -394,10 +461,23 @@ void pgraph_d3d11_init(void)
 {
     memset(&g_pg, 0, sizeof(g_pg));
     g_pg.current_diffuse = 0xFFFFFFFF;  /* opaque white; see struct comment */
+    for (int i = 0; i < 16; i++)
+        g_pg.inline_value[i][3] = 1.0f;
+    for (int i = 0; i < 4; i++)         /* diffuse follows current_diffuse */
+        g_pg.inline_value[NV2A_VERTEX_ATTR_DIFFUSE][i] = 1.0f;
     g_pg.clear_color = 0xFF000000;
     g_pg.color_mask = 0x01010101;
     g_pg.blend_sfactor = 0x0001;        /* GL_ONE / GL_ZERO: blending a no-op */
     g_pg.blend_dfactor = 0x0000;
+    /* OpenGL's defaults, which NV2A's methods take their enums from. */
+    g_pg.depth_func = 0x0201;           /* LESS */
+    g_pg.depth_mask = 1;
+    g_pg.stencil_func = 0x0207;         /* ALWAYS */
+    g_pg.stencil_func_mask = 0xFF;
+    g_pg.stencil_mask = 0xFF;
+    g_pg.stencil_op_fail = g_pg.stencil_op_zfail = g_pg.stencil_op_zpass =
+        NV097_SET_STENCIL_OP_V_KEEP;
+    g_pg.blend_equation = NV097_SET_BLEND_EQUATION_V_FUNC_ADD;
     g_pg.initialized = 1;
 
     fprintf(stderr, "[PGRAPH-D3D11] Translator initialized\n");
@@ -678,12 +758,17 @@ static void convert_vsh_vertex(const uint8_t *src_vb, const uint32_t src_offset[
             uint32_t packed = 0;
             if (g_pg.vattr[i].count) {
                 packed = decode_diffuse_color(src_vb, src_offset, i);
-            } else if (i == NV2A_VERTEX_ATTR_DIFFUSE) {
-                packed = g_pg.current_diffuse;
+            } else {
+                const float *v = g_pg.inline_value[i];
+                packed = ((uint32_t)(v[3] * 255.0f + 0.5f) << 24) |
+                         ((uint32_t)(v[0] * 255.0f + 0.5f) << 16) |
+                         ((uint32_t)(v[1] * 255.0f + 0.5f) << 8) |
+                          (uint32_t)(v[2] * 255.0f + 0.5f);
             }
             memcpy(dst + dst_off, &packed, 4);
         } else {
-            float f4[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            float f4[4];
+            memcpy(f4, g_pg.inline_value[i], sizeof(f4));
             decode_attr_floats(src_vb, src_offset, i, f4);
             memcpy(dst + dst_off, f4, size);
         }
@@ -1319,6 +1404,8 @@ static void tex_refresh_yuv(TexCacheEntry *entry, const TexSource *ts, int stage
     ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)entry->tex2d, 0);
 }
 
+static TexCacheEntry *resolve_surface_texture(int stage);
+
 /* Resolve (uploading/caching as needed) the texture bound to `stage`.
  * Returns NULL if the stage is disabled, or programmed with a format
  * this translator doesn't decode (see tex_describe()) -- either way the
@@ -1338,6 +1425,12 @@ static TexCacheEntry *resolve_texture_stage(int stage)
 
     if (stage < 0 || stage >= 4 || !g_pg.tex[stage].enabled)
         return NULL;
+    /* A texture at an address the title has rendered into is that
+     * rendering, not whatever guest RAM holds there (which is never written:
+     * nothing reads surfaces back). */
+    entry = resolve_surface_texture(stage);
+    if (entry)
+        return entry;
     if (tex_describe(stage, &ts) != 0)
         return NULL;
 
@@ -1410,6 +1503,774 @@ static TexCacheEntry *resolve_texture_stage(int stage)
     }
 
     return entry;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * Render targets
+ *
+ * The title picks where each pass renders with SET_SURFACE_COLOR_OFFSET and
+ * SET_SURFACE_ZETA_OFFSET: its frame, 256x128 bloom buffers, 512x512 depth-
+ * only shadow maps. Everything used to land on the one swap-chain back
+ * buffer, so a bloom pass's clear or a shadow pass erased the frame drawn
+ * before it. Following xemu (pgraph/gl/surface.c) each address gets its own
+ * texture, drawing binds the pair the title selected, a texture offset that
+ * falls inside a surface samples that surface, and the frame surface is
+ * copied to the back buffer at the flip.
+ *
+ * Two differences from xemu. A surface is never re-created smaller: the
+ * title binds the same frame address with a 480-high clip for its clear and
+ * a 464-high clip (16 rows of letterbox) for the scene, and xemu's download/
+ * upload round trip that keeps contents across that is not available here,
+ * so the texture keeps its largest size and the viewport takes the binding's.
+ * And sampling always goes through a copy, since a pass often samples the
+ * surface it is drawing into (the frame composite reads a sub-rectangle of
+ * the frame).
+ * ══════════════════════════════════════════════════════════════════════ */
+
+#define SURF_MAX 24
+typedef struct {
+    int in_use;
+    int is_color;
+    NV2ASurfDesc d;              /* address; allocated size; pitch/bpp */
+    ID3D11Texture2D *tex;
+    ID3D11RenderTargetView *rtv;
+    ID3D11DepthStencilView *dsv;
+    uint32_t write_seq;          /* bumped by every draw or clear into it */
+    uint32_t last_frame;
+} Surface;
+static Surface g_surf[SURF_MAX];
+static uint32_t g_surf_seq;
+static int g_bound_color = -1, g_bound_zeta = -1;
+static int g_present_surf = -1;   /* frame surface to show at the flip */
+
+#define SURFVIEW_MAX 16
+typedef struct {
+    int in_use;
+    int surf;
+    uint32_t x, y, w, h;
+    uint32_t copied_seq;
+    uint32_t last_frame;
+    ID3D11Texture2D *tex;
+    TexCacheEntry te;            /* what resolve_texture_stage() hands out */
+} SurfView;
+static SurfView g_surfview[SURFVIEW_MAX];
+
+static void surfview_release(SurfView *v)
+{
+    if (v->te.srv) ID3D11ShaderResourceView_Release(v->te.srv);
+    if (v->tex)    ID3D11Texture2D_Release(v->tex);
+    memset(v, 0, sizeof(*v));
+}
+
+static void surface_release(int idx)
+{
+    Surface *s = &g_surf[idx];
+    int i;
+
+    for (i = 0; i < SURFVIEW_MAX; i++)
+        if (g_surfview[i].in_use && g_surfview[i].surf == idx)
+            surfview_release(&g_surfview[i]);
+    if (s->rtv) ID3D11RenderTargetView_Release(s->rtv);
+    if (s->dsv) ID3D11DepthStencilView_Release(s->dsv);
+    if (s->tex) ID3D11Texture2D_Release(s->tex);
+    memset(s, 0, sizeof(*s));
+    if (g_bound_color == idx) g_bound_color = -1;
+    if (g_bound_zeta == idx)  g_bound_zeta = -1;
+    if (g_present_surf == idx) g_present_surf = -1;
+}
+
+/* Create the D3D11 texture and view for `s` at s->d.width x s->d.height. */
+static int surface_create_objects(Surface *s)
+{
+    ID3D11Device *dev = d3d8_GetD3D11Device();
+    D3D11_TEXTURE2D_DESC td;
+    HRESULT hr;
+
+    memset(&td, 0, sizeof(td));
+    td.Width = s->d.width;
+    td.Height = s->d.height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    if (s->is_color) {
+        /* The swap chain's format, so the frame surface copies straight to
+         * the back buffer. Channel order is the shader's business. */
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    } else {
+        /* Z16 and Z24S8 both live in D24S8; depth is normalised either way
+         * and the shadow compare rescales by the texture format's range. */
+        td.Format = DXGI_FORMAT_R24G8_TYPELESS;
+        td.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    }
+    hr = ID3D11Device_CreateTexture2D(dev, &td, NULL, &s->tex);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[PGRAPH-D3D11] SURF: CreateTexture2D %ux%u failed: 0x%08lX\n",
+                s->d.width, s->d.height, hr);
+        s->tex = NULL;
+        return -1;
+    }
+    if (s->is_color) {
+        hr = ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)s->tex,
+                                                 NULL, &s->rtv);
+    } else {
+        D3D11_DEPTH_STENCIL_VIEW_DESC dd;
+        memset(&dd, 0, sizeof(dd));
+        dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        dd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        hr = ID3D11Device_CreateDepthStencilView(dev, (ID3D11Resource *)s->tex,
+                                                 &dd, &s->dsv);
+    }
+    if (FAILED(hr)) {
+        fprintf(stderr, "[PGRAPH-D3D11] SURF: view creation failed: 0x%08lX\n", hr);
+        return -1;
+    }
+    return 0;
+}
+
+/* The surface for (addr, colour/zeta), created or grown to at least w x h. */
+static int surface_get(uint32_t addr, int is_color, uint32_t w, uint32_t h,
+                       uint32_t pitch, uint32_t bpp)
+{
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    int i, idx = -1, free_idx = -1, lru = -1;
+
+    for (i = 0; i < SURF_MAX; i++) {
+        Surface *s = &g_surf[i];
+        if (!s->in_use) {
+            if (free_idx < 0) free_idx = i;
+            continue;
+        }
+        if (s->d.addr == addr && s->is_color == is_color) {
+            idx = i;
+            break;
+        }
+        if (i != g_bound_color && i != g_bound_zeta && i != g_present_surf &&
+            (lru < 0 || s->last_frame < g_surf[lru].last_frame))
+            lru = i;
+    }
+
+    if (idx >= 0) {
+        Surface *s = &g_surf[idx];
+        s->d.pitch = pitch ? pitch : s->d.pitch;
+        s->d.bpp = bpp;
+        if (s->d.width >= w && s->d.height >= h)
+            return idx;
+
+        /* Grow, keeping what was drawn (colour only: D3D11 copies depth
+         * only whole-resource). */
+        {
+            Surface old = *s;
+            int j;
+            for (j = 0; j < SURFVIEW_MAX; j++)
+                if (g_surfview[j].in_use && g_surfview[j].surf == idx)
+                    surfview_release(&g_surfview[j]);
+            s->tex = NULL;
+            s->rtv = NULL;
+            s->dsv = NULL;
+            s->d.width = old.d.width > w ? old.d.width : w;
+            s->d.height = old.d.height > h ? old.d.height : h;
+            if (surface_create_objects(s) != 0) {
+                if (old.rtv) ID3D11RenderTargetView_Release(old.rtv);
+                if (old.dsv) ID3D11DepthStencilView_Release(old.dsv);
+                if (old.tex) ID3D11Texture2D_Release(old.tex);
+                surface_release(idx);
+                return -1;
+            }
+            if (old.is_color && old.tex && ctx) {
+                D3D11_BOX box = { 0, 0, 0, old.d.width, old.d.height, 1 };
+                ID3D11DeviceContext_CopySubresourceRegion(ctx,
+                    (ID3D11Resource *)s->tex, 0, 0, 0, 0,
+                    (ID3D11Resource *)old.tex, 0, &box);
+            }
+            if (old.rtv) ID3D11RenderTargetView_Release(old.rtv);
+            if (old.dsv) ID3D11DepthStencilView_Release(old.dsv);
+            if (old.tex) ID3D11Texture2D_Release(old.tex);
+            s->write_seq = ++g_surf_seq;
+            if (g_pg.stats.frames < 20000)
+                fprintf(stderr, "[PGRAPH-D3D11] SURF: grew %s 0x%08X to %ux%u\n",
+                        is_color ? "colour" : "zeta", addr, s->d.width, s->d.height);
+        }
+        return idx;
+    }
+
+    if (free_idx < 0) {
+        if (lru < 0)
+            return -1;
+        surface_release(lru);
+        free_idx = lru;
+    }
+    idx = free_idx;
+    {
+        Surface *s = &g_surf[idx];
+        memset(s, 0, sizeof(*s));
+        s->is_color = is_color;
+        s->d.addr = addr;
+        s->d.width = w;
+        s->d.height = h;
+        s->d.pitch = pitch;
+        s->d.bpp = bpp;
+        if (surface_create_objects(s) != 0) {
+            surface_release(idx);
+            return -1;
+        }
+        s->in_use = 1;
+        s->write_seq = ++g_surf_seq;
+        fprintf(stderr, "[PGRAPH-D3D11] SURF: new %s surface 0x%08X %ux%u (slot %d)\n",
+                is_color ? "colour" : "zeta", addr, w, h, idx);
+    }
+    return idx;
+}
+
+/* Depth-range top for the bound zeta format, the value oPos.z is divided by
+ * when SET_CLIP_MAX hasn't been written. */
+static float surface_zmax(void)
+{
+    float clip_max = u2f(g_pg.clip_max);
+    if (clip_max > 0.0f)
+        return clip_max;
+    return ((g_pg.surf_format >> 4) & 0xF) == 1 ? 65535.0f : 16777215.0f;
+}
+
+/* Bind the render targets the title selected for a draw (clearing = 0) or a
+ * CLEAR_SURFACE with `clear_flags`. Which halves are bound follows xemu's
+ * surface_update: colour when it will be written, zeta when depth or stencil
+ * is in use -- so a pass whose zeta offset names another pass's colour buffer
+ * doesn't clobber it. Returns 0 when there is nothing to draw into. */
+static int bind_targets(int clearing, uint32_t clear_flags)
+{
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    ID3D11RenderTargetView *rtv = NULL;
+    ID3D11DepthStencilView *dsv = NULL;
+    uint32_t w, h;
+    uint32_t color_fmt = g_pg.surf_format & 0xF;
+    uint32_t zeta_fmt = (g_pg.surf_format >> 4) & 0xF;
+    uint32_t cbpp = nv2a_surf_color_bpp(color_fmt);
+    uint32_t zbpp = nv2a_surf_zeta_bpp(zeta_fmt);
+    int color_write, zeta_write, ci = -1, zi = -1;
+    D3D11_VIEWPORT vp;
+
+    if (!ctx)
+        return 0;
+    nv2a_surf_dims(g_pg.surf_format, g_pg.surface_clip_h, g_pg.surface_clip_v, &w, &h);
+    if (w == 0 || h == 0 || w > 4096 || h > 4096)
+        return 0;
+
+    color_write = clearing ? (clear_flags & NV097_CLEAR_SURFACE_COLOR) != 0
+                           : (g_pg.color_mask & 0x01010101) != 0;
+    zeta_write = clearing ? (clear_flags & (NV097_CLEAR_SURFACE_Z |
+                                            NV097_CLEAR_SURFACE_STENCIL)) != 0
+                          : (g_pg.depth_test || g_pg.stencil_test);
+
+    if (color_write && cbpp)
+        ci = surface_get(g_pg.surf_color_offset, 1, w, h,
+                         g_pg.surf_pitch & 0xFFFF, cbpp);
+    if (zeta_write && zbpp)
+        zi = surface_get(g_pg.surf_zeta_offset, 0, w, h,
+                         (g_pg.surf_pitch >> 16) & 0xFFFF, zbpp);
+
+    /* D3D11 wants the depth buffer at least as large as the colour target;
+     * grow whichever is smaller so the pair matches. */
+    if (ci >= 0 && zi >= 0 &&
+        (g_surf[ci].d.width != g_surf[zi].d.width ||
+         g_surf[ci].d.height != g_surf[zi].d.height)) {
+        uint32_t mw = g_surf[ci].d.width > g_surf[zi].d.width ? g_surf[ci].d.width : g_surf[zi].d.width;
+        uint32_t mh = g_surf[ci].d.height > g_surf[zi].d.height ? g_surf[ci].d.height : g_surf[zi].d.height;
+        ci = surface_get(g_pg.surf_color_offset, 1, mw, mh, g_surf[ci].d.pitch, cbpp);
+        zi = surface_get(g_pg.surf_zeta_offset, 0, mw, mh, g_surf[zi].d.pitch, zbpp);
+    }
+
+    if (ci >= 0) {
+        rtv = g_surf[ci].rtv;
+        g_surf[ci].write_seq = ++g_surf_seq;
+        g_surf[ci].last_frame = g_pg.stats.frames;
+        /* The frame is the last full-screen-sized colour surface written. */
+        if (w == d3d8_GetBackbufferWidth())
+            g_present_surf = ci;
+    }
+    if (zi >= 0) {
+        dsv = g_surf[zi].dsv;
+        g_surf[zi].write_seq = ++g_surf_seq;
+        g_surf[zi].last_frame = g_pg.stats.frames;
+    }
+    if (!rtv && !dsv)
+        return 0;
+
+    if (ci != g_bound_color || zi != g_bound_zeta) {
+        /* Unbind pixel-stage textures first: a copy view is never a target,
+         * but D3D11 still warns about stale bindings across target changes. */
+        ID3D11ShaderResourceView *null_srv[4] = { NULL, NULL, NULL, NULL };
+        ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 4, null_srv);
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, rtv ? 1 : 0,
+                                               rtv ? &rtv : NULL, dsv);
+        g_bound_color = ci;
+        g_bound_zeta = zi;
+    }
+
+    vp.TopLeftX = 0.0f;
+    vp.TopLeftY = 0.0f;
+    vp.Width = (float)w;
+    vp.Height = (float)h;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
+    d3d8_vsh_set_surface((float)w, (float)h, surface_zmax());
+    d3d8_vsh_set_fog(g_pg.fog_enable, g_pg.fog_mode, g_pg.fog_param[0], g_pg.fog_param[1]);
+    return 1;
+}
+
+static void clear_surface(uint32_t param)
+{
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    uint32_t w, h, x0, y0, x1, y1;
+    int full;
+
+    if (!bind_targets(1, param))
+        return;
+    nv2a_surf_dims(g_pg.surf_format, g_pg.surface_clip_h, g_pg.surface_clip_v, &w, &h);
+    if (!nv2a_surf_clear_rect(g_pg.clear_rect_h, g_pg.clear_rect_v, w, h,
+                              &x0, &y0, &x1, &y1))
+        return;
+    full = x0 == 0 && y0 == 0 && x1 >= w && y1 >= h;
+
+    if ((param & NV097_CLEAR_SURFACE_COLOR) && g_bound_color >= 0) {
+        Surface *s = &g_surf[g_bound_color];
+        uint32_t c = g_pg.clear_color;   /* A8R8G8B8 */
+        float rgba[4] = { ((c >> 16) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f,
+                          (c & 0xFF) / 255.0f, ((c >> 24) & 0xFF) / 255.0f };
+        int cleared = 0;
+        if (!full) {
+            ID3D11DeviceContext1 *ctx1 = NULL;
+            if (SUCCEEDED(ID3D11DeviceContext_QueryInterface(ctx,
+                    &IID_ID3D11DeviceContext1, (void **)&ctx1)) && ctx1) {
+                D3D11_RECT r = { (LONG)x0, (LONG)y0, (LONG)x1, (LONG)y1 };
+                ID3D11DeviceContext1_ClearView(ctx1, (ID3D11View *)s->rtv, rgba, &r, 1);
+                ID3D11DeviceContext1_Release(ctx1);
+                cleared = 1;
+            }
+        }
+        if (!cleared)
+            ID3D11DeviceContext_ClearRenderTargetView(ctx, s->rtv, rgba);
+    }
+
+    if ((param & (NV097_CLEAR_SURFACE_Z | NV097_CLEAR_SURFACE_STENCIL)) &&
+        g_bound_zeta >= 0) {
+        uint32_t zs = g_pg.zstencil_clear;
+        UINT flags = 0;
+        float depth;
+        UINT8 stencil = 0;
+        if (((g_pg.surf_format >> 4) & 0xF) == 1) {
+            depth = (zs & 0xFFFF) / 65535.0f;
+        } else {
+            depth = (zs >> 8) / 16777215.0f;
+            stencil = (UINT8)(zs & 0xFF);
+        }
+        if (param & NV097_CLEAR_SURFACE_Z)       flags |= D3D11_CLEAR_DEPTH;
+        if (param & NV097_CLEAR_SURFACE_STENCIL) flags |= D3D11_CLEAR_STENCIL;
+        /* ClearView can't take a depth view; a partial depth clear clears
+         * the whole buffer. Breakdown's partial clears are the letterboxed
+         * scene inside a surface it cleared whole just before. */
+        ID3D11DeviceContext_ClearDepthStencilView(ctx, g_surf[g_bound_zeta].dsv,
+                                                  flags, depth, stencil);
+    }
+}
+
+/* Copy the frame surface to the swap chain's back buffer. Called at the
+ * flip, before the frame dump and Present read it. */
+static void present_surface(void)
+{
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    ID3D11RenderTargetView *bb_rtv = d3d8_GetDefaultRTV();
+    ID3D11Resource *bb = NULL;
+    Surface *s;
+    D3D11_BOX box;
+    UINT bw = d3d8_GetBackbufferWidth(), bh = d3d8_GetBackbufferHeight();
+
+    if (!ctx || !bb_rtv || g_present_surf < 0 || !g_surf[g_present_surf].in_use)
+        return;
+    s = &g_surf[g_present_surf];
+    ID3D11View_GetResource((ID3D11View *)bb_rtv, &bb);
+    if (!bb)
+        return;
+    box.left = 0;
+    box.top = 0;
+    box.front = 0;
+    box.right = s->d.width < bw ? s->d.width : bw;
+    box.bottom = s->d.height < bh ? s->d.height : bh;
+    box.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(ctx, bb, 0, 0, 0, 0,
+                                              (ID3D11Resource *)s->tex, 0, &box);
+    ID3D11Resource_Release(bb);
+}
+
+/* A texture stage whose offset lies inside a surface: a copy of that
+ * rectangle, refreshed when the surface has been drawn into since. */
+static TexCacheEntry *resolve_surface_texture(int stage)
+{
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    uint32_t fmt = g_pg.tex[stage].format;
+    uint32_t color = (fmt & NV097_SET_TEXTURE_FORMAT_COLOR) >> 8;
+    uint32_t offset = g_pg.tex[stage].offset;
+    int linear = nv2a_psh_tex_is_linear(color);
+    int depth = nv2a_psh_tex_depth_max(color) > 0.0f;
+    uint32_t tw, th, x = 0, y = 0;
+    int i, si = -1, vi = -1, free_vi = -1, lru_vi = 0;
+    Surface *s;
+    SurfView *v;
+
+    if (!ctx)
+        return NULL;
+    if (linear) {
+        tw = (g_pg.tex[stage].image_rect & NV097_SET_TEXTURE_IMAGE_RECT_WIDTH) >> 16;
+        th = g_pg.tex[stage].image_rect & NV097_SET_TEXTURE_IMAGE_RECT_HEIGHT;
+    } else {
+        tw = 1u << ((fmt & NV097_SET_TEXTURE_FORMAT_BASE_SIZE_U) >> 20);
+        th = 1u << ((fmt & NV097_SET_TEXTURE_FORMAT_BASE_SIZE_V) >> 24);
+    }
+
+    for (i = 0; i < SURF_MAX; i++) {
+        s = &g_surf[i];
+        if (!s->in_use || s->is_color == depth)
+            continue;
+        if (nv2a_surf_locate(&s->d, offset, tw, th, &x, &y)) {
+            si = i;
+            break;
+        }
+    }
+    if (si < 0)
+        return NULL;
+    s = &g_surf[si];
+    /* D3D11 copies depth only as a whole resource. */
+    if (depth && (x || y || tw != s->d.width || th != s->d.height)) {
+        tw = s->d.width;
+        th = s->d.height;
+        x = y = 0;
+    }
+
+    for (i = 0; i < SURFVIEW_MAX; i++) {
+        v = &g_surfview[i];
+        if (!v->in_use) {
+            if (free_vi < 0) free_vi = i;
+            continue;
+        }
+        if (v->surf == si && v->x == x && v->y == y && v->w == tw && v->h == th) {
+            vi = i;
+            break;
+        }
+        if (v->last_frame < g_surfview[lru_vi].last_frame)
+            lru_vi = i;
+    }
+
+    if (vi < 0) {
+        D3D11_TEXTURE2D_DESC td;
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvd;
+        vi = free_vi >= 0 ? free_vi : lru_vi;
+        v = &g_surfview[vi];
+        surfview_release(v);
+        memset(&td, 0, sizeof(td));
+        td.Width = tw;
+        td.Height = th;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.Format = depth ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, NULL, &v->tex)))
+            return NULL;
+        memset(&srvd, 0, sizeof(srvd));
+        srvd.Format = depth ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS : DXGI_FORMAT_R8G8B8A8_UNORM;
+        srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvd.Texture2D.MipLevels = 1;
+        if (FAILED(ID3D11Device_CreateShaderResourceView(d3d8_GetD3D11Device(),
+                (ID3D11Resource *)v->tex, &srvd, &v->te.srv))) {
+            ID3D11Texture2D_Release(v->tex);
+            memset(v, 0, sizeof(*v));
+            return NULL;
+        }
+        v->in_use = 1;
+        v->surf = si;
+        v->x = x;
+        v->y = y;
+        v->w = tw;
+        v->h = th;
+        v->copied_seq = 0;
+        v->te.in_use = 1;
+        v->te.width = (float)tw;
+        v->te.height = (float)th;
+        v->te.normalized = !linear;
+        v->te.tex2d = v->tex;
+    }
+    v = &g_surfview[vi];
+    v->last_frame = g_pg.stats.frames;
+    if (v->copied_seq != s->write_seq) {
+        if (depth) {
+            ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)v->tex,
+                                             (ID3D11Resource *)s->tex);
+        } else {
+            D3D11_BOX box = { x, y, 0, x + tw, y + th, 1 };
+            ID3D11DeviceContext_CopySubresourceRegion(ctx, (ID3D11Resource *)v->tex,
+                0, 0, 0, 0, (ID3D11Resource *)s->tex, 0, &box);
+        }
+        v->copied_seq = s->write_seq;
+    }
+    return &v->te;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * Pixel stage: register combiners (nv2a_psh.c)
+ * ══════════════════════════════════════════════════════════════════════ */
+
+#define PSH_CACHE_SIZE 96
+typedef struct {
+    int in_use;
+    int failed;                  /* compile failed: don't retry every draw */
+    uint32_t last_use;
+    NV2APshState st;
+    ID3D11PixelShader *ps;
+} PshCacheEntry;
+static PshCacheEntry g_psh_cache[PSH_CACHE_SIZE];
+static uint32_t g_psh_clock;
+static ID3D11Buffer *g_psh_cb;
+
+static void argb_to_rgba(uint32_t c, float *out)
+{
+    out[0] = ((c >> 16) & 0xFF) / 255.0f;
+    out[1] = ((c >> 8) & 0xFF) / 255.0f;
+    out[2] = (c & 0xFF) / 255.0f;
+    out[3] = ((c >> 24) & 0xFF) / 255.0f;
+}
+
+static ID3D11PixelShader *psh_get(const NV2APshState *st)
+{
+    static char src[65536];
+    PshCacheEntry *e = NULL;
+    ID3DBlob *code = NULL, *errors = NULL;
+    int i, len, slot = 0;
+    HRESULT hr;
+
+    for (i = 0; i < PSH_CACHE_SIZE; i++) {
+        PshCacheEntry *c = &g_psh_cache[i];
+        if (c->in_use && !memcmp(&c->st, st, sizeof(*st))) {
+            c->last_use = ++g_psh_clock;
+            return c->failed ? NULL : c->ps;
+        }
+    }
+    /* Miss: a free slot, else the least recently used. */
+    for (i = 0; i < PSH_CACHE_SIZE; i++) {
+        if (!g_psh_cache[i].in_use) {
+            slot = i;
+            break;
+        }
+        if (g_psh_cache[i].last_use < g_psh_cache[slot].last_use)
+            slot = i;
+    }
+    e = &g_psh_cache[slot];
+    if (e->ps) ID3D11PixelShader_Release(e->ps);
+    memset(e, 0, sizeof(*e));
+    e->in_use = 1;
+    e->st = *st;
+    e->last_use = ++g_psh_clock;
+
+    len = nv2a_psh_generate(st, src, sizeof(src));
+    if (len < 0) {
+        fprintf(stderr, "[PGRAPH-D3D11] PSH: generated shader too large\n");
+        e->failed = 1;
+        return NULL;
+    }
+    hr = D3DCompile(src, (SIZE_T)len, "nv2a_psh", NULL, NULL, "main", "ps_5_0",
+                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
+    if (FAILED(hr)) {
+        static int reported;
+        if (reported++ < 4)
+            fprintf(stderr, "[PGRAPH-D3D11] PSH: compile failed: %s\n--- source ---\n%s\n",
+                    errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "unknown", src);
+        if (errors) ID3D10Blob_Release(errors);
+        e->failed = 1;
+        return NULL;
+    }
+    if (errors) ID3D10Blob_Release(errors);
+    hr = ID3D11Device_CreatePixelShader(d3d8_GetD3D11Device(),
+        ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code), NULL, &e->ps);
+    ID3D10Blob_Release(code);
+    if (FAILED(hr)) {
+        e->ps = NULL;
+        e->failed = 1;
+        return NULL;
+    }
+    {
+        static uint32_t compiled;
+        if (++compiled <= 32 || compiled % 100 == 0)
+            fprintf(stderr, "[PGRAPH-D3D11] PSH: compiled #%u (stages=%u program=0x%05X)\n",
+                    compiled, st->combiner_control & 0xFF, st->shader_stage_program);
+    }
+    return e->ps;
+}
+
+/* Build the combiner state for this draw, bind its shader, textures and
+ * constants. Returns 0 if the generated shader isn't usable, and the caller
+ * falls back to the fixed texture-times-diffuse shader. */
+static int bind_pixel_stage(void)
+{
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    ID3D11ShaderResourceView *srv[4] = { NULL, NULL, NULL, NULL };
+    ID3D11SamplerState *samp[4] = { NULL, NULL, NULL, NULL };
+    NV2APshState st;
+    NV2APshConstants k;
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    ID3D11PixelShader *ps;
+    int i, n;
+
+    if (!ctx)
+        return 0;
+    memset(&st, 0, sizeof(st));
+    memset(&k, 0, sizeof(k));
+    st.combiner_control = g_pg.psh.control;
+    st.shader_stage_program = g_pg.psh.stage_program;
+    st.other_stage_input = g_pg.psh.other_stage_input;
+    st.final_inputs_0 = g_pg.psh.specfog_cw0;
+    st.final_inputs_1 = g_pg.psh.specfog_cw1;
+    st.clip_plane_mode = g_pg.psh.clip_plane_mode;
+    n = (int)(st.combiner_control & 0xFF);
+    if (n > 8) n = 8;
+    for (i = 0; i < n; i++) {
+        st.rgb_inputs[i] = g_pg.psh.color_icw[i];
+        st.rgb_outputs[i] = g_pg.psh.color_ocw[i];
+        st.alpha_inputs[i] = g_pg.psh.alpha_icw[i];
+        st.alpha_outputs[i] = g_pg.psh.alpha_ocw[i];
+    }
+    st.shadow_depth_func = (uint8_t)(g_pg.psh.shadow_func & 7);
+    st.alpha_test = (uint8_t)g_pg.alpha_test;
+    st.alpha_func = (uint8_t)(g_pg.psh.alpha_func & 0xF);
+
+    for (i = 0; i < 4; i++) {
+        uint32_t mode = (st.shader_stage_program >> (i * 5)) & 0x1F;
+        uint32_t fmt = g_pg.tex[i].format;
+        uint32_t color = (fmt & NV097_SET_TEXTURE_FORMAT_COLOR) >> 8;
+        TexCacheEntry *te;
+        if (mode == 0 || !g_pg.tex[i].enabled)
+            continue;
+        st.enabled[i] = 1;
+        st.rect_tex[i] = (uint8_t)nv2a_psh_tex_is_linear(color);
+        st.shadow_map[i] = nv2a_psh_tex_depth_max(color) > 0.0f;
+        st.alphakill[i] = (g_pg.tex[i].control0 & (1u << 2)) ? 1 : 0;
+        st.dim_tex[i] = (uint8_t)((fmt & NV097_SET_TEXTURE_FORMAT_DIMENSIONALITY) >> 4);
+        k.depth_max[i] = nv2a_psh_tex_depth_max(color);
+        te = resolve_texture_stage(i);
+        if (te) {
+            srv[i] = te->srv;
+            samp[i] = get_stage_sampler(i);
+        }
+    }
+
+    ps = psh_get(&st);
+    if (!ps)
+        return 0;
+
+    if (!g_psh_cb) {
+        D3D11_BUFFER_DESC cbd;
+        memset(&cbd, 0, sizeof(cbd));
+        cbd.ByteWidth = sizeof(NV2APshConstants);
+        cbd.Usage = D3D11_USAGE_DYNAMIC;
+        cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(ID3D11Device_CreateBuffer(d3d8_GetD3D11Device(), &cbd, NULL, &g_psh_cb))) {
+            g_psh_cb = NULL;
+            return 0;
+        }
+    }
+    for (i = 0; i < 8; i++) {
+        argb_to_rgba(g_pg.psh.factor0[i], k.consts[i * 2]);
+        argb_to_rgba(g_pg.psh.factor1[i], k.consts[i * 2 + 1]);
+    }
+    argb_to_rgba(g_pg.psh.specfog_factor[0], k.consts[16]);
+    argb_to_rgba(g_pg.psh.specfog_factor[1], k.consts[17]);
+    /* SET_FOG_COLOR is R in the low byte (NV097_SET_FOG_COLOR_RED). */
+    k.fog_color[0] = (g_pg.psh.fog_color & 0xFF) / 255.0f;
+    k.fog_color[1] = ((g_pg.psh.fog_color >> 8) & 0xFF) / 255.0f;
+    k.fog_color[2] = ((g_pg.psh.fog_color >> 16) & 0xFF) / 255.0f;
+    k.fog_color[3] = ((g_pg.psh.fog_color >> 24) & 0xFF) / 255.0f;
+    memcpy(k.bump_mat, g_pg.psh.bump_mat, sizeof(k.bump_mat));
+    memcpy(k.bump_scale, g_pg.psh.bump_scale, sizeof(k.bump_scale));
+    memcpy(k.bump_offset, g_pg.psh.bump_offset, sizeof(k.bump_offset));
+    k.alpha_ref = (float)(g_pg.psh.alpha_ref & 0xFF);
+
+    if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_psh_cb, 0,
+                                       D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+        return 0;
+    memcpy(mapped.pData, &k, sizeof(k));
+    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_psh_cb, 0);
+
+    ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &g_psh_cb);
+    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 4, srv);
+    ID3D11DeviceContext_PSSetSamplers(ctx, 0, 4, samp);
+    return 1;
+}
+
+/* NV2A (OpenGL) compare function -> D3DCMPFUNC. */
+static DWORD gl_cmp_to_d3d(uint32_t f)
+{
+    if (f >= 0x0200 && f <= 0x0207)
+        return (DWORD)(f - 0x0200 + 1);   /* NEVER=1 .. ALWAYS=8 */
+    return 8;
+}
+
+/* NV2A stencil op (OpenGL enum) -> D3DSTENCILOP. */
+static DWORD gl_stencil_op_to_d3d(uint32_t op)
+{
+    switch (op) {
+    case NV097_SET_STENCIL_OP_V_KEEP:    return 1;
+    case NV097_SET_STENCIL_OP_V_ZERO:    return 2;
+    case NV097_SET_STENCIL_OP_V_REPLACE: return 3;
+    case NV097_SET_STENCIL_OP_V_INCRSAT: return 4;
+    case NV097_SET_STENCIL_OP_V_DECRSAT: return 5;
+    case NV097_SET_STENCIL_OP_V_INVERT:  return 6;
+    case NV097_SET_STENCIL_OP_V_INCR:    return 7;
+    case NV097_SET_STENCIL_OP_V_DECR:    return 8;
+    default:                             return 1;
+    }
+}
+
+static DWORD gl_blend_eq_to_d3d(uint32_t eq)
+{
+    switch (eq) {
+    case NV097_SET_BLEND_EQUATION_V_FUNC_SUBTRACT:         return 2;
+    case NV097_SET_BLEND_EQUATION_V_FUNC_REVERSE_SUBTRACT: return 3;
+    case NV097_SET_BLEND_EQUATION_V_MIN:                   return 4;
+    case NV097_SET_BLEND_EQUATION_V_MAX:                   return 5;
+    default:                                               return 1;  /* ADD */
+    }
+}
+
+/* The title's depth, stencil, colour-mask and blend state, as D3D8 render
+ * states for d3d8_states_apply() to build D3D11 state objects from. */
+static void apply_raster_state(IDirect3DDevice8 *dev)
+{
+    int have_zeta = g_bound_zeta >= 0;
+    int have_stencil = have_zeta && ((g_pg.surf_format >> 4) & 0xF) == 2;
+    uint32_t m = g_pg.color_mask;
+    DWORD cw = ((m & NV097_SET_COLOR_MASK_RED_WRITE_ENABLE)   ? 1 : 0) |
+               ((m & NV097_SET_COLOR_MASK_GREEN_WRITE_ENABLE) ? 2 : 0) |
+               ((m & NV097_SET_COLOR_MASK_BLUE_WRITE_ENABLE)  ? 4 : 0) |
+               ((m & NV097_SET_COLOR_MASK_ALPHA_WRITE_ENABLE) ? 8 : 0);
+
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, (g_pg.depth_test && have_zeta) ? TRUE : FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ZFUNC, gl_cmp_to_d3d(g_pg.depth_func));
+    dev->lpVtbl->SetRenderState(dev, D3DRS_ZWRITEENABLE,
+                                (g_pg.depth_mask && have_zeta) ? TRUE : FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILENABLE,
+                                (g_pg.stencil_test && have_stencil) ? TRUE : FALSE);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILFUNC, gl_cmp_to_d3d(g_pg.stencil_func));
+    dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILREF, g_pg.stencil_ref & 0xFF);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILMASK, g_pg.stencil_func_mask & 0xFF);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILWRITEMASK, g_pg.stencil_mask & 0xFF);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILFAIL, gl_stencil_op_to_d3d(g_pg.stencil_op_fail));
+    dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILZFAIL, gl_stencil_op_to_d3d(g_pg.stencil_op_zfail));
+    dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILPASS, gl_stencil_op_to_d3d(g_pg.stencil_op_zpass));
+    dev->lpVtbl->SetRenderState(dev, D3DRS_COLORWRITEENABLE, cw);
+    dev->lpVtbl->SetRenderState(dev, D3DRS_BLENDOP, gl_blend_eq_to_d3d(g_pg.blend_equation));
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -1533,6 +2394,11 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
         default: prim_count = out_vert_count / 3; break;
     }
     if (prim_count == 0)
+        return;
+
+    /* Render into the surfaces the title selected; nothing selected (a
+     * colour-masked pass with depth off) draws nothing, so skip the work. */
+    if (!bind_targets(0, 0))
         return;
 
     /* ── Choose the vertex pipeline for this draw ──
@@ -1768,12 +2634,35 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
         }
     }
 
+    if (surftrace_on()) {
+        fprintf(stderr, "[SURF] DRAW mode=%u verts=%u vsh=%d inputs=0x%04X c=0x%08X z=0x%08X "
+                "fmt=0x%X vp=(%.0f,%.0f s %.0f,%.0f) blend=%d %04X/%04X cmask=%08X "
+                "depth=%d/%04X/%d stencil=%d f=%04X ref=%u m=%02X wm=%02X ops=%04X/%04X/%04X",
+                g_pg.draw_mode, num_verts, use_vsh, g_pg.vsh.inputs_read,
+                g_pg.surf_color_offset, g_pg.surf_zeta_offset, g_pg.surf_format,
+                g_pg.vp_offset[0], g_pg.vp_offset[1], g_pg.vp_scale[0], g_pg.vp_scale[1],
+                g_pg.blend_enable, g_pg.blend_sfactor, g_pg.blend_dfactor,
+                g_pg.color_mask, g_pg.depth_test, g_pg.depth_func, g_pg.depth_mask,
+                g_pg.stencil_test, g_pg.stencil_func, g_pg.stencil_ref,
+                g_pg.stencil_func_mask, g_pg.stencil_mask, g_pg.stencil_op_fail,
+                g_pg.stencil_op_zfail, g_pg.stencil_op_zpass);
+        for (int s = 0; s < 4; s++) {
+            if (g_pg.tex[s].enabled)
+                fprintf(stderr, " t%d=0x%08X/%02X/%ux%u", s, g_pg.tex[s].offset,
+                        (g_pg.tex[s].format >> 8) & 0xFF,
+                        g_pg.tex[s].image_rect >> 16, g_pg.tex[s].image_rect & 0xFFFF);
+        }
+        fputc('\n', stderr);
+    }
+
     /* Get D3D8 device */
     IDirect3DDevice8 *dev = xbox_GetD3DDevice();
     if (!dev) return;
 
-    /* Set up 2D render state — always enable alpha for menu transparency */
-    dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, FALSE);
+    /* Depth, stencil and colour mask as the title set them. Culling stays
+     * off: NV2A's front-face convention against this backend's y-down clip
+     * mapping is unverified, and drawing a back face is only overdraw. */
+    apply_raster_state(dev);
     dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
     dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
     /* The title's own blend state. Forcing SRCALPHA/INVSRCALPHA on for every
@@ -1888,10 +2777,11 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
          * shader directly instead, so they're authoritative for VSH
          * draws regardless of what that dead D3D8 state says. */
         ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
-        ID3D11PixelShader *ps = get_tex_pixel_shader();
-        TexCacheEntry *te = resolve_texture_stage(0);
+        int combiners = bind_pixel_stage();
+        ID3D11PixelShader *ps = combiners ? NULL : get_tex_pixel_shader();
+        TexCacheEntry *te = combiners ? NULL : resolve_texture_stage(0);
 
-        if (ctx && ps && g_tex_ps_cb) {
+        if (!combiners && ctx && ps && g_tex_ps_cb) {
             D3D11_MAPPED_SUBRESOURCE mapped;
 
             ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
@@ -2084,16 +2974,18 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         g_pg.clear_rect_v = param;
         return 1;
 
+    case NV097_SET_ZSTENCIL_CLEAR_VALUE:
+        g_pg.zstencil_clear = param;
+        return 1;
+
     case NV097_CLEAR_SURFACE:
     {
-        IDirect3DDevice8 *dev = xbox_GetD3DDevice();
-        if (dev) {
-            uint32_t flags = 0;
-            if (param & 0xF0) flags |= 1;  /* D3DCLEAR_TARGET */
-            if (param & 0x01) flags |= 2;  /* D3DCLEAR_ZBUFFER */
-            if (param & 0x02) flags |= 4;  /* D3DCLEAR_STENCIL */
-            dev->lpVtbl->Clear(dev, 0, NULL, flags, g_pg.clear_color, 1.0f, 0);
-        }
+        clear_surface(param);
+        surftrace("CLEAR 0x%02X color=0x%08X rect x=%u w=%u y=%u h=%u on c=0x%08X z=0x%08X",
+                  param, g_pg.clear_color, g_pg.clear_rect_h & 0xFFFF,
+                  g_pg.clear_rect_h >> 16, g_pg.clear_rect_v & 0xFFFF,
+                  g_pg.clear_rect_v >> 16, g_pg.surf_color_offset,
+                  g_pg.surf_zeta_offset);
         g_pg.stats.clears++;
         return 1;
     }
@@ -2129,6 +3021,83 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
 
     case NV097_SET_SHADE_MODE:
         /* 1=flat, 2=gouraud — we always use gouraud */
+        return 1;
+
+    case NV097_SET_DEPTH_FUNC:        g_pg.depth_func = param;         return 1;
+    case NV097_SET_DEPTH_MASK:        g_pg.depth_mask = param ? 1 : 0; return 1;
+    case NV097_SET_STENCIL_TEST_ENABLE: g_pg.stencil_test = param ? 1 : 0; return 1;
+    case NV097_SET_STENCIL_MASK:      g_pg.stencil_mask = param;       return 1;
+    case NV097_SET_STENCIL_FUNC:      g_pg.stencil_func = param;       return 1;
+    case NV097_SET_STENCIL_FUNC_REF:  g_pg.stencil_ref = param;        return 1;
+    case NV097_SET_STENCIL_FUNC_MASK: g_pg.stencil_func_mask = param;  return 1;
+    case NV097_SET_STENCIL_OP_FAIL:   g_pg.stencil_op_fail = param;    return 1;
+    case NV097_SET_STENCIL_OP_ZFAIL:  g_pg.stencil_op_zfail = param;   return 1;
+    case NV097_SET_STENCIL_OP_ZPASS:  g_pg.stencil_op_zpass = param;   return 1;
+    case NV097_SET_CONTROL0:          g_pg.control0 = param;           return 1;
+    case NV097_SET_CLIP_MIN:          g_pg.clip_min = param;           return 1;
+    case NV097_SET_CLIP_MAX:          g_pg.clip_max = param;           return 1;
+    case NV097_SET_BLEND_EQUATION:    g_pg.blend_equation = param;     return 1;
+
+    /* ── Pixel stage (see bind_pixel_stage) ── */
+    case NV097_SET_COMBINER_SPECULAR_FOG_CW0: g_pg.psh.specfog_cw0 = param; return 1;
+    case NV097_SET_COMBINER_SPECULAR_FOG_CW1: g_pg.psh.specfog_cw1 = param; return 1;
+    case NV097_SET_SPECULAR_FOG_FACTOR:       g_pg.psh.specfog_factor[0] = param; return 1;
+    case NV097_SET_SPECULAR_FOG_FACTOR + 4:   g_pg.psh.specfog_factor[1] = param; return 1;
+    case NV097_SET_COMBINER_CONTROL:          g_pg.psh.control = param; return 1;
+    case NV097_SET_SHADER_STAGE_PROGRAM:      g_pg.psh.stage_program = param; return 1;
+    case NV097_SET_SHADER_CLIP_PLANE_MODE:    g_pg.psh.clip_plane_mode = param; return 1;
+    case NV097_SET_SHADOW_DEPTH_FUNC:         g_pg.psh.shadow_func = param; return 1;
+    case NV097_SET_SHADOW_ZSLOPE_THRESHOLD:   return 1;
+    case NV097_SET_ALPHA_FUNC:                g_pg.psh.alpha_func = param; return 1;
+    case NV097_SET_ALPHA_REF:                 g_pg.psh.alpha_ref = param; return 1;
+    case NV097_SET_FOG_COLOR:                 g_pg.psh.fog_color = param; return 1;
+    case NV097_SET_FOG_ENABLE:
+        g_pg.fog_enable = param ? 1 : 0;
+        return 1;
+    case NV097_SET_FOG_MODE:
+        /* To NV_PGRAPH_CONTROL_3_FOG_MODE, as xemu's SET_FOG_MODE. */
+        switch (param) {
+        case NV097_SET_FOG_MODE_V_EXP:        g_pg.fog_mode = 1; break;
+        case NV097_SET_FOG_MODE_V_EXP2:       g_pg.fog_mode = 3; break;
+        case NV097_SET_FOG_MODE_V_EXP_ABS:    g_pg.fog_mode = 5; break;
+        case NV097_SET_FOG_MODE_V_EXP2_ABS:   g_pg.fog_mode = 7; break;
+        case NV097_SET_FOG_MODE_V_LINEAR_ABS: g_pg.fog_mode = 4; break;
+        default:                              g_pg.fog_mode = 0; break;
+        }
+        return 1;
+    case NV097_SET_FOG_GEN_MODE:
+        return 1;
+    case NV097_SET_FOG_PARAMS:
+    case NV097_SET_FOG_PARAMS + 4:
+    case NV097_SET_FOG_PARAMS + 8:
+        if (method != NV097_SET_FOG_PARAMS + 8)
+            g_pg.fog_param[(method - NV097_SET_FOG_PARAMS) / 4] = u2f(param);
+        return 1;
+    /* xemu keeps both in NV_PGRAPH_SHADERCTL: the dot mappings in bits 0-11,
+     * the other-stage inputs in 12-27. */
+    case NV097_SET_DOT_RGBMAPPING:
+        g_pg.psh.other_stage_input = (g_pg.psh.other_stage_input & ~0xFFFu) | (param & 0xFFF);
+        return 1;
+    case NV097_SET_SHADER_OTHER_STAGE_INPUT:
+        g_pg.psh.other_stage_input = (g_pg.psh.other_stage_input & ~0xFFFF000u) |
+                                     (param & 0xFFFF000);
+        return 1;
+
+    /* ── Render target selection ── */
+    case NV097_SET_SURFACE_FORMAT:
+        g_pg.surf_format = param;
+        surftrace("SURFACE_FORMAT 0x%08X", param);
+        return 1;
+    case NV097_SET_SURFACE_PITCH:
+        g_pg.surf_pitch = param;
+        return 1;
+    case NV097_SET_SURFACE_COLOR_OFFSET:
+        g_pg.surf_color_offset = param;
+        surftrace("SURFACE_COLOR_OFFSET 0x%08X", param);
+        return 1;
+    case NV097_SET_SURFACE_ZETA_OFFSET:
+        g_pg.surf_zeta_offset = param;
+        surftrace("SURFACE_ZETA_OFFSET 0x%08X", param);
         return 1;
 
     /* ── Viewport ──
@@ -2182,10 +3151,12 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
 
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
         g_pg.surface_clip_h = param;
+        surftrace("SURFACE_CLIP_H x=%u w=%u", param & 0xFFFF, param >> 16);
         return 1;
 
     case NV097_SET_SURFACE_CLIP_VERTICAL:
         g_pg.surface_clip_v = param;
+        surftrace("SURFACE_CLIP_V y=%u h=%u", param & 0xFFFF, param >> 16);
         return 1;
 
     /* ── Texture state tracking (4 stages, 0x40 stride) ── */
@@ -2376,6 +3347,10 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
                     g_pg.current_diffuse, param);
         }
         g_pg.current_diffuse = param;
+        g_pg.inline_value[NV2A_VERTEX_ATTR_DIFFUSE][0] = (param & 0xFF) / 255.0f;
+        g_pg.inline_value[NV2A_VERTEX_ATTR_DIFFUSE][1] = ((param >> 8) & 0xFF) / 255.0f;
+        g_pg.inline_value[NV2A_VERTEX_ATTR_DIFFUSE][2] = ((param >> 16) & 0xFF) / 255.0f;
+        g_pg.inline_value[NV2A_VERTEX_ATTR_DIFFUSE][3] = ((param >> 24) & 0xFF) / 255.0f;
         return 1;
 
     /* ── Programmable vertex shader control registers ──
@@ -2439,6 +3414,80 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
             return 1;
         }
 
+        /* Inline attribute values (xemu SET_VERTEX_DATA2F_M/4F_M/2S/4UB/
+         * 4S_M). Immediate-mode vertices -- the slot 0 writes that finish
+         * one -- are not assembled; only the values are kept. */
+        if (method >= NV097_SET_VERTEX_DATA2F_M && method < NV097_SET_VERTEX_DATA2F_M + 0x80 &&
+            !(method & 3)) {
+            unsigned idx = (method - NV097_SET_VERTEX_DATA2F_M) / 4;
+            float *v = g_pg.inline_value[idx / 2];
+            v[idx % 2] = u2f(param);
+            v[2] = 0.0f;
+            v[3] = 1.0f;
+            return 1;
+        }
+        if (method >= NV097_SET_VERTEX_DATA2S && method < NV097_SET_VERTEX_DATA2S + 0x40 &&
+            !(method & 3)) {
+            float *v = g_pg.inline_value[(method - NV097_SET_VERTEX_DATA2S) / 4];
+            v[0] = (float)(int16_t)(param & 0xFFFF);
+            v[1] = (float)(int16_t)(param >> 16);
+            v[2] = 0.0f;
+            v[3] = 1.0f;
+            return 1;
+        }
+        if (method >= NV097_SET_VERTEX_DATA4UB && method < NV097_SET_VERTEX_DATA4UB + 0x40 &&
+            !(method & 3)) {
+            unsigned slot = (method - NV097_SET_VERTEX_DATA4UB) / 4;
+            float *v = g_pg.inline_value[slot];
+            v[0] = (param & 0xFF) / 255.0f;
+            v[1] = ((param >> 8) & 0xFF) / 255.0f;
+            v[2] = ((param >> 16) & 0xFF) / 255.0f;
+            v[3] = ((param >> 24) & 0xFF) / 255.0f;
+            return 1;
+        }
+        if (method >= NV097_SET_VERTEX_DATA4S_M && method < NV097_SET_VERTEX_DATA4S_M + 0x80 &&
+            !(method & 3)) {
+            unsigned idx = (method - NV097_SET_VERTEX_DATA4S_M) / 4;
+            float *v = g_pg.inline_value[idx / 2];
+            v[(idx % 2) * 2] = (float)(int16_t)(param & 0xFFFF);
+            v[(idx % 2) * 2 + 1] = (float)(int16_t)(param >> 16);
+            return 1;
+        }
+        if (method >= NV097_SET_VERTEX_DATA4F_M && method < NV097_SET_VERTEX_DATA4F_M + 0x100 &&
+            !(method & 3)) {
+            unsigned idx = (method - NV097_SET_VERTEX_DATA4F_M) / 4;
+            g_pg.inline_value[idx / 4][idx % 4] = u2f(param);
+            return 1;
+        }
+
+        /* Eight-slot combiner registers (xemu DEF_METHOD_INC). */
+#define PSH_SLOTS(base, arr)                                              \
+        if (method >= (base) && method < (base) + 0x20 && !(method & 3)) { \
+            g_pg.psh.arr[(method - (base)) / 4] = param;                  \
+            return 1;                                                     \
+        }
+        PSH_SLOTS(NV097_SET_COMBINER_ALPHA_ICW, alpha_icw)
+        PSH_SLOTS(NV097_SET_COMBINER_FACTOR0, factor0)
+        PSH_SLOTS(NV097_SET_COMBINER_FACTOR1, factor1)
+        PSH_SLOTS(NV097_SET_COMBINER_ALPHA_OCW, alpha_ocw)
+        PSH_SLOTS(NV097_SET_COMBINER_COLOR_ICW, color_icw)
+        PSH_SLOTS(NV097_SET_COMBINER_COLOR_OCW, color_ocw)
+#undef PSH_SLOTS
+
+        /* Bump environment, per texture stage 1-3 (0x40 apart): a 2x2
+         * matrix at +0x28, scale at +0x38, offset at +0x3C. */
+        if (method >= NV097_SET_TEXTURE_OFFSET + 0x40 &&
+            method < NV097_SET_TEXTURE_OFFSET + 0x100) {
+            uint32_t rel = (method - NV097_SET_TEXTURE_OFFSET) % 0x40;
+            int stage = (int)((method - NV097_SET_TEXTURE_OFFSET) / 0x40);
+            if (rel >= 0x28 && rel < 0x38 && !(rel & 3)) {
+                g_pg.psh.bump_mat[stage][(rel - 0x28) / 4] = u2f(param);
+                return 1;
+            }
+            if (rel == 0x38) { g_pg.psh.bump_scale[stage] = u2f(param); return 1; }
+            if (rel == 0x3C) { g_pg.psh.bump_offset[stage] = u2f(param); return 1; }
+        }
+
         /* Known ranges we can safely ignore.
          *
          * Names here were checked against nv2a_regs.h; several were previously
@@ -2467,8 +3516,6 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
             method == 0x0100 ||                        /* NO_OPERATION */
             method == 0x0110 ||                        /* WAIT_FOR_IDLE */
             method == 0x0180 ||                        /* SET_CONTEXT_DMA_NOTIFIES */
-            method == 0x0394 ||                        /* SET_CLIP_MIN */
-            method == 0x0398 ||                        /* SET_CLIP_MAX */
             method == 0x039C ||                        /* SET_CULL_FACE (winding) */
             /* The flip group, previously written 0x18 low (0x0108-0x0118): it
              * ignored three methods the title never sends and let the real
@@ -2491,6 +3538,7 @@ void pgraph_d3d11_flush(void)
         submit_draw();
         g_pg.in_draw = 0;
     }
+    present_surface();
     g_pg.stats.frames++;
 }
 
