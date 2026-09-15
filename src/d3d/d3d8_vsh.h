@@ -510,6 +510,9 @@ void d3d8_vsh_set_surface(float width, float height, float zmax);
  */
 void d3d8_vsh_set_fog(int enable, int mode, float param0, float param1);
 
+/** Current value of constant register `reg` (debug tracing). */
+const float *d3d8_vsh_get_constant(int reg);
+
 /**
  * Check if a shader handle refers to a programmable vertex shader
  * (as opposed to an FVF code).

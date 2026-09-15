@@ -41,6 +41,7 @@ int main(int argc, char **argv) {
     s.alpha_test = v[11]; s.alpha_func = v[12];
     s.rgb_inputs[1] = v[13]; s.rgb_outputs[1] = v[14];
     s.z_perspective = v[15];
+    s.poly_offset = v[16];
     if (argc > 1 && !strcmp(argv[1], "tiny")) {
         printf("%d\n", nv2a_psh_generate(&s, buf, 64));
         return 0;
@@ -60,7 +61,7 @@ int main(int argc, char **argv) {
 
 # D3D's default: one stage, R0 = T0 * V0, final colour D = R0, alpha G = R0.
 DEFAULT = ["1", "1", "c", "1c00", "08040000", "c00", "18140000", "c00",
-           "0", "0", "0", "0", "0", "0", "0", "0"]
+           "0", "0", "0", "0", "0", "0", "0", "0", "0"]
 
 
 def _compiler():
@@ -169,7 +170,19 @@ class PshTest(unittest.TestCase):
         f[15] = "1"
         out = self.gen(f)
         self.assertIn("out float oDepth : SV_Depth", out)
-        self.assertIn("oDepth = saturate(input.pos.w * depthScale);", out)
+        self.assertIn("float zvalue = input.pos.w;", out)
+        self.assertIn("oDepth = saturate(zvalue * depthScale);", out)
+        self.assertNotIn("depthOffset;\n", out.split("SV_TARGET {")[1])
+
+    def test_polygon_offset(self):
+        f = list(DEFAULT)
+        f[16] = "1"          # offset, no w-buffer: bias plus slope term
+        out = self.gen(f)
+        self.assertIn("float zvalue = input.pos.z / depthScale;", out)
+        self.assertIn("zvalue += depthOffset + depthFactor * max(abs(ddx(zvalue)), abs(ddy(zvalue)));", out)
+        f[15] = "1"          # with w-buffer: bias only
+        out = self.gen(f)
+        self.assertIn("float zvalue = input.pos.w;\nzvalue += depthOffset;", out)
 
     def test_overflow_is_reported(self):
         self.assertEqual(self.gen(DEFAULT, "tiny").strip(), "-1")

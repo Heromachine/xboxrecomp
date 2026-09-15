@@ -583,11 +583,22 @@ static void emit_one_dest(StrBuf *sb, const NV2AVshDstOperand *dst,
 
     case NV2A_VSH_DST_OUTPUT: {
         const char *name = output_reg_name((NV2AVshOutputReg)dst->reg_index);
+        uint8_t mask = dst->write_mask;
+        if ((NV2AVshOutputReg)dst->reg_index == NV2A_VSH_OUT_FOG) {
+            /* A write to oFog lands its most significant masked component
+             * in x (xemu vsh-prog.c fog_mask_str): a program that writes
+             * fog as oFog.w still sets the fog distance. */
+            static const uint8_t fog_mask[16] = {
+                0x0, 0x8, 0x8, 0xC, 0x8, 0xC, 0xC, 0xE,
+                0x8, 0xC, 0xC, 0xE, 0xC, 0xE, 0xE, 0xF,
+            };
+            mask = fog_mask[mask & 0xF];
+        }
         if (name) {
             sb_append(sb, "    %s", name);
-            emit_write_mask(sb, dst->write_mask);
+            emit_write_mask(sb, mask);
             sb_append(sb, " = (%s)", rhs);
-            emit_write_mask(sb, dst->write_mask);
+            emit_write_mask(sb, mask);
             sb_append(sb, ";\n");
         }
         return;
@@ -1497,6 +1508,11 @@ void d3d8_vsh_set_surface(float width, float height, float zmax)
     g_vsh_constants.surface[1] = height;
     g_vsh_constants.surface[2] = zmax;
     g_vsh_constants_dirty = TRUE;
+}
+
+const float *d3d8_vsh_get_constant(int reg)
+{
+    return (reg >= 0 && reg < NV2A_VS_MAX_CONSTANTS) ? g_vsh_constants.c[reg] : NULL;
 }
 
 void d3d8_vsh_set_fog(int enable, int mode, float param0, float param1)

@@ -287,6 +287,8 @@ static struct {
     int fog_enable, fog_mode;    /* mode as NV_PGRAPH_CONTROL_3_FOG_MODE */
     float fog_param[2];          /* SET_FOG_PARAMS 0-1 */
     uint32_t blend_equation;     /* GL enum */
+    int poly_offset_fill;        /* SET_POLY_OFFSET_FILL_ENABLE */
+    uint32_t poly_offset_factor, poly_offset_bias;  /* float bit patterns */
 
     /* Register combiners and the pixel-stage registers xemu's psh.c reads,
      * stored raw -- nv2a_psh.c decodes them. */
@@ -2259,6 +2261,16 @@ static ID3D11PixelShader *psh_get(const NV2APshState *st)
         e->failed = 1;
         return NULL;
     }
+    if (getenv("XBOXRECOMP_PSHDUMP")) {
+        int i2;
+        fprintf(stderr, "[PSHDUMP] ctl=%08X prog=%08X other=%08X fin=%08X/%08X shf=%u zp=%u",
+                st->combiner_control, st->shader_stage_program, st->other_stage_input,
+                st->final_inputs_0, st->final_inputs_1, st->shadow_depth_func, st->z_perspective);
+        for (i2 = 0; i2 < 8; i2++)
+            fprintf(stderr, " s%d=%08X/%08X/%08X/%08X", i2, st->rgb_inputs[i2], st->rgb_outputs[i2],
+                    st->alpha_inputs[i2], st->alpha_outputs[i2]);
+        fprintf(stderr, "\n%s\n[PSHDUMP-END]\n", src);
+    }
     hr = D3DCompile(src, (SIZE_T)len, "nv2a_psh", NULL, NULL, "main", "ps_5_0",
                     D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
     if (FAILED(hr)) {
@@ -2324,6 +2336,9 @@ static int bind_pixel_stage(void)
     st.alpha_test = (uint8_t)g_pg.alpha_test;
     st.alpha_func = (uint8_t)(g_pg.psh.alpha_func & 0xF);
     st.z_perspective = (g_pg.control0 & NV097_SET_CONTROL0_Z_PERSPECTIVE_ENABLE) ? 1 : 0;
+    /* Triangles only, fill mode (xemu psh.c); every mode this backend
+     * draws is filled. */
+    st.poly_offset = (g_pg.poly_offset_fill && g_pg.draw_mode >= 4) ? 1 : 0;
 
     for (i = 0; i < 4; i++) {
         uint32_t mode = (st.shader_stage_program >> (i * 5)) & 0x1F;
@@ -2377,6 +2392,10 @@ static int bind_pixel_stage(void)
     memcpy(k.bump_offset, g_pg.psh.bump_offset, sizeof(k.bump_offset));
     k.alpha_ref = (float)(g_pg.psh.alpha_ref & 0xFF);
     k.depth_scale = 1.0f / surface_zmax();
+    if (st.poly_offset) {
+        k.depth_offset = u2f(g_pg.poly_offset_bias);
+        k.depth_factor = u2f(g_pg.poly_offset_factor);
+    }
 
     if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_psh_cb, 0,
                                        D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
@@ -2828,9 +2847,33 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
                 g_pg.stencil_test, g_pg.stencil_func, g_pg.stencil_ref,
                 g_pg.stencil_func_mask, g_pg.stencil_mask, g_pg.stencil_op_fail,
                 g_pg.stencil_op_zfail, g_pg.stencil_op_zpass);
+        fprintf(stderr, " fog=%d/%d/%g/%g fc=%08X k1=%08X k0=%08X",
+                g_pg.fog_enable, g_pg.fog_mode, g_pg.fog_param[0], g_pg.fog_param[1],
+                g_pg.psh.fog_color, g_pg.psh.factor1[0], g_pg.psh.factor0[0]);
         fprintf(stderr, " clip=%g..%g ctl0=%08X shf=%u prog=%05X ctl=%X",
                 u2f(g_pg.clip_min), u2f(g_pg.clip_max), g_pg.control0,
                 g_pg.psh.shadow_func, g_pg.psh.stage_program, g_pg.psh.control);
+        if (g_pg.vsh.inputs_read == 0x061D) {
+            static const int regs[] = { 96, 101, 106, 108, 109, 130, 131, 146, 147, 158, 159 };
+            for (unsigned r = 0; r < sizeof(regs) / sizeof(regs[0]); r++) {
+                const float *cc = d3d8_vsh_get_constant(regs[r]);
+                fprintf(stderr, " c%d=(%.3g,%.3g,%.3g,%.3g)", regs[r], cc[0], cc[1], cc[2], cc[3]);
+            }
+        }
+        if (num_verts > 2 && g_pg.vattr[4].count) {
+            fprintf(stderr, " raw4=");
+            for (uint32_t vi = 0; vi < 3; vi++) {
+                const uint8_t *q = base + vi * stride_bytes + byte_offset[4];
+                fprintf(stderr, "%02X%02X%02X%02X,", q[0], q[1], q[2], q[3]);
+            }
+        }
+        if (num_verts > 0 && g_pg.vattr[2].count) {
+            float n4[4] = {0,0,0,1};
+            const uint8_t *q = base + byte_offset[2];
+            decode_attr_floats(base, byte_offset, 2, n4);
+            fprintf(stderr, " d2=%u/%u n=(%.3f,%.3f,%.3f) rawn=%02X%02X%02X%02X", g_pg.vattr[2].format,
+                    g_pg.vattr[2].count, n4[0], n4[1], n4[2], q[0], q[1], q[2], q[3]);
+        }
         fprintf(stderr, " d3=%u/%u iv3=(%.2f,%.2f,%.2f,%.2f) d4=%u/%u",
                 g_pg.vattr[3].format, g_pg.vattr[3].count,
                 g_pg.inline_value[3][0], g_pg.inline_value[3][1],
@@ -3240,6 +3283,9 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
     case NV097_SET_CLIP_MIN:          g_pg.clip_min = param;           return 1;
     case NV097_SET_CLIP_MAX:          g_pg.clip_max = param;           return 1;
     case NV097_SET_BLEND_EQUATION:    g_pg.blend_equation = param;     return 1;
+    case NV097_SET_POLY_OFFSET_FILL_ENABLE: g_pg.poly_offset_fill = param ? 1 : 0; return 1;
+    case NV097_SET_POLYGON_OFFSET_SCALE_FACTOR: g_pg.poly_offset_factor = param; return 1;
+    case NV097_SET_POLYGON_OFFSET_BIAS: g_pg.poly_offset_bias = param; return 1;
 
     /* ── Pixel stage (see bind_pixel_stage) ── */
     case NV097_SET_COMBINER_SPECULAR_FOG_CW0: g_pg.psh.specfog_cw0 = param; return 1;
