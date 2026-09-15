@@ -1478,7 +1478,12 @@ class Lifter:
         out = []
         if self.needs_cf:
             out.append(f"if ({cnt}) _cf = (int)((({dst}) >> (({cnt}) - 1)) & 1);")
-        out.append(_fmt_operand_write(ops[0], f"(uint32_t)((int32_t){dst} >> {cnt})"))
+        # Sign-extend from the operand's own width first. LO16/LO8 and the
+        # 8/16-bit memory reads are unsigned, so `sar ax, 7` on 0x8000 would
+        # shift in zeros and turn a negative stick axis positive.
+        width = _operand_width(ops[0]) or 4
+        signed = {1: "int8_t", 2: "int16_t"}.get(width, "int32_t")
+        out.append(_fmt_operand_write(ops[0], f"(uint32_t)((int32_t)({signed}){dst} >> {cnt})"))
         return out
 
     def _lift_rotate(self, insn, ops, m):
