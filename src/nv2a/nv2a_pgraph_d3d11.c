@@ -430,6 +430,44 @@ static float u2f(uint32_t u) {
     return x.f;
 }
 
+/* Debug switches, read once at init. Kept permanently: each one isolated a
+ * rendering fault once and will be needed again.
+ *   XBOXRECOMP_DBG_SKIPTEX=<offset>   skip draws whose stage-0 texture is at <offset>
+ *   XBOXRECOMP_DBG_NOLIGHTPASS=1      skip ZERO/ONE_MINUS_SRC_COLOR (light/shadow projection) draws
+ *   XBOXRECOMP_DBG_NOMASKED=1         skip colour-masked draws into a colour surface
+ *   XBOXRECOMP_DBG_NODEPTH=1          depth test off for every draw
+ *   XBOXRECOMP_DBG_SMALLNODEPTH=1     depth test off for draws of <= 10 vertices
+ *   XBOXRECOMP_DBG_EQLE=1             depth func EQUAL drawn as LEQUAL
+ *   XBOXRECOMP_DBG_SHINV=1            invert the shadow-map compare function
+ *   XBOXRECOMP_DBG_SHFLIP=1|2|3       flip shadow-map v / u / both
+ *   XBOXRECOMP_DBG_PSHOUT=1..4        output t0 / v0 / r0 (base world shader ctl 0x1101 prog 1) or t1 (composite prog 0x21)
+ *   XBOXRECOMP_DBG_POST=1|2           skip the additive bloom composite / the final screen composite
+ *   XBOXRECOMP_DBG_TEXPPM=1           write tex_<offset>_<w>x<h>.ppm for decoded uploads >= 128 wide
+ *   XBOXRECOMP_DBG_ONLYINPUTS=<mask>  draw only programs whose vertex inputs equal <mask>
+ * (XBOXRECOMP_DBG_FOGF=<f> lives in d3d8_vsh.c: force the fog factor.) */
+static struct {
+    long skiptex;
+    int nolightpass, nomasked, nodepth, smallnodepth, eqle, shinv, shflip, pshout, post, texppm;
+    long onlyinputs;
+} g_dbg = { -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1 };
+
+static void dbg_init(void)
+{
+    const char *e;
+    g_dbg.skiptex = (e = getenv("XBOXRECOMP_DBG_SKIPTEX")) ? strtol(e, NULL, 0) : -1;
+    g_dbg.nolightpass = getenv("XBOXRECOMP_DBG_NOLIGHTPASS") != NULL;
+    g_dbg.nomasked = getenv("XBOXRECOMP_DBG_NOMASKED") != NULL;
+    g_dbg.nodepth = getenv("XBOXRECOMP_DBG_NODEPTH") != NULL;
+    g_dbg.smallnodepth = getenv("XBOXRECOMP_DBG_SMALLNODEPTH") != NULL;
+    g_dbg.eqle = getenv("XBOXRECOMP_DBG_EQLE") != NULL;
+    g_dbg.shinv = getenv("XBOXRECOMP_DBG_SHINV") != NULL;
+    g_dbg.shflip = (e = getenv("XBOXRECOMP_DBG_SHFLIP")) ? atoi(e) : 0;
+    g_dbg.pshout = (e = getenv("XBOXRECOMP_DBG_PSHOUT")) ? atoi(e) : 0;
+    g_dbg.post = (e = getenv("XBOXRECOMP_DBG_POST")) ? atoi(e) : 0;
+    g_dbg.texppm = getenv("XBOXRECOMP_DBG_TEXPPM") != NULL;
+    g_dbg.onlyinputs = (e = getenv("XBOXRECOMP_DBG_ONLYINPUTS")) ? strtol(e, NULL, 0) : -1;
+}
+
 /* XBOXRECOMP_SURFTRACE=<frame>: log every render-target switch, clear and
  * draw of that one frame, in order. Off unless set. */
 static int surftrace_on(void)
@@ -484,6 +522,7 @@ void pgraph_d3d11_init(void)
     g_pg.stencil_op_fail = g_pg.stencil_op_zfail = g_pg.stencil_op_zpass =
         NV097_SET_STENCIL_OP_V_KEEP;
     g_pg.blend_equation = NV097_SET_BLEND_EQUATION_V_FUNC_ADD;
+    dbg_init();
     g_pg.initialized = 1;
 
     fprintf(stderr, "[PGRAPH-D3D11] Translator initialized\n");
@@ -1344,6 +1383,26 @@ static int tex_entry_create(TexCacheEntry *entry, const TexSource *ts, int stage
         tex_decode_bgra(ts, conv);
         sd.pSysMem = conv;
         sd.SysMemPitch = ts->width * 4;
+    }
+
+    if (g_dbg.texppm && ts->width >= 128) {
+        char name[64];
+        FILE *f;
+        const uint8_t *px = (const uint8_t *)sd.pSysMem;
+        snprintf(name, sizeof(name), "tex_%08X_%ux%u.ppm", g_pg.tex[stage].offset,
+                 ts->width, ts->height);
+        if ((f = fopen(name, "wb")) != NULL) {
+            UINT yy, xx;
+            fprintf(f, "P6\n%u %u\n255\n", ts->width, ts->height);
+            for (yy = 0; yy < ts->height; yy++)
+                for (xx = 0; xx < ts->width; xx++) {
+                    const uint8_t *q = px + yy * sd.SysMemPitch + xx * 4;
+                    uint8_t rgb[3] = { q[2], q[1], q[0] };
+                    if (q[3] == 0) { rgb[0] = 255; rgb[1] = 0; rgb[2] = 255; }  /* transparent = magenta */
+                    fwrite(rgb, 1, 3, f);
+                }
+            fclose(f);
+        }
     }
 
     memset(&td, 0, sizeof(td));
@@ -2339,6 +2398,15 @@ static int bind_pixel_stage(void)
     /* Triangles only, fill mode (xemu psh.c); every mode this backend
      * draws is filled. */
     st.poly_offset = (g_pg.poly_offset_fill && g_pg.draw_mode >= 4) ? 1 : 0;
+    if (g_dbg.shinv) {
+        static const uint8_t inv[8] = { 7, 6, 5, 4, 3, 2, 1, 0 };
+        st.shadow_depth_func = inv[st.shadow_depth_func & 7];
+    }
+    st.dbg_shflip = (uint8_t)g_dbg.shflip;
+    if ((g_dbg.pshout >= 1 && g_dbg.pshout <= 3 && st.combiner_control == 0x1101 &&
+         st.shader_stage_program == 1) ||
+        (g_dbg.pshout == 4 && st.shader_stage_program == 0x21))
+        st.dbg_out = (uint8_t)g_dbg.pshout;
 
     for (i = 0; i < 4; i++) {
         uint32_t mode = (st.shader_stage_program >> (i * 5)) & 0x1F;
@@ -2597,6 +2665,18 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
     if (prim_count == 0)
         return;
 
+    if (g_dbg.skiptex >= 0 && g_pg.tex[0].enabled && g_pg.tex[0].offset == (uint32_t)g_dbg.skiptex)
+        return;
+    if (g_dbg.nolightpass && g_pg.blend_enable && g_pg.blend_sfactor == 0 && g_pg.blend_dfactor == 0x0301)
+        return;
+    if (g_dbg.nomasked && g_pg.color_mask == 0 && g_pg.surf_color_offset != 0)
+        return;
+    if (g_dbg.post == 1 && g_pg.blend_enable && g_pg.blend_sfactor == 1 && g_pg.blend_dfactor == 1 &&
+        g_pg.tex[0].enabled && g_pg.tex[0].offset == 0x021CA000 && g_pg.surf_color_offset != 0x021CA000)
+        return;
+    if (g_dbg.post == 2 && !g_pg.blend_enable && g_pg.tex[1].enabled && g_pg.tex[1].offset == 0x021CA000 &&
+        g_pg.tex[0].enabled && g_pg.tex[0].offset != 0x021CA000 && g_pg.surf_color_offset != 0x021CA000)
+        return;
     /* Render into the surfaces the title selected; nothing selected (a
      * colour-masked pass with depth off) draws nothing, so skip the work. */
     if (!bind_targets(0, 0))
@@ -2674,6 +2754,9 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
         }
         use_vsh = (g_pg.vsh.shader_handle != 0);
     }
+
+    if (g_dbg.onlyinputs >= 0 && (!use_vsh || g_pg.vsh.inputs_read != (uint16_t)g_dbg.onlyinputs))
+        return;
 
     uint32_t vsh_dst_offset[16];
     uint32_t vsh_stride = 0;
@@ -2916,6 +2999,10 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
      * with depth_clipping off). Clipping cut holes in close-up models whose
      * vertices leave the depth range. */
     d3d8_states_set_depth_clip(FALSE);
+    if (g_dbg.nodepth || (g_dbg.smallnodepth && num_verts <= 10))
+        dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, FALSE);
+    if (g_dbg.eqle && g_pg.depth_func == 0x0202)
+        dev->lpVtbl->SetRenderState(dev, D3DRS_ZFUNC, 4);
     dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
     dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
     /* The title's own blend state. Forcing SRCALPHA/INVSRCALPHA on for every

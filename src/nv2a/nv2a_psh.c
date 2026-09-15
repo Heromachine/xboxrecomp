@@ -385,7 +385,16 @@ static void append_shadowmap(const Psh *ps, Sb *vars, int i, int compare_z)
         sb_printf(vars, "float4 t%d = float4(1.0, 1.0, 1.0, 1.0);\n", i);
         return;
     }
-    tex_uv(ps, i, "pT%d.xy / pT%d.w", uv, sizeof(uv));
+    {
+        int m = ps->state->dbg_shflip;
+        const char *expr = m == 1 ? "float2(pT%d.x / pT%d.w, 1.0 - pT%d.y / pT%d.w)" :
+                           m == 2 ? "float2(1.0 - pT%d.x / pT%d.w, pT%d.y / pT%d.w)" :
+                           m == 3 ? "float2(1.0 - pT%d.x / pT%d.w, 1.0 - pT%d.y / pT%d.w)" :
+                           "pT%d.xy / pT%d.w";
+        char e2[160];
+        snprintf(e2, sizeof(e2), expr, i, i, i, i);
+        tex_uv(ps, i, e2, uv, sizeof(uv));
+    }
     sb_printf(vars, "float t%d_depth = texSamp%d.Sample(samp%d, ", i, i, i);
     sb_printf(vars, uv, i, i);
     sb_printf(vars, ").r * depthMax[%d];\n", i);
@@ -769,6 +778,13 @@ int nv2a_psh_generate(const NV2APshState *s, char *buf, size_t cap)
     }
     sb_printf(&out, "%s", vars_buf);
     sb_printf(&out, "%s", code_buf);
+    switch (s->dbg_out) {
+    case 1: sb_printf(&out, "fragColor.rgb = t0.rgb;\n"); break;
+    case 2: sb_printf(&out, "fragColor.rgb = v0.rgb;\n"); break;
+    case 3: if (ps.uses_r0) sb_printf(&out, "fragColor.rgb = r0.rgb;\n"); break;
+    case 4: sb_printf(&out, "fragColor.rgb = t1.rgb; fragColor.a = 1.0;\n"); break;
+    default: break;
+    }
     sb_printf(&out, "return fragColor;\n}\n");
 
     if (out.overflow || vars.overflow || code.overflow)

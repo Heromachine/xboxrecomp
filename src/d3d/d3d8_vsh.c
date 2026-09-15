@@ -1070,6 +1070,8 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "            fogFactor = nv2aFog.z + pow(2.0, -fogDistance * fogDistance * nv2aFog.w * nv2aFog.w * 32.0) - 1.5;\n"
         "        }\n"
         "        if (fogMode >= 4) fogFactor = abs(fogFactor);\n"
+        /* XBOXRECOMP_DBG_FOGF=<f>: force the fog factor (debug) */
+        "        if (nv2aSurface.w > 0.0) fogFactor = nv2aSurface.w;\n"
         "        oFog = (float4)fogFactor;\n"
         "    }\n\n");
 
@@ -1507,6 +1509,14 @@ void d3d8_vsh_set_surface(float width, float height, float zmax)
     g_vsh_constants.surface[0] = width;
     g_vsh_constants.surface[1] = height;
     g_vsh_constants.surface[2] = zmax;
+    {
+        static float fogf = -1.0f;
+        if (fogf < 0.0f) {
+            const char *e = getenv("XBOXRECOMP_DBG_FOGF");
+            fogf = e ? (float)atof(e) : 0.0f;
+        }
+        g_vsh_constants.surface[3] = fogf;
+    }
     g_vsh_constants_dirty = TRUE;
 }
 

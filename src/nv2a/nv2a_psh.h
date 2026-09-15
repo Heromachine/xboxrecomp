@@ -39,6 +39,12 @@ typedef struct {
     uint8_t alpha_func;            /* GL enum minus 0x200: 0 NEVER .. 7 ALWAYS */
     uint8_t z_perspective;         /* CONTROL0 Z_PERSPECTIVE_ENABLE: w-buffer */
     uint8_t poly_offset;           /* SET_POLY_OFFSET_FILL_ENABLE on a triangle draw */
+
+    /* Debug (XBOXRECOMP_DBG_*, set by the translator; 0 = off).
+     * dbg_shflip: 1 flip v, 2 flip u, 3 both, for shadow-map lookups.
+     * dbg_out: replace the output rgb -- 1 t0, 2 v0, 3 r0, 4 t1. */
+    uint8_t dbg_shflip;
+    uint8_t dbg_out;
 } NV2APshState;
 
 /* Pixel shader constant buffer at register(b0). 16-byte aligned; matches the
