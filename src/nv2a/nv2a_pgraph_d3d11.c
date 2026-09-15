@@ -884,10 +884,12 @@ static void convert_vsh_vertex(const uint8_t *src_vb, const uint32_t src_offset[
 #define NV2A_TEX_COLOR_YUV_CR8YB8CB8YA8 0x24
 #define NV2A_TEX_COLOR_YUV_YB8CR8YA8CB8 0x25
 
-/* Sized for a whole screen's textures at once. Breakdown's title screen binds
+/* Sized for a whole level's textures at once. Breakdown's title screen binds
  * about twenty, and with 16 slots and slot-0 eviction every frame re-uploaded
- * (and re-decoded) some of them. */
-#define TEX_CACHE_SIZE 64
+ * (and re-decoded) some of them. 64 was still far too few once play started:
+ * a play session in hon_under re-uploaded 1,065,000 times, every one of them
+ * a CPU-side decode, which is most of the cost of a combat scene. */
+#define TEX_CACHE_SIZE 512
 typedef struct {
     uint32_t key;                 /* hash of offset/format/control1/image_rect/palette */
     uint32_t checked_frame;       /* g_pg.stats.frames when the source was last
