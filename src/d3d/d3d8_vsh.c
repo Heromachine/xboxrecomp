@@ -1139,27 +1139,21 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
  * ================================================================ */
 
 /**
- * Default format for each input register.
- * This is the common Xbox convention; games may vary.
+ * Format of each input register as the NV2A path feeds it.
+ *
+ * Every register is a full float4, as xemu hands a vertex program each
+ * attribute as a vec4. The old per-slot guesses (point size and fog as one
+ * float, texture coordinates as two, colours as clamped bytes) dropped data
+ * programs really read: Breakdown's skinning takes its four bone indices from
+ * v6 (the "point size" slot), so with one float only the first bone index
+ * arrived, the others read 0, and multi-bone vertices stretched arms and tore
+ * holes in faces. Values the stream doesn't supply are filled the xemu way
+ * by the packer (0,0,0,1, or the attribute's inline value).
  */
 DXGI_FORMAT d3d8_vsh_default_input_format(int vreg)
 {
-    switch (vreg) {
-    case 0:  return DXGI_FORMAT_R32G32B32_FLOAT;    /* Position (xyz) */
-    case 1:  return DXGI_FORMAT_R32G32B32A32_FLOAT;  /* Blend weights */
-    case 2:  return DXGI_FORMAT_R32G32B32_FLOAT;     /* Normal */
-    case 3:  return DXGI_FORMAT_R8G8B8A8_UNORM;      /* Diffuse (D3DCOLOR) */
-    case 4:  return DXGI_FORMAT_R8G8B8A8_UNORM;      /* Specular (D3DCOLOR) */
-    case 5:  return DXGI_FORMAT_R32_FLOAT;            /* Fog */
-    case 6:  return DXGI_FORMAT_R32_FLOAT;            /* Point size */
-    case 7:  return DXGI_FORMAT_R8G8B8A8_UNORM;      /* Back diffuse */
-    case 8:  return DXGI_FORMAT_R8G8B8A8_UNORM;      /* Back specular */
-    case 9:  return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 0 */
-    case 10: return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 1 */
-    case 11: return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 2 */
-    case 12: return DXGI_FORMAT_R32G32_FLOAT;         /* Texcoord 3 */
-    default: return DXGI_FORMAT_R32G32B32A32_FLOAT;   /* Generic (13-15) */
-    }
+    (void)vreg;
+    return DXGI_FORMAT_R32G32B32A32_FLOAT;
 }
 
 UINT d3d8_vsh_input_format_size(DXGI_FORMAT fmt)
