@@ -19,6 +19,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdlib.h>
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
@@ -248,37 +249,48 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
+    /* XAudio2 path. frame_buf already holds this cycle's 256 samples of the
+     * title's own audio: mcpx_apu_dsp_frame() wrote the VP mix into it one
+     * 32-sample slice per sub-frame (the frame thread zeroes it when the
+     * VP pipeline isn't running). Mix the test tone and software voices on
+     * top and submit exactly those samples, as xemu's monitor frame does.
+     * This used to clear frame_buf first and submit 1024 samples of tone and
+     * software mixer only, so nothing the game played ever reached the
+     * speakers. */
     if (xa2_is_active()) {
-        int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
+        int chunk = MIXER_FRAME_SAMPLES;
 
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
-            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
-                    g_test_tone.phase += g_test_tone.phase_inc;
-                    if (g_test_tone.phase >= 2.0 * M_PI)
-                        g_test_tone.phase -= 2.0 * M_PI;
-                }
+        if (g_test_tone.active && !g_audio_muted) {
+            for (int i = 0; i < chunk; i++) {
+                int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                d->monitor.frame_buf[i][0] = s;
+                d->monitor.frame_buf[i][1] = s;
+                g_test_tone.phase += g_test_tone.phase_inc;
+                if (g_test_tone.phase >= 2.0 * M_PI)
+                    g_test_tone.phase -= 2.0 * M_PI;
             }
+        }
+        if (g_audio_muted)
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        else
+            mixer_render(d->monitor.frame_buf, chunk);
 
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
+        {
+            /* Level meter for logs: peak over ~5 s. */
+            static int peak, cycles;
+            for (int i = 0; i < chunk; i++) {
+                int l = abs(d->monitor.frame_buf[i][0]), r = abs(d->monitor.frame_buf[i][1]);
+                if (l > peak) peak = l;
+                if (r > peak) peak = r;
+            }
+            if (++cycles >= 937) {
+                fprintf(stderr, "[APU] output peak %d over last ~5 s\n", peak);
+                peak = 0;
+                cycles = 0;
+            }
         }
 
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
+        xa2_submit_samples((const int16_t *)d->monitor.frame_buf, chunk);
         return;
     }
 
@@ -436,7 +448,10 @@ static void *mcpx_apu_frame_thread(void *arg)
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);
         } else {
-            /* Lightweight: just monitor frame (test tone + software mixer) */
+            /* Lightweight: just monitor frame (test tone + software mixer).
+             * No VP output this cycle, so start from silence. */
+            if (((d->ep_frame_div + 1) % 8) == 0)
+                memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }

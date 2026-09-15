@@ -23,8 +23,8 @@
 
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
-#define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
-#define XA2_NUM_BUFS      3
+#define XA2_BUF_SAMPLES   1024   /* largest submission accepted */
+#define XA2_NUM_BUFS      24     /* 256-sample cycles: ~128 ms of queue */
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
