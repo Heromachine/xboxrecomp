@@ -94,6 +94,9 @@ static float clampf(float v, float mn, float mx)
     return v;
 }
 
+static unsigned g_apu_stream_segments, g_apu_stream_starved,
+                g_apu_stream_empty_segment;
+
 static float attenuate(uint16_t vol)
 {
     vol &= 0xFFF;
@@ -829,6 +832,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         count = d->vp.ssl[v].count[ssl_index];
 
         if (count == 0) {
+            g_apu_stream_starved++;
             voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                            NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
             d->vp.ssl[v].ssl_seg = 0;
@@ -846,6 +850,13 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         hwaddr addr = d->regs[NV_PAPU_VPSSLADDR] + page * 8;
         segment_offset = ldl_le_phys(address_space_memory, addr);
         segment_length = ldl_le_phys(address_space_memory, addr + 4);
+        if (segment_offset == 0 || segment_length == 0) {
+            /* The page table entry the title should have filled in is empty:
+             * it queued a segment the hardware has not been told about. */
+            g_apu_stream_empty_segment++;
+            return -1;
+        }
+        g_apu_stream_segments++;
         assert(segment_offset != 0);
         assert(segment_length != 0);
         seg_len = (segment_length >> 0) & 0xffff;
@@ -1257,6 +1268,23 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+
+    {
+        /* Streaming health, ~every 5 s. "Starved" means the title had queued
+         * nothing for a stream voice that wanted data -- speech arriving late
+         * or not at all looks like this from here. */
+        static unsigned frames;
+        if (++frames >= 937) {
+            fprintf(stderr, "[APU] streams: %u segments played, %u starved, "
+                    "%u empty page entries (~5 s)\n",
+                    g_apu_stream_segments, g_apu_stream_starved,
+                    g_apu_stream_empty_segment);
+            fflush(stderr);
+            g_apu_stream_segments = g_apu_stream_starved = 0;
+            g_apu_stream_empty_segment = 0;
+            frames = 0;
+        }
+    }
 
     /* Voices seen per frame, reported ~every 5 s. The XAudio2 queue is never
      * empty while sounds still cut in and out, so the question is whether the

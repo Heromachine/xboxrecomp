@@ -118,6 +118,9 @@ int xa2_is_active(void)
 
 /* Submit a buffer of mixed samples to XAudio2.
  * Called from APU frame thread. Returns 1 if buffer was submitted. */
+static unsigned long long g_xa2_samples_out;
+static void xa2_note_samples(int n) { g_xa2_samples_out += (unsigned)n; }
+
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
     XAUDIO2_VOICE_STATE state;
@@ -136,6 +139,8 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
      * and any backlog arrives late). */
     {
         static unsigned calls, dropped, dry;
+        static ULONGLONG last_ms;
+        unsigned long long samples_out = g_xa2_samples_out;
         static unsigned depth_min = ~0u, depth_max, depth_sum;
         unsigned d = state.BuffersQueued;
         calls++;
@@ -145,10 +150,22 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
         if (d == 0) dry++;
         if ((int)d >= XA2_NUM_BUFS) dropped++;
         if (calls >= 937) {
+            /* Samples per second actually delivered. 48000 is the rate the
+             * voice was opened at; anything else is drift, and drift is what
+             * makes speech run late against its captions and one-shot sounds
+             * fire early. */
+            ULONGLONG now_ms = GetTickCount64();
+            unsigned rate = 0;
+            if (last_ms && now_ms > last_ms)
+                rate = (unsigned)((unsigned long long)samples_out * 1000ull
+                                  / (now_ms - last_ms));
             fprintf(stderr, "[XA2] queue depth min/avg/max %u/%u/%u of %d, "
-                    "%u empty, %u dropped, over %u submissions (~5 s)\n",
+                    "%u empty, %u dropped, %u samples/s (want %d), "
+                    "over %u submissions (~5 s)\n",
                     depth_min, depth_sum / calls, depth_max, XA2_NUM_BUFS,
-                    dry, dropped, calls);
+                    dry, dropped, rate, XA2_SAMPLE_RATE, calls);
+            last_ms = now_ms;
+            g_xa2_samples_out = 0;
             fflush(stderr);
             calls = dropped = dry = depth_sum = depth_max = 0;
             depth_min = ~0u;
@@ -166,6 +183,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     xbuf.pAudioData = (const BYTE *)g_xa2_bufs[idx];
 
     IXAudio2SourceVoice_SubmitSourceBuffer(g_xa2_source, &xbuf, NULL);
+    xa2_note_samples(copy_samples);
 
     g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
     g_xa2_frames_written++;
