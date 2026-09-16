@@ -20,6 +20,7 @@
  */
 
 #include "apu_state.h"
+#include <math.h>
 #include "fpconv.h"
 
 /* #define DEBUG_MCPX */
@@ -878,9 +879,21 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             if (adpcm_block_index != (int)block_index) {
                 uint32_t linear_addr = block_index * (uint32_t)block_size;
                 if (stream) {
+                    /* Straight through apu_phys_ptr, like every other access
+                     * in this file. Masking to 26 bits is right in xemu, where
+                     * guest RAM really is 64 MB of physical memory, but wrong
+                     * here: a stream buffer in the 0x8xxxxxxx contiguous window
+                     * folded down to a low address that holds something else,
+                     * so the streamed BGM, effects and speech decoded from the
+                     * wrong bytes. See the note above apu_phys_ptr in
+                     * apu_shim.h, which fixed the same masking for the DSOUND
+                     * completion mailbox. */
                     hwaddr addr = segment_offset + linear_addr;
-                    memcpy(adpcm_block, &d->ram_ptr[addr & 0x03FFFFFF],
-                           block_size);
+                    const void *src = apu_phys_ptr(addr);
+                    if (src)
+                        memcpy(adpcm_block, src, block_size);
+                    else
+                        memset(adpcm_block, 0, block_size);
                 } else {
                     linear_addr += ba;
                     for (unsigned int word_index = 0;
@@ -1163,6 +1176,41 @@ static void voice_process(MCPXAPUState *d,
                                      NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
         if (hrtf_handle != HRTF_NULL_HANDLE) {
             hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
+        }
+    }
+
+    /* Per-voice meter: the raw samples this voice produced, and the gain it
+     * is mixed at. Sound that fades in and out with speech missing entirely
+     * needs these apart -- a voice playing silence is a streaming or buffer
+     * problem, a voice with samples but no gain is a volume problem. */
+    {
+        static unsigned frames, carried, silent, gainless;
+        static float loudest, loudest_gain;
+        float vpeak = 0.0f, gpeak = 0.0f;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            float a = fabsf(samples[i][0]);
+            if (a > vpeak) vpeak = a;
+        }
+        for (int b = 0; b < 8; b++) {
+            float g = attenuate(vol[b]);
+            if (g > gpeak) gpeak = g;
+        }
+        gpeak *= ea_value;
+        if (vpeak > loudest) loudest = vpeak;
+        if (vpeak < 1e-6f) silent++;
+        else if (gpeak < 1e-6f) gainless++;
+        else carried++;
+        if (gpeak > loudest_gain) loudest_gain = gpeak;
+        if (++frames >= 8000) {
+            fprintf(stderr, "[APU] voice mixes: %u with sound, %u silent, "
+                    "%u muted by gain, loudest sample %.3f, loudest gain %.4f "
+                    "(hrtf headroom %u, submix headroom bin0 %u bin1 %u)\n",
+                    carried, silent, gainless, loudest, loudest_gain,
+                    d->vp.hrtf_headroom, d->vp.submix_headroom[0],
+                    d->vp.submix_headroom[1]);
+            fflush(stderr);
+            frames = carried = silent = gainless = 0;
+            loudest = loudest_gain = 0.0f;
         }
     }
 

@@ -2411,6 +2411,37 @@ static void bridge_NtReadFile(void)
     }
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
+
+    /* Reads, ~every 5 s, plus every failed or short one. Breakdown streams
+     * BGM, sound effects and speech out of D:\stream\*.stw, and sound that
+     * fades in and out with speech missing entirely looks like streaming
+     * rather than mixing. A short read means the title got less audio than it
+     * asked for; a failure means it got none. */
+    {
+        static unsigned reads, shorts, failures;
+        static uint64_t bytes;
+        static ULONGLONG last_ms;
+        ULONGLONG now = GetTickCount64();
+        int bad = (int)ios.Status < 0 || (uint32_t)ios.Information < length;
+        reads++;
+        bytes += (uint32_t)ios.Information;
+        if ((int)ios.Status < 0) failures++;
+        else if ((uint32_t)ios.Information < length) shorts++;
+        if (bad && (failures + shorts) <= 20)
+            fprintf(stderr, "  [FILE] read %u bytes at %lld -> status 0x%08X, %u bytes\n",
+                    length, poff ? (long long)off.QuadPart : -1LL,
+                    (unsigned)ios.Status, (unsigned)ios.Information);
+        if (!last_ms) last_ms = now;
+        if (now - last_ms >= 5000) {
+            fprintf(stderr, "  [FILE] %u reads, %llu KB, %u short, %u failed (~5 s)\n",
+                    reads, (unsigned long long)(bytes / 1024), shorts, failures);
+            fflush(stderr);
+            reads = shorts = failures = 0;
+            bytes = 0;
+            last_ms = now;
+        }
+    }
+
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                             iostatus);
