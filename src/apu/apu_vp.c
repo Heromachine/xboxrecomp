@@ -1210,6 +1210,11 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 {
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
+    /* Voices seen per frame, reported ~every 5 s. The XAudio2 queue is never
+     * empty while sounds still cut in and out, so the question is whether the
+     * title's voices reach the mixer at all. */
+    int dbg_listed = 0, dbg_active = 0, dbg_idled = 0;
+
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
         top = voice_list_regs[list].top;
@@ -1228,14 +1233,35 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
 
+            dbg_listed++;
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+                dbg_idled++;
                 fe_method(d, SE2FE_IDLE_VOICE, v);
             } else {
+                dbg_active++;
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
             }
             d->regs[current] = d->regs[next];
+        }
+    }
+
+    {
+        static unsigned frames, listed, active, idled, max_active, silent_frames;
+        frames++;
+        listed += dbg_listed;
+        active += dbg_active;
+        idled += dbg_idled;
+        if ((unsigned)dbg_active > max_active) max_active = dbg_active;
+        if (dbg_active == 0) silent_frames++;
+        if (frames >= 937) {
+            fprintf(stderr, "[APU] voices per frame: %u listed, %u active "
+                    "(max %u), %u idled, %u of %u frames with no active voice "
+                    "(~5 s)\n", listed / frames, active / frames, max_active,
+                    idled / frames, silent_frames, frames);
+            fflush(stderr);
+            frames = listed = active = idled = max_active = silent_frames = 0;
         }
     }
 

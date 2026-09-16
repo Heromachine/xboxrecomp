@@ -68,6 +68,30 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
 
+    /* Which mixbins actually carry audio. Only 0 and 1 reach the output here;
+     * with the DSP stubbed, anything the title routes through a submix or an
+     * effect send is dropped, which would sound like effects cutting in and
+     * out while the music keeps playing. */
+    {
+        static float peak[NUM_MIXBINS];
+        static unsigned frames;
+        for (int b = 0; b < NUM_MIXBINS; b++)
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                float a = mixbins[b][i] < 0 ? -mixbins[b][i] : mixbins[b][i];
+                if (a > peak[b]) peak[b] = a;
+            }
+        if (++frames >= 937) {
+            char line[NUM_MIXBINS * 12 + 1];
+            int n = 0;
+            for (int b = 0; b < NUM_MIXBINS; b++)
+                n += snprintf(line + n, sizeof(line) - n, " %d:%.3f", b, peak[b]);
+            fprintf(stderr, "[APU] mixbin peaks%s (~5 s)\n", line);
+            fflush(stderr);
+            memset(peak, 0, sizeof(peak));
+            frames = 0;
+        }
+    }
+
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* Clamp to [-1, 1] range */

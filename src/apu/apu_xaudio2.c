@@ -128,6 +128,33 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     if (!g_xa2_initialized || !g_xa2_source) return 0;
 
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
+
+    /* Queue health, ~every 5 s. The queue is the whole story behind audio
+     * that cuts in and out: at 0 the voice has run dry and plays silence
+     * until the next submission (a gap), at XA2_NUM_BUFS the producer is
+     * ahead of the clock and this submission is dropped (lost samples,
+     * and any backlog arrives late). */
+    {
+        static unsigned calls, dropped, dry;
+        static unsigned depth_min = ~0u, depth_max, depth_sum;
+        unsigned d = state.BuffersQueued;
+        calls++;
+        depth_sum += d;
+        if (d < depth_min) depth_min = d;
+        if (d > depth_max) depth_max = d;
+        if (d == 0) dry++;
+        if ((int)d >= XA2_NUM_BUFS) dropped++;
+        if (calls >= 937) {
+            fprintf(stderr, "[XA2] queue depth min/avg/max %u/%u/%u of %d, "
+                    "%u empty, %u dropped, over %u submissions (~5 s)\n",
+                    depth_min, depth_sum / calls, depth_max, XA2_NUM_BUFS,
+                    dry, dropped, calls);
+            fflush(stderr);
+            calls = dropped = dry = depth_sum = depth_max = 0;
+            depth_min = ~0u;
+        }
+    }
+
     if ((int)state.BuffersQueued >= XA2_NUM_BUFS) return 0;
 
     idx = g_xa2_next_buf;
