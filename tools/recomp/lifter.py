@@ -951,6 +951,8 @@ class Lifter:
             return self._lift_sar(insn, ops)
         if m in ("rol", "ror"):
             return self._lift_rotate(insn, ops, m)
+        if m in ("rcl", "rcr"):
+            return self._lift_rotate_carry(insn, ops, m)
         if m in ("bsf", "bsr"):
             return self._lift_bit_scan(ops, m)
 
@@ -1491,8 +1493,62 @@ class Lifter:
             return [f"/* {m}: bad operands */"]
         dst = _fmt_operand_read(ops[0])
         cnt = _fmt_operand_read(ops[1])
-        func = "ROL32" if m == "rol" else "ROR32"
-        return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
+        width = _operand_width(ops[0]) or 4
+        bits = width * 8
+        if width == 4:
+            func = "ROL32" if m == "rol" else "ROR32"
+            return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
+        # 8/16-bit rotates wrap within their own width, which ROL32/ROR32
+        # cannot express: the upper bits of the register are not part of the
+        # value and must not rotate into it.
+        mask = (1 << bits) - 1
+        shift = f"(({cnt}) & {bits - 1})"
+        value = f"(({dst}) & 0x{mask:X}u)"
+        if m == "rol":
+            expr = (f"(({value} << {shift}) | ({value} >> (({bits} - {shift}) & {bits - 1})))"
+                    f" & 0x{mask:X}u")
+        else:
+            expr = (f"(({value} >> {shift}) | ({value} << (({bits} - {shift}) & {bits - 1})))"
+                    f" & 0x{mask:X}u")
+        return [_fmt_operand_write(ops[0], expr)]
+
+    def _lift_rotate_carry(self, insn, ops, m):
+        """
+        rcl/rcr: rotate through the carry flag, so the rotation is one bit
+        wider than the operand.
+
+        These were emitted as a `/* TODO */` comment, which silently dropped
+        them. Breakdown's CRT 64-bit divide (sub_001B10B0, _aulldiv) shifts a
+        64-bit value with `shr ecx, 1; rcr ebx, 1`, so with the rcr dropped the
+        low half never moved: every 64-bit division in the title returned a
+        wrong quotient.
+
+        x86 masks the count to 5 bits and then takes it modulo (bits + 1); a
+        count of 0 leaves both value and flags alone. The loop is the
+        definition, and the counts here are 1.
+        """
+        if len(ops) < 2:
+            return [f"/* {m}: bad operands */"]
+        dst = _fmt_operand_read(ops[0])
+        cnt = _fmt_operand_read(ops[1])
+        width = _operand_width(ops[0]) or 4
+        bits = width * 8
+        mask = (1 << bits) - 1
+        if m == "rcl":
+            step = [f"    unsigned _rc_b = (_rc_v >> {bits - 1}) & 1u;",
+                    f"    _rc_v = ((_rc_v << 1) | (uint32_t)(_cf & 1)) & 0x{mask:X}u;",
+                    "    _cf = (int)_rc_b;"]
+        else:
+            step = ["    unsigned _rc_b = _rc_v & 1u;",
+                    f"    _rc_v = (_rc_v >> 1) | ((uint32_t)(_cf & 1) << {bits - 1});",
+                    "    _cf = (int)_rc_b;"]
+        return ([f"{{ uint32_t _rc_v = ({dst}) & 0x{mask:X}u;",
+                 f"  unsigned _rc_n = (unsigned)(({cnt}) & 31) % {bits + 1}u;",
+                 "  while (_rc_n--) {"]
+                + ["  " + line for line in step]
+                + ["  }",
+                   "  " + _fmt_operand_write(ops[0], "_rc_v"),
+                   f"}} /* {m} */"])
 
     def _lift_bit_scan(self, ops, mnemonic):
         if len(ops) < 2:

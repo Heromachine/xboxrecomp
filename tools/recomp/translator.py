@@ -727,15 +727,18 @@ class FunctionTranslator:
             # width, so the branch tests what the compare saw.
 
 
-        # Add _cf for carry-dependent instructions (sbb, adc)
-        has_carry = any(insn.mnemonic in ("sbb", "adc")
+        # Add _cf for carry-dependent instructions (sbb, adc, rcl, rcr)
+        has_carry = any(insn.mnemonic in ("sbb", "adc", "rcl", "rcr")
                         for insn in instructions)
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")
         # Only functions that consume CF pay for producing it: an adc/sbb
         # reading a never-written _cf silently drops every carry, which
         # corrupts multi-word arithmetic (add/adc pairs) and the shr/adc
-        # idiom MSVC emits for odd trailing elements.
+        # idiom MSVC emits for odd trailing elements. rcl/rcr rotate THROUGH
+        # the carry, so they consume it too -- and without them in this list
+        # a function whose only carry user is an rcr would not even declare
+        # _cf, which is how the CRT 64-bit divide lost its low half.
         self.lifter.needs_cf = has_carry
         self.lifter.publishes_ebp = self._func_has_prologue(instructions)
 
