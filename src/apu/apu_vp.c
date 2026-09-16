@@ -94,8 +94,11 @@ static float clampf(float v, float mn, float mx)
     return v;
 }
 
+static unsigned g_apu_unhandled_methods, g_apu_last_unhandled;
 static unsigned g_apu_stream_segments, g_apu_stream_starved,
-                g_apu_stream_empty_segment;
+                g_apu_stream_empty_segment, g_apu_stream_advances,
+                g_apu_stream_notifies;
+static unsigned long long g_apu_stream_samples;
 
 static float attenuate(uint16_t vol)
 {
@@ -565,6 +568,17 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                           + (d->vp.ssl_base_page * 8)
                           + (method - NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET);
             stl_le_phys(address_space_memory, addr, argument);
+        } else if (method == NV1BA0_PIO_GET_VOICE_POSITION
+                   || method == NV1BA0_PIO_SET_CONTEXT_DMA_NOTIFY
+                   || method == NV1BA0_PIO_SET_CURRENT_SSL_CONTEXT_DMA) {
+            /* xemu asserts on these; here they are counted, so a title that
+             * really uses them is visible instead of silently mishandled. */
+            static unsigned seen[3];
+            int i = method == NV1BA0_PIO_GET_VOICE_POSITION ? 0
+                  : method == NV1BA0_PIO_SET_CONTEXT_DMA_NOTIFY ? 1 : 2;
+            if (seen[i]++ == 0)
+                fprintf(stderr, "[APU] VP method 0x%04X used by the title "
+                        "(unimplemented)\n", (unsigned)method);
         } else if (method >= NV1BA0_PIO_SET_SUBMIX_HEADROOM &&
                    method <= NV1BA0_PIO_SET_SUBMIX_HEADROOM + 4 * (NUM_MIXBINS - 1)) {
             assert((method & 3) == 0);
@@ -577,7 +591,11 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                     method < NV1BA0_PIO_SET_OUTBUF_LEN + 32)) {
             /* Outbuf base/length - ignore for now */
         } else {
-            /* Unknown method - silently ignore */
+            /* Genuinely unhandled: count it. A dropped "stop this voice" would
+             * sound exactly like the stale audio heard across an area change,
+             * so these must not stay invisible. */
+            g_apu_unhandled_methods++;
+            g_apu_last_unhandled = (uint32_t)method;
             DPRINTF("Unknown FE method: 0x%08X arg=0x%08X\n", method, argument);
         }
         break;
@@ -970,9 +988,12 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             samples[sample_count][1] = samples[sample_count][0];
         }
     }
+    if (stream)
+        g_apu_stream_samples += (unsigned)sample_count;
 
     if (cbo >= ebo) {
         if (stream) {
+            g_apu_stream_advances++;
             d->vp.ssl[v].ssl_seg += 1;
             cbo = 0;
             if (d->vp.ssl[v].ssl_seg < d->vp.ssl[v].count[ssl_index]) {
@@ -981,6 +1002,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 int next_index = (ssl_index + 1) % 2;
                 d->vp.ssl[v].ssl_index = next_index;
                 d->vp.ssl[v].ssl_seg = 0;
+                g_apu_stream_notifies++;
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
                                   NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
             }
@@ -1270,18 +1292,27 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
     {
-        /* Streaming health, ~every 5 s. "Starved" means the title had queued
+        /* Streaming health, every 937 VP frames (~0.6 s). "Starved" means the title had queued
          * nothing for a stream voice that wanted data -- speech arriving late
          * or not at all looks like this from here. */
         static unsigned frames;
         if (++frames >= 937) {
-            fprintf(stderr, "[APU] streams: %u segments played, %u starved, "
-                    "%u empty page entries (~5 s)\n",
+            if (g_apu_unhandled_methods)
+                fprintf(stderr, "[APU] %u VP methods dropped (last 0x%04X)\n",
+                        g_apu_unhandled_methods, g_apu_last_unhandled);
+            g_apu_unhandled_methods = 0;
+            fprintf(stderr, "[APU] streams: %u frames, %u starved, %u empty, "
+                    "%u segment advances, %u buffer-done notifies, "
+                    "%llu samples consumed (~0.6 s)\n",
                     g_apu_stream_segments, g_apu_stream_starved,
-                    g_apu_stream_empty_segment);
+                    g_apu_stream_empty_segment, g_apu_stream_advances,
+                    g_apu_stream_notifies,
+                    (unsigned long long)g_apu_stream_samples);
             fflush(stderr);
             g_apu_stream_segments = g_apu_stream_starved = 0;
             g_apu_stream_empty_segment = 0;
+            g_apu_stream_advances = g_apu_stream_notifies = 0;
+            g_apu_stream_samples = 0;
             frames = 0;
         }
     }

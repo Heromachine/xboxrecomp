@@ -444,6 +444,25 @@ static void *mcpx_apu_frame_thread(void *arg)
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
 
+        {
+            /* Which branch the frame thread takes, ~every 5 s. The EP frame is
+             * 8 sub-frames of 32 samples; the VP must run for each of them or
+             * the monitor submits 256 samples of which only some are fresh. */
+            static unsigned iters, full, light;
+            static ULONGLONG last;
+            ULONGLONG now = GetTickCount64();
+            iters++;
+            if (apu_active && !g_test_tone.active) full++; else light++;
+            if (!last) last = now;
+            if (now - last >= 5000) {
+                fprintf(stderr, "[APU] frame thread: %u iterations, %u full "
+                        "pipeline, %u monitor-only (~5 s)\n", iters, full, light);
+                fflush(stderr);
+                iters = full = light = 0;
+                last = now;
+            }
+        }
+
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);
