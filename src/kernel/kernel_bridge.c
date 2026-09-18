@@ -691,6 +691,11 @@ static void bridge_NtClose(void)
 {
     uint32_t raw_handle = STACK_ARG(0);
 
+    if (getenv("XBOXRECOMP_SAVE_TRACE")) {
+        fprintf(stderr, "  [SAVE] NtClose token=0x%08X\n", raw_handle);
+        fflush(stderr);
+    }
+
     if (g_kernel_call_count <= 200) {
         fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X\n", raw_handle);
         fflush(stderr);
@@ -2412,6 +2417,15 @@ static void bridge_NtReadFile(void)
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
 
+    if (getenv("XBOXRECOMP_SAVE_TRACE")) {
+        fprintf(stderr, "  [SAVE] NtReadFile token=0x%08X len=%u off=%lld "
+                "status=0x%08X info=%u ret=0x%08X event=0x%08X apc=0x%08X\n",
+                STACK_ARG(0), length, poff ? (long long)off.QuadPart : -1LL,
+                (unsigned)ios.Status, (unsigned)ios.Information,
+                (unsigned)g_eax, STACK_ARG(1), STACK_ARG(2));
+        fflush(stderr);
+    }
+
     /* Reads, ~every 5 s, plus every failed or short one. Breakdown streams
      * BGM, sound effects and speech out of D:\stream\*.stw, and sound that
      * fades in and out with speech missing entirely looks like streaming
@@ -2467,6 +2481,14 @@ static void bridge_NtWriteFile(void)
     }
     g_eax = (uint32_t)xbox_NtWriteFile(handle, NULL, NULL, NULL, &ios,
                 XBOX_TO_NATIVE(buffer_va), length, poff);
+    if (getenv("XBOXRECOMP_SAVE_TRACE")) {
+        fprintf(stderr, "  [SAVE] NtWriteFile token=0x%08X len=%u off=%lld "
+                "status=0x%08X info=%u ret=0x%08X event=0x%08X apc=0x%08X\n",
+                STACK_ARG(0), length, poff ? (long long)off.QuadPart : -1LL,
+                (unsigned)ios.Status, (unsigned)ios.Information,
+                (unsigned)g_eax, STACK_ARG(1), STACK_ARG(2));
+        fflush(stderr);
+    }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                             iostatus);
@@ -2546,6 +2568,12 @@ static void bridge_NtFlushBuffersFile(void)
 
     memset(&ios, 0, sizeof(ios));
     g_eax = (uint32_t)xbox_NtFlushBuffersFile(handle, &ios);
+    if (getenv("XBOXRECOMP_SAVE_TRACE")) {
+        fprintf(stderr, "  [SAVE] NtFlushBuffersFile token=0x%08X status=0x%08X "
+                "info=%u ret=0x%08X\n", STACK_ARG(0), (unsigned)ios.Status,
+                (unsigned)ios.Information, (unsigned)g_eax);
+        fflush(stderr);
+    }
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
@@ -3718,9 +3746,9 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     /* case 252: bridge_PhyGetLinkState */
     /* case 253: bridge_PhyInitialize */
     /* case 305: bridge_RtlTimeToTimeFields */
-    /* case 335: bridge_XcSHAInit */
-    /* case 336: bridge_XcSHAUpdate */
-    /* case 337: bridge_XcSHAFinal */
+    case 335: return bridge_XcSHAInit;
+    case 336: return bridge_XcSHAUpdate;
+    case 337: return bridge_XcSHAFinal;
     /* case 340: bridge_XcHMAC */
     /* case 346: bridge_XcDESKeyParity */
 
