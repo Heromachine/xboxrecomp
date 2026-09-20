@@ -74,7 +74,7 @@ extern "C" {
 #define NV2A_VS_MAX_SLOTS           128
 
 /** Shader cache size (hashed microcode -> compiled shader). */
-#define NV2A_VS_CACHE_SIZE          64
+#define NV2A_VS_CACHE_SIZE          256
 
 /**
  * Fixed hardware constant-file slots for the viewport scale/offset, NOT
