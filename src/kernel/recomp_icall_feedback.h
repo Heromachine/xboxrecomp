@@ -21,9 +21,18 @@
  * the whole image for a 7.7 MiB XBE (tools/disasm/config.py XBE_BASE_ADDRESS /
  * XBE_IMAGE_SIZE). Targets outside the window are ignored rather than clamped --
  * a wrong bucket is worse than a missing one, because it would seed function
- * detection at an address the title never actually branched to. */
+ * detection at an address the title never actually branched to.
+ *
+ * Override per title from the build, e.g. -DRECOMP_ICALL_FB_SIZE=0x00900000u.
+ * Burnout needs that: its image runs to 0x008C7140 and its executable DOLBY
+ * section sits at 0x008AAFC0, past the end of the 8 MiB default, so with the
+ * default those targets are silently dropped. */
+#ifndef RECOMP_ICALL_FB_BASE
 #define RECOMP_ICALL_FB_BASE 0x00010000u
+#endif
+#ifndef RECOMP_ICALL_FB_SIZE
 #define RECOMP_ICALL_FB_SIZE 0x00800000u  /* 8 MiB */
+#endif
 
 /* Flags OR'd into g_icall_seen[va - base]. */
 #define RECOMP_ICALL_SEEN_RESOLVED   1u  /* dispatch found a translation */
