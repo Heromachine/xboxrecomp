@@ -153,6 +153,34 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         }
     }
 
+    /* Back the raw \Device\CdRom0 device with a small file.
+     *
+     * Titles open the DVD drive as a device -- not as a filesystem -- to
+     * interrogate the media: Burnout does so in sub_00018C9F and immediately
+     * issues a SCSI MODE SENSE(10) through IOCTL_SCSI_PASS_THROUGH_DIRECT,
+     * which kernel_file.c answers. Without a backing object the open fails
+     * with STATUS_OBJECT_PATH_NOT_FOUND, the title treats that as "no disc"
+     * and returns to the dashboard.
+     *
+     * This is a handle placeholder, NOT a disc image: it exists so the device
+     * can be opened and IOCTLs issued against it. Raw sector reads of the disc
+     * are not supported, and a title attempting one will read zeroes -- which
+     * is why it is one sector long rather than pretending to be a disc. */
+    {
+        WCHAR cd[MAX_PATH];
+        swprintf_s(cd, MAX_PATH, L"%s\\cdrom0.dev", s_save_dir);
+        if (GetFileAttributesW(cd) == INVALID_FILE_ATTRIBUTES) {
+            HANDLE h = CreateFileW(cd, GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                                   FILE_ATTRIBUTE_NORMAL, NULL);
+            if (h != INVALID_HANDLE_VALUE) {
+                LARGE_INTEGER sz; sz.QuadPart = 2048;   /* one DVD sector */
+                SetFilePointerEx(h, sz, NULL, FILE_BEGIN);
+                SetEndOfFile(h);
+                CloseHandle(h);
+            }
+        }
+    }
+
     s_initialized = TRUE;
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S", s_game_dir, s_save_dir);
 }
@@ -178,6 +206,22 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
                 xbox_path);
         fflush(stderr);
         swprintf_s(host_path_buf, buf_size, L"%s\\partition0.bin", s_save_dir);
+        return TRUE;
+    }
+
+    /* Raw CD-ROM device. Same bare-vs-separator convention as the partitions
+     * above: "\Device\CdRom0" with nothing after it addresses the DEVICE, so
+     * it maps to the backing object and is where SCSI pass-through IOCTLs are
+     * aimed. "\Device\CdRom0\..." is the FILESYSTEM on the disc and is left
+     * to the prefix rules below, which map it to the game directory.
+     *
+     * The explicit end-of-string test is what keeps those two apart; matching
+     * the prefix alone would swallow every file path on the disc. */
+    if ((skip = match_prefix(xbox_path, "\\Device\\CdRom0")) != 0 &&
+        xbox_path[skip] == '\0') {
+        fprintf(stderr, "  [PATH] %s -> cdrom0.dev (raw CD-ROM device)\n", xbox_path);
+        fflush(stderr);
+        swprintf_s(host_path_buf, buf_size, L"%s\\cdrom0.dev", s_save_dir);
         return TRUE;
     }
 

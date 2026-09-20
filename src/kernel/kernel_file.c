@@ -1375,6 +1375,89 @@ NTSTATUS __stdcall xbox_NtDeviceIoControlFile(
         }
         return STATUS_SUCCESS;
     }
+    case 0x0004D014: {  /* IOCTL_SCSI_PASS_THROUGH_DIRECT */
+        /* SCSI pass-through to the DVD drive. Titles use this to interrogate
+         * the media rather than to read files; Burnout's sub_00018C9F opens
+         * \Device\CdRom0 and sends MODE SENSE(10) before it will start.
+         *
+         * Two things about the buffers here are easy to get wrong:
+         *  - the DIRECT variant returns its payload through the DataBuffer
+         *    pointer INSIDE this struct, not through OutputBuffer, which the
+         *    caller is entitled to pass as NULL (Burnout does);
+         *  - InputBuffer has already been converted to a native pointer by
+         *    the bridge, but DataBuffer is a field the GUEST wrote, so it is
+         *    still an Xbox VA and has to be translated here.
+         *
+         * SCSI_PASS_THROUGH_DIRECT (32-bit): Length@0 ScsiStatus@2 PathId@3
+         * TargetId@4 Lun@5 CdbLength@6 SenseInfoLength@7 DataIn@8
+         * DataTransferLength@12 TimeOutValue@16 DataBuffer@20
+         * SenseInfoOffset@24 Cdb@28..44 */
+        extern ptrdiff_t g_xbox_mem_offset;
+        unsigned char* spt = (unsigned char*)InputBuffer;
+        uint32_t data_va, data_len;
+        unsigned char* cdb;
+        unsigned char* data;
+
+        if (!spt || InputBufferLength < 44) return STATUS_INVALID_PARAMETER;
+
+        memcpy(&data_len, spt + 12, 4);
+        memcpy(&data_va,  spt + 20, 4);
+        cdb  = spt + 28;
+        data = data_va ? (unsigned char*)((uintptr_t)data_va + g_xbox_mem_offset)
+                       : NULL;
+
+        if (cdb[0] == 0x5A && data && data_len >= 13) {  /* MODE SENSE(10) */
+            unsigned int page = cdb[2] & 0x3F;
+            unsigned int len  = data_len < 28 ? data_len : 28;
+
+            memset(data, 0, len);
+            /* Mode parameter header (10-byte form): mode data length big-endian,
+             * medium type, device-specific byte, then block descriptor length. */
+            data[0] = (unsigned char)((len - 2) >> 8);
+            data[1] = (unsigned char)((len - 2) & 0xFF);
+            data[2] = 0x00;          /* medium type */
+            data[3] = 0x80;          /* device-specific: write protected */
+            data[6] = 0x00;          /* block descriptor length (none) */
+            data[7] = 0x00;
+
+            if (len >= 10) {
+                data[8] = (unsigned char)page;            /* page code echoed */
+                data[9] = (unsigned char)(len - 10);      /* page length */
+            }
+            /* Page payload. Burnout requires data[10] != 0, data[11] == 1 and
+             * data[12] != 0, retrying five times and refusing to start
+             * otherwise, so these are set to satisfy that check.
+             *
+             * HONEST LIMIT: the per-byte meaning of this vendor page is NOT
+             * verified. It is inferred from what the title accepts, not from
+             * ground truth, and no xemu capture of a real MODE SENSE reply has
+             * been compared against it yet. Treat these three values as a
+             * bring-up placeholder: if another title disagrees with them, get
+             * the real reply from xemu before "fixing" them to taste. */
+            if (len >= 13) {
+                data[10] = 0x01;
+                data[11] = 0x01;
+                data[12] = 0x01;
+            }
+
+            spt[2] = 0x00;           /* ScsiStatus: GOOD */
+            if (IoStatusBlock) {
+                IoStatusBlock->Status = STATUS_SUCCESS;
+                IoStatusBlock->Information = len;
+            }
+            return STATUS_SUCCESS;
+        }
+
+        /* Any other SCSI command: say so rather than returning a plausible
+         * empty buffer, so the next title to need one is easy to diagnose. */
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
+                 "SCSI pass-through: unhandled CDB opcode 0x%02X", cdb[0]);
+        if (IoStatusBlock) {
+            IoStatusBlock->Status = STATUS_NOT_IMPLEMENTED;
+            IoStatusBlock->Information = 0;
+        }
+        return STATUS_NOT_IMPLEMENTED;
+    }
     default:
         break;
     }
