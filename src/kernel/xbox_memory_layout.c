@@ -16,6 +16,7 @@
 #include "kernel.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>   /* getenv, for XBOXRECOMP_MEDIA_PATCH */
 
 /* XBE header field offsets (per xboxdevwiki.net/Xbe) */
 #define XBE_MAGIC_OFFSET        0x0000
@@ -580,6 +581,62 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         memcpy(XBOX_VA(XBOX_BASE_ADDRESS), xbe, header_size);
         fprintf(stderr, "  XBE header: %u bytes at %p (Xbox VA 0x%08X)\n",
                 header_size, XBOX_VA(XBOX_BASE_ADDRESS), XBOX_BASE_ADDRESS);
+
+        /*
+         * Relax the certificate's AllowedMediaTypes, the way a modchip BIOS
+         * does when it loads a title.
+         *
+         * A retail XBE says it may only run from a retail DVD (DVD_X2, 0x2),
+         * and titles check it: Burnout compares
+         * [[0x10118]+0x9C] & 0xFFFFFF against 2 in sub_00018D7D and, when it
+         * matches, opens \Device\CdRom0 and interrogates the drive over SCSI
+         * before it will start. We are not a retail DVD -- there is no drive
+         * here at all, only a directory of extracted files -- so satisfying
+         * that check means fabricating drive responses, and every further
+         * check the title makes would need another one.
+         *
+         * 0x00FFFFFF is not invented. It is the value the Complex 4627 BIOS
+         * writes, measured in xemu's RAM with the same title loaded while the
+         * on-disc field still read 0x00000002 (see the Burnout project,
+         * HeroLab task df74a7c7). Every modded console and emulator the title
+         * is likely to meet does this, so it is the well-trodden path rather
+         * than a novel one.
+         *
+         * Set XBOXRECOMP_MEDIA_PATCH=0 to leave the field alone and run the
+         * title's real media check instead -- kernel_file.c answers the
+         * resulting MODE SENSE, so that path still works. It is kept because
+         * it is the faithful-to-retail behaviour and is worth being able to
+         * exercise deliberately; this switch chooses between two working
+         * designs, it does not hide a broken one.
+         */
+        {
+            const char *env = getenv("XBOXRECOMP_MEDIA_PATCH");
+            int patch = !(env && env[0] == '0');
+            uint32_t cert_va = 0, cert_off = 0;
+
+            if (header_size >= 0x11C)
+                cert_va = *(const uint32_t *)((const uint8_t *)XBOX_VA(XBOX_BASE_ADDRESS) + 0x118);
+            if (cert_va >= XBOX_BASE_ADDRESS)
+                cert_off = cert_va - XBOX_BASE_ADDRESS;
+
+            if (!patch) {
+                fprintf(stderr, "  Media types: left as authored "
+                        "(XBOXRECOMP_MEDIA_PATCH=0); the title's own disc "
+                        "check will run\n");
+            } else if (cert_off != 0 && cert_off + 0xA0 <= header_size) {
+                uint32_t *amt = (uint32_t *)((uint8_t *)XBOX_VA(XBOX_BASE_ADDRESS)
+                                             + cert_off + 0x9C);
+                uint32_t was = *amt;
+                *amt = 0x00FFFFFFu;
+                fprintf(stderr, "  Media types: 0x%08X -> 0x%08X at Xbox VA "
+                        "0x%08X (disc checks bypassed)\n",
+                        was, *amt, cert_va + 0x9C);
+            } else {
+                fprintf(stderr, "  WARNING: certificate not reachable in the "
+                        "copied header (cert VA 0x%08X, header %u bytes); "
+                        "media types left as authored\n", cert_va, header_size);
+            }
+        }
     }
 
     /*
