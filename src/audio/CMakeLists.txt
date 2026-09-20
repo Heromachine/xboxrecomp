@@ -3,6 +3,7 @@
 
 add_library(xbox_dsound STATIC
     dsound_device.c
+    ac97_mmio_hook.c
 )
 
 target_include_directories(xbox_dsound PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
