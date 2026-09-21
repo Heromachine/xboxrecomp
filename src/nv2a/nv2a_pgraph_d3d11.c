@@ -1872,6 +1872,11 @@ static int bind_targets(int clearing, uint32_t clear_flags)
     }
 
     if (ci >= 0) {
+        { static int on = -1; static int n;
+          if (on < 0) { const char *e = getenv("XBOXRECOMP_METHODTRACE"); on = e && *e; }
+          if (on && (n++ < 8 || (n % 2000) == 0))
+              fprintf(stderr, "[BIND] %s -> surf idx %d addr=0x%08X\n",
+                      clearing ? "CLEAR" : "DRAW ", ci, g_surf[ci].d.addr); }
         rtv = g_surf[ci].rtv;
         g_surf[ci].write_seq = ++g_surf_seq;
         g_surf[ci].last_frame = g_pg.stats.frames;
@@ -2173,6 +2178,29 @@ static void present_surface(void)
     if (!ctx || !bb_rtv || g_present_surf < 0 || !g_surf[g_present_surf].in_use)
         return;
     s = &g_surf[g_present_surf];
+
+    /* Which surface actually reaches the screen, and what else was live.
+     * Rides XBOXRECOMP_METHODTRACE. A title that double-buffers writes two
+     * full-screen colour surfaces per pair of frames, and "the last one
+     * written" is a heuristic -- this says whether it picked the one the
+     * draws went into. */
+    { static int on = -1; static int n;
+      if (on < 0) { const char *e = getenv("XBOXRECOMP_METHODTRACE"); on = e && *e; }
+      if (on && (n++ < 4 || (n % 400) == 0)) {
+          int i;
+          fprintf(stderr, "[PRESENT-SURF] showing idx %d addr=0x%08X %ux%u "
+                  "write_seq=%u last_frame=%u | live:",
+                  g_present_surf, s->d.addr, s->d.width, s->d.height,
+                  s->write_seq, s->last_frame);
+          for (i = 0; i < SURF_MAX; i++)
+              if (g_surf[i].in_use && g_surf[i].is_color)
+                  fprintf(stderr, " [%d]0x%08X(seq=%u,f=%u)", i,
+                          g_surf[i].d.addr, g_surf[i].write_seq,
+                          g_surf[i].last_frame);
+          fprintf(stderr, "\n");
+          fflush(stderr);
+      } }
+
     ID3D11View_GetResource((ID3D11View *)bb_rtv, &bb);
     if (!bb)
         return;
