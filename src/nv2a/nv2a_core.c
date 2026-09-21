@@ -20,6 +20,10 @@ static NV2AState *g_nv2a = NULL;
 static MemoryRegion g_vram_region;
 static MemoryRegion g_ramin_region;
 
+/* PRAMIN window, matching xemu's subregion at MMIO 0x700000. */
+#define NV_PRAMIN_OFFSET 0x700000u
+#define NV_PRAMIN_SIZE   0x100000u
+
 NV2AState *nv2a_get_state(void) {
     return g_nv2a;
 }
@@ -79,20 +83,81 @@ DMAObject nv_dma_load(NV2AState *d, hwaddr dma_obj_address)
     };
 }
 
+/* Resolve an object HANDLE to its RAMIN instance address through the RAMHT.
+ *
+ * The parameter a title passes to SET_CONTEXT_DMA_* is a handle, not a RAMIN
+ * offset -- Burnout binds its semaphore object with handle 8, and RAMIN offset
+ * 8 is in the middle of the hash table itself. The table maps it:
+ *   handle 0x00000008 -> context 0x8000011B -> instance 0x11B << 4 = 0x11B0
+ * and RAMIN 0x11B0 holds the object {limit 0x20, address 0x03FFD000}, which is
+ * the physical address of the dword the title polls.
+ *
+ * Hash and layout are xemu's (hw/xbox/nv2a/pfifo.c ramht_hash/ramht_lookup).
+ * Returns 0 if the handle is not found, which callers must treat as "cannot
+ * resolve" rather than "RAMIN offset 0".
+ */
+uint32_t nv_ramht_instance(NV2AState *d, uint32_t handle)
+{
+    uint32_t ramht_reg = d->pfifo.regs[NV_PFIFO_RAMHT / 4];
+    unsigned ramht_size = 1u << (GET_MASK(ramht_reg, NV_PFIFO_RAMHT_SIZE) + 12);
+    unsigned bits = (unsigned)ctz32(ramht_size) - 1;
+    hwaddr base = (hwaddr)GET_MASK(ramht_reg, NV_PFIFO_RAMHT_BASE_ADDRESS) << 12;
+    uint32_t h = handle, hash = 0;
+    unsigned channel_id;
+    hwaddr entry;
+
+    if (!d->ramin_ptr || bits == 0 || bits > 31)
+        return 0;
+
+    while (h) {
+        hash ^= (h & ((1u << bits) - 1u));
+        h >>= bits;
+    }
+    channel_id = GET_MASK(d->pfifo.regs[NV_PFIFO_CACHE1_PUSH1 / 4],
+                          NV_PFIFO_CACHE1_PUSH1_CHID);
+    hash ^= channel_id << (bits - 4);
+
+    entry = base + (hwaddr)hash * 8;
+    if (entry + 8 > NV_PRAMIN_SIZE)
+        return 0;
+
+    {
+        const uint8_t *p = d->ramin_ptr + entry;
+        uint32_t entry_handle  = ldl_le_p((const uint32_t *)p);
+        uint32_t entry_context = ldl_le_p((const uint32_t *)(p + 4));
+        if (entry_handle != handle || !(entry_context & NV_RAMHT_STATUS))
+            return 0;
+        return (entry_context & NV_RAMHT_INSTANCE) << 4;
+    }
+}
+
 void *nv_dma_map(NV2AState *d, hwaddr dma_obj_address, hwaddr *len)
 {
     DMAObject dma = nv_dma_load(d, dma_obj_address);
-    dma.address &= 0x07FFFFFF;
+    uint32_t ram_size = 0;
+    uint8_t *ram;
 
-    if (dma.address >= memory_region_size(d->vram)) {
-        fprintf(stderr, "[NV2A] DMA map address 0x%llx out of VRAM range\n",
-                (unsigned long long)dma.address);
+    /* Resolve against GUEST RAM, not d->vram_ptr.
+     *
+     * On real hardware there is no separate VRAM: GPU memory IS system memory,
+     * and a DMA object's address is a physical address into it. d->vram_ptr is
+     * a private VirtualAlloc block disconnected from the guest, so resolving
+     * there returned a pointer into memory the title has never seen -- which
+     * is why the caution above pfifo_pull said this path wanted pointing at
+     * guest RAM before it could return anything real. It does now.
+     *
+     * Same 26-bit wrap as pb_read32: the Xbox memory controller wraps every
+     * physical address modulo installed RAM, so mask rather than reject. */
+    ram = (uint8_t *)nv2a_get_guest_ram(&ram_size);
+    if (!ram || ram_size == 0) {
         *len = 0;
         return NULL;
     }
 
+    dma.address &= 0x07FFFFFF;
+
     *len = dma.limit;
-    return d->vram_ptr + dma.address;
+    return ram + (dma.address & (ram_size - 1));
 }
 
 /* ============================================================
@@ -571,6 +636,13 @@ static int g_pgraph_in_begin = 0;
  * miscounted as a flip. */
 #define M_FLIP_INCREMENT_WRITE  0x012C
 #define M_FLIP_STALL            0x0130
+/* Back-end write semaphore. Looked up in nv2a_regs.h, not inferred:
+ * NV097_SET_CONTEXT_DMA_SEMAPHORE 0x01A4, NV097_SET_SEMAPHORE_OFFSET 0x1D6C,
+ * NV097_BACK_END_WRITE_SEMAPHORE_RELEASE 0x1D70. */
+#define M_SET_CONTEXT_DMA_SEMAPHORE 0x01A4
+#define M_SET_SEMAPHORE_OFFSET      0x1D6C
+#define M_BACK_END_WRITE_SEMAPHORE_RELEASE 0x1D70
+
 #define M_SET_VIEWPORT_OFFSET   0x0A20
 #define M_SET_VIEWPORT_SCALE    0x0AF0
 
@@ -607,6 +679,66 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
             fflush(stderr);
         }
         d3d8_PresentFrame();
+        return;
+    }
+
+    /*
+     * Back-end write semaphore: the GPU's answer to "how far have you got?".
+     *
+     * The driver keeps its own submission counter and will not reuse a buffer
+     * until the GPU reports having passed a given value, so a semaphore that
+     * never advances stops the title dead -- Burnout spins in its own D3D at
+     * sub_0012D3B0 polling the semaphore dword, needing 9, seeing 3 forever.
+     *
+     * Handled BEFORE the translator, which claims these methods and returns
+     * "handled", exactly as FLIP_STALL has to be.
+     *
+     * Semantics are xemu's (hw/xbox/nv2a/pgraph/pgraph.c,
+     * NV097_BACK_END_WRITE_SEMAPHORE_RELEASE): map the bound DMA object, add
+     * the semaphore offset, store the parameter there as a little-endian
+     * 32-bit word. xemu updates surfaces first; the equivalent here is
+     * flushing the translator's batched draws, so the release cannot be
+     * observed before the work it accounts for.
+     */
+    if (method == M_SET_CONTEXT_DMA_SEMAPHORE) {
+        d->pgraph.dma_semaphore = param;
+        d->pgraph.regs[method / 4] = param;
+        return;
+    }
+    if (method == M_SET_SEMAPHORE_OFFSET) {
+        d->pgraph.semaphore_offset = param;
+        d->pgraph.regs[method / 4] = param;
+        return;
+    }
+    if (method == M_BACK_END_WRITE_SEMAPHORE_RELEASE) {
+        hwaddr len = 0;
+        uint8_t *sem;
+
+        pgraph_d3d11_flush();
+
+        { uint32_t inst = nv_ramht_instance(d, d->pgraph.dma_semaphore);
+          sem = inst ? (uint8_t *)nv_dma_map(d, inst, &len) : NULL; }
+        if (sem && d->pgraph.semaphore_offset + 4 <= len) {
+            uint8_t *p = sem + d->pgraph.semaphore_offset;
+            /* Byte-wise, so an unaligned offset cannot fault on a host that
+             * cares, and little-endian explicitly rather than by memcpy. */
+            p[0] = (uint8_t)(param      );
+            p[1] = (uint8_t)(param >>  8);
+            p[2] = (uint8_t)(param >> 16);
+            p[3] = (uint8_t)(param >> 24);
+        } else {
+            static int warned;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "[PGRAPH] semaphore release 0x%08X dropped: "
+                        "dma 0x%08X offset 0x%X maps %s (len %llu)\n",
+                        param, d->pgraph.dma_semaphore,
+                        d->pgraph.semaphore_offset, sem ? "short" : "NULL",
+                        (unsigned long long)len);
+                fflush(stderr);
+            }
+        }
+        d->pgraph.regs[method / 4] = param;
         return;
     }
 
@@ -1023,8 +1155,37 @@ const NV2ABlockInfo blocktable[NV_NUM_BLOCKS] = {
  * MMIO dispatch (for VEH handler integration)
  * ============================================================ */
 
+/* PRAMIN is plain memory, not a register block.
+ *
+ * xemu maps it the same way -- memory_region_add_subregion(&d->mmio, 0x700000,
+ * &d->ramin) -- which is why its blocktable entry is commented out there and
+ * NULL here. Without this the window decodes to no block at all, so the DMA
+ * objects the driver writes into RAMIN never reach d->ramin_ptr and every
+ * nv_dma_load() reads back zeros. That is what dropped Burnout's semaphore
+ * releases: "dma 0x00000008 offset 0x0 maps short (len 0)".
+ */
+static inline bool pramin_range(hwaddr addr, unsigned int size, hwaddr *off)
+{
+    if (addr < NV_PRAMIN_OFFSET || addr >= NV_PRAMIN_OFFSET + NV_PRAMIN_SIZE)
+        return false;
+    *off = addr - NV_PRAMIN_OFFSET;
+    return *off + size <= NV_PRAMIN_SIZE;
+}
+
 uint64_t nv2a_mmio_read(NV2AState *d, hwaddr addr, unsigned int size)
 {
+    hwaddr ramin_off;
+    if (d->ramin_ptr && pramin_range(addr, size, &ramin_off)) {
+        const uint8_t *p = d->ramin_ptr + ramin_off;
+        switch (size) {
+        case 1: return p[0];
+        case 2: return (uint64_t)p[0] | ((uint64_t)p[1] << 8);
+        case 4: return (uint64_t)p[0] | ((uint64_t)p[1] << 8) |
+                       ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24);
+        default: return 0;
+        }
+    }
+
     /* Find which block handles this address */
     for (int i = 0; i < NV_NUM_BLOCKS; i++) {
         if (!blocktable[i].name) continue;
@@ -1040,6 +1201,21 @@ uint64_t nv2a_mmio_read(NV2AState *d, hwaddr addr, unsigned int size)
 
 void nv2a_mmio_write(NV2AState *d, hwaddr addr, uint64_t val, unsigned int size)
 {
+    hwaddr ramin_off;
+    if (d->ramin_ptr && pramin_range(addr, size, &ramin_off)) {
+        uint8_t *p = d->ramin_ptr + ramin_off;
+        switch (size) {
+        case 4: p[3] = (uint8_t)(val >> 24); p[2] = (uint8_t)(val >> 16);
+                /* fall through */
+        case 2: p[1] = (uint8_t)(val >> 8);
+                /* fall through */
+        case 1: p[0] = (uint8_t)val;
+                break;
+        default: break;
+        }
+        return;
+    }
+
     for (int i = 0; i < NV_NUM_BLOCKS; i++) {
         if (!blocktable[i].name) continue;
         if (addr >= blocktable[i].offset &&

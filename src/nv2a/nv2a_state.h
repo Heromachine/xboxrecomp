@@ -67,6 +67,14 @@ struct PGRAPHState {
     uint32_t pending_interrupts;
     uint32_t enabled_interrupts;
     uint32_t regs[0x2000];
+
+    /* Back-end write semaphore: how the GPU tells the driver how far it has
+     * got. dma_semaphore is the RAMIN offset of the DMA object bound by
+     * NV097_SET_CONTEXT_DMA_SEMAPHORE; semaphore_offset is the byte offset
+     * within it set by NV097_SET_SEMAPHORE_OFFSET. */
+    uint32_t dma_semaphore;
+    uint32_t semaphore_offset;
+
     /* Phase 3-4: Full PGRAPH state will go here */
 };
 
@@ -223,6 +231,9 @@ void nv2a_stub_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 /* DMA helpers */
 DMAObject nv_dma_load(NV2AState *d, hwaddr dma_obj_address);
 void *nv_dma_map(NV2AState *d, hwaddr dma_obj_address, hwaddr *len);
+
+/* Handle -> RAMIN instance address via the RAMHT. 0 means not found. */
+uint32_t nv_ramht_instance(NV2AState *d, uint32_t handle);
 
 /* PGRAPH method dispatch (from push buffer commands) */
 void pgraph_method(NV2AState *d, uint32_t subchannel,
