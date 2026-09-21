@@ -113,15 +113,33 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
         uintptr_t fault_addr = ep->ExceptionRecord->ExceptionInformation[1];
 
         /*
-         * GPU register probe at 0xFD000000 range.
-         * Some games probe NV2A registers directly. On real hardware this
-         * returns GPU state; here we just skip the instruction.
-         * TODO: Implement mini x86-64 decoder for instruction skipping,
-         * or connect to the xbox_nv2a library for proper handling.
+         * NV2A/MCPX register access.
+         *
+         * There is deliberately NO check here, and adding the obvious one is
+         * a trap. fault_addr is a HOST address; 0xFD000000 and 0xFE800000 are
+         * GUEST addresses. The two ranges are not the same numbers, and with
+         * a small g_xbox_mem_offset they OVERLAP -- so a test like
+         *
+         *     if (fault_addr >= 0xFD000000 && fault_addr < 0xFE000000)
+         *         return EXCEPTION_CONTINUE_SEARCH;
+         *
+         * silently swallows the very faults device emulation exists to
+         * service. That cost a title a debugging session: it was harmless
+         * while nothing emulated the GPU, then turned every register access
+         * into an unhandled page fault the moment one did.
+         *
+         * To wire up device emulation, convert to a guest VA FIRST and route
+         * on that:
+         *
+         *     uint32_t fault_va = (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset);
+         *     if (fault_va >= 0xFD000000u && fault_va < 0xFE000000u &&
+         *         nv2a_hook_handle_mmio(ep->ContextRecord, fault_addr, fault_va, is_write))
+         *         return EXCEPTION_CONTINUE_EXECUTION;
+         *
+         * and let anything unhandled fall through to the crash report below,
+         * so a decode gap is visible instead of looping on the same
+         * instruction forever.
          */
-        if (fault_addr >= 0xFD000000 && fault_addr < 0xFE000000) {
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
 
         fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
             (unsigned long long)ep->ContextRecord->Rip,
