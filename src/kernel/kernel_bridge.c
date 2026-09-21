@@ -3099,7 +3099,20 @@ static void bridge_MmQueryAllocationSize(void)
                  : (uint32_t)xbox_MmQueryAllocationSize(XBOX_TO_NATIVE(va));
 }
 
-/* ── NtCreateMutant (ordinal 192, 3 args) */
+/* ── NtCreateMutant (192) / NtReleaseMutant (221) ─────────
+ *
+ * Routed as a PAIR, deliberately. bridge_NtCreateMutant below was written
+ * earlier and left unregistered, which was the right call at the time: routing
+ * create without release is worse than routing neither. The create succeeds,
+ * the release falls through to the "no bridge" default and silently does
+ * nothing, and the mutex stays held forever by a thread that has already
+ * exited -- so the next acquirer blocks permanently, and the title looks alive
+ * because everything else keeps running.
+ *
+ * Burnout sits in exactly that shape: it opens 17 files, stops opening any
+ * more, and keeps drawing 2 primitives a frame indefinitely while ordinal 221
+ * is the most recent kernel call over and over.
+ */
 static void bridge_NtCreateMutant(void)
 {
     uint32_t handle_va = STACK_ARG(0);
@@ -3113,6 +3126,20 @@ static void bridge_NtCreateMutant(void)
                              (BOOLEAN)STACK_ARG(2));
     if (st >= 0 && handle_va) bridge_write_handle(handle_va, h);
     g_eax = (uint32_t)st;
+}
+
+/* ── NtReleaseMutant (ordinal 221, 2 args) ───────────────
+ *
+ * PreviousCount is an optional out-parameter; XBOX_TO_NATIVE maps a NULL guest
+ * pointer to NULL, and xbox_NtReleaseMutant checks it before writing. Guest
+ * LONG and host LONG are both 4 bytes, so this needs no local-and-copy dance
+ * -- the same reasoning as bridge_NtReleaseSemaphore.
+ */
+static void bridge_NtReleaseMutant(void)
+{
+    g_eax = (uint32_t)xbox_NtReleaseMutant(
+        bridge_resolve_handle(STACK_ARG(0)),
+        (PLONG)XBOX_TO_NATIVE(STACK_ARG(1)));
 }
 
 /* ── NtResumeThread (ordinal 224, 2 args) */
@@ -3717,7 +3744,10 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
      * call is indistinguishable in the log from a missing one. */
     case 175: return bridge_MmLockUnlockBufferPages;
     case 180: return bridge_MmQueryAllocationSize;
-    /* case 192: bridge_NtCreateMutant */
+    /* The mutant pair, routed together -- see their definitions for why one
+     * without the other deadlocks rather than merely under-serving. */
+    case 192: return bridge_NtCreateMutant;
+    case 221: return bridge_NtReleaseMutant;
     /* NtCreateSemaphore (193) / NtReleaseSemaphore (222): bridges written this
      * session -- see their definitions for why an unbridged NtCreateSemaphore
      * is actively harmful rather than merely absent (it reports SUCCESS and
@@ -3745,7 +3775,9 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 250: return bridge_ObfDereferenceObject;
     /* case 252: bridge_PhyGetLinkState */
     /* case 253: bridge_PhyInitialize */
-    /* case 305: bridge_RtlTimeToTimeFields */
+    /* Pure formatting: splits a timestamp into fields, touches no state. The
+     * body was already here; only the registration was missing. */
+    case 305: return bridge_RtlTimeToTimeFields;
     case 335: return bridge_XcSHAInit;
     case 336: return bridge_XcSHAUpdate;
     case 337: return bridge_XcSHAFinal;
