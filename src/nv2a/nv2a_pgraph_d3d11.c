@@ -2086,6 +2086,21 @@ static void clear_surface(uint32_t param)
     uint32_t c = g_pg.clear_color;   /* A8R8G8B8 */
     uint32_t zs = g_pg.zstencil_clear;
 
+    /* XBOXRECOMP_FORCE_CLEAR_COLOR=AARRGGBB replaces the title's clear colour.
+     *
+     * The point is to split "the display path is broken" from "the title drew
+     * nothing useful" in ONE run: if a dump or the window comes back this
+     * colour, everything from CLEAR_SURFACE through the render target, Present
+     * and the swap chain works, and the fault is in geometry or in which
+     * surface is bound. Breakdown settled exactly that question this way. */
+    { static int forced = -1; static uint32_t forced_c;
+      if (forced < 0) {
+          const char *e = getenv("XBOXRECOMP_FORCE_CLEAR_COLOR");
+          forced = e && *e;
+          if (forced) forced_c = (uint32_t)strtoul(e, NULL, 16);
+      }
+      if (forced) c = forced_c; }
+
     if (!bind_targets(1, param))
         return;
     nv2a_surf_dims(g_pg.surf_format, g_pg.surface_clip_h, g_pg.surface_clip_v, &w, &h);
