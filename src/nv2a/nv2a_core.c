@@ -651,6 +651,24 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
 {
     g_pgraph_method_count++;
 
+    /* XBOXRECOMP_METHODTRACE=<frame> prints every method of that ONE frame.
+     *
+     * Scoped to a frame because the interesting question is always "what did
+     * the title ask for in a frame that looked wrong", and a whole-run trace
+     * buries that in millions of lines. Frame numbers match the [PGRAPH] Frame
+     * counter, so pick one from a run and re-run to see inside it.
+     *
+     * Decode the result against nv2a_regs.h -- reading these numbers from
+     * memory is how four wrong constants got into this file once before. */
+    { static int want = -2;
+      if (want == -2) {
+          const char *e = getenv("XBOXRECOMP_METHODTRACE");
+          want = e && *e ? atoi(e) : -1;
+      }
+      if (want >= 0 && (int)g_pgraph_flip_count == want)
+          fprintf(stderr, "[MTRACE] %u sub=%u 0x%04X = 0x%08X\n",
+                  g_pgraph_method_count, subchannel, method, param); }
+
     /* Frame boundary, handled before the translator gets a say.
      *
      * FLIP_STALL is where the title says "that was a frame, show it" -- on

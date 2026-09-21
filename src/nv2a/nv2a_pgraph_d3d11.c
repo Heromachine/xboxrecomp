@@ -2108,6 +2108,18 @@ static void clear_surface(uint32_t param)
                               &x0, &y0, &x1, &y1))
         return;
 
+    /* Surface/clear state, printed with the method trace so a wrong-looking
+     * frame can be read against the dimensions it was actually drawn at. */
+    { static int on = -1; static int n;
+      if (on < 0) { const char *e = getenv("XBOXRECOMP_METHODTRACE"); on = e && *e; }
+      if (on && n++ < 8)
+        fprintf(stderr, "[CLEARDBG] surf_format=0x%08X clip_h=0x%08X clip_v=0x%08X "
+                "-> w=%u h=%u | rect_h=0x%08X rect_v=0x%08X -> x %u..%u y %u..%u "
+                "| color_off=0x%08X pitch=0x%08X\n",
+                g_pg.surf_format, g_pg.surface_clip_h, g_pg.surface_clip_v, w, h,
+                g_pg.clear_rect_h, g_pg.clear_rect_v, x0, x1, y0, y1,
+                g_pg.surf_color_offset, g_pg.surf_pitch); }
+
     rgba[0] = ((c >> 16) & 0xFF) / 255.0f;
     rgba[1] = ((c >> 8) & 0xFF) / 255.0f;
     rgba[2] = (c & 0xFF) / 255.0f;
