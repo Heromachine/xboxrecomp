@@ -1217,6 +1217,18 @@ static const uint8_t *tex_guest_span(uint32_t offset, size_t len)
     off = offset & (size - 1);
     if (len > (size_t)(size - off))
         return NULL;
+    { static int on = -1; static int n;
+      if (on < 0) { const char *e = getenv("XBOXRECOMP_METHODTRACE"); on = e && *e; }
+      if (on && (n++ < 6 || (n % 4000) == 0)) {
+          const uint8_t *p8 = ram + off;
+          int nz = 0; size_t i;
+          for (i = 0; i < len && i < 4096; i++) if (p8[i]) { nz = 1; break; }
+          fprintf(stderr, "[TEXSPAN] offset=0x%08X len=%zu -> %s  first16:"
+                  " %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                  offset, len, nz ? "HAS DATA" : "all zero",
+                  p8[0],p8[1],p8[2],p8[3],p8[4],p8[5],p8[6],p8[7]);
+          fflush(stderr);
+      } }
     return ram + off;
 }
 
