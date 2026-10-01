@@ -13,6 +13,7 @@
  *
  * The generated HLSL uses:
  *   - cbuffer at b1: 192 float4 constants (c0-c191)
+ *   - Texture2D<float4> at t0 (192x1): the same constants, for c[a0+n] reads
  *   - Input semantics: ATTR0-ATTR15 mapped to v0-v15
  *   - Output semantics: SV_POSITION, COLOR0/1, TEXCOORD0-3, FOG, PSIZE
  */
@@ -109,6 +110,29 @@ static BOOL g_vsh_constants_dirty = TRUE;
 /* D3D11 constant buffer for VS constants */
 static ID3D11Buffer *g_vsh_cb = NULL;
 
+/* The same 192 constants again, as a 192x1 Texture2D<float4> SRV at t0, read
+ * only by relative (c[a0+n]) accesses -- bone palettes, i.e. every skinned
+ * mesh.
+ *
+ * Indexing the cbuffer array with a dynamic index is legal HLSL, but Wine
+ * 9.0's builtin d3dcompiler (vkd3d-shader) lowers EACH such read into a full
+ * local copy of the array: a 76-insn skinning program came out of wined3d as
+ * vec4 X0[192] .. X23[192]. NVIDIA's GL linker rejects that (C5041 "cannot
+ * locate suitable resource to bind variable ... Possibly large array"), the
+ * program never links, the previous one stays bound, and every character
+ * draws in its bind pose (T-pose). A resource Load() is never lowered that
+ * way, so this works on any compiler/driver. Static c[n] reads stay on the
+ * cbuffer. Uploaded only when a relative-addressing shader draws and c[]
+ * changed since the last upload (g_vsh_rel_dirty).
+ *
+ * A texture, not Buffer<float4>/StructuredBuffer: the Wine 9.0 compiler
+ * rejects both as syntax errors, while Texture2D.Load() compiles on it and on
+ * Microsoft's d3dcompiler_47 alike without an indexable temp (checked with a
+ * D3DCompile + D3DDisassemble probe on both). */
+static ID3D11Texture2D          *g_vsh_rel_tex = NULL;
+static ID3D11ShaderResourceView *g_vsh_rel_srv = NULL;
+static BOOL                      g_vsh_rel_dirty = TRUE;
+
 /* Shader cache: maps microcode hash to compiled shader + input layout */
 typedef struct {
     uint32_t            hash;
@@ -119,6 +143,7 @@ typedef struct {
     uint16_t            layout_masks[16];
     int                 layout_count;
     uint16_t            inputs_read;  /* Which v registers are read */
+    int                 uses_rel;     /* Reads c[a0+n] -> needs g_vsh_rel_srv */
 } VshCacheEntry;
 
 static VshCacheEntry g_vsh_cache[NV2A_VS_CACHE_SIZE];
@@ -498,7 +523,7 @@ static void emit_source(StrBuf *sb, const NV2AVshSrcOperand *src, int scalar)
         break;
     case NV2A_VSH_REG_CONST:
         if (src->rel_addr)
-            sb_append(sb, "c[a0 + %d]", src->reg_index);
+            sb_append(sb, "cRel.Load(int3(a0 + %d, 0, 0))", src->reg_index);
         else
             sb_append(sb, "c[%d]", src->reg_index);
         break;
@@ -916,6 +941,7 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "    float4 nv2aSurface;\n"
         "    float4 nv2aFog;\n"
         "};\n"
+        "Texture2D<float4> cRel : register(t0);  /* c[] again, for c[a0+n] */\n"
         "\n", NV2A_VS_MAX_CONSTANTS);
 
     /* Input structure - only declare used inputs */
@@ -1329,6 +1355,7 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
 
     entry->vs_blob     = code;
     entry->inputs_read = program.inputs_read;
+    entry->uses_rel    = strstr(hlsl_buf, "cRel.Load(") != NULL;
     entry->layout_count = 0;
 
     fprintf(stderr, "D3D8 VSH: Compiled shader (hash 0x%08X, %d insns, inputs 0x%04X)\n",
@@ -1403,6 +1430,39 @@ HRESULT d3d8_vsh_init(void)
         return hr;
     }
 
+    /* Relative-read mirror of c[] (see g_vsh_rel_tex) */
+    {
+        D3D11_TEXTURE2D_DESC td;
+
+        memset(&td, 0, sizeof(td));
+        td.Width            = NV2A_VS_MAX_CONSTANTS;
+        td.Height           = 1;
+        td.MipLevels        = 1;
+        td.ArraySize        = 1;
+        td.Format           = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        td.SampleDesc.Count = 1;
+        td.Usage            = D3D11_USAGE_DYNAMIC;
+        td.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags   = D3D11_CPU_ACCESS_WRITE;
+
+        hr = ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, NULL,
+                                          &g_vsh_rel_tex);
+        if (FAILED(hr)) {
+            fprintf(stderr, "D3D8 VSH: Failed to create relative constant "
+                    "texture: 0x%08lX\n", hr);
+            return hr;
+        }
+
+        hr = ID3D11Device_CreateShaderResourceView(d3d8_GetD3D11Device(),
+                (ID3D11Resource *)g_vsh_rel_tex, NULL, &g_vsh_rel_srv);
+        if (FAILED(hr)) {
+            fprintf(stderr, "D3D8 VSH: Failed to create relative constant "
+                    "SRV: 0x%08lX\n", hr);
+            return hr;
+        }
+        g_vsh_rel_dirty = TRUE;
+    }
+
     fprintf(stderr, "D3D8 VSH: Vertex shader translator initialized\n");
     return S_OK;
 }
@@ -1427,6 +1487,14 @@ void d3d8_vsh_shutdown(void)
     if (g_vsh_cb) {
         ID3D11Buffer_Release(g_vsh_cb);
         g_vsh_cb = NULL;
+    }
+    if (g_vsh_rel_srv) {
+        ID3D11ShaderResourceView_Release(g_vsh_rel_srv);
+        g_vsh_rel_srv = NULL;
+    }
+    if (g_vsh_rel_tex) {
+        ID3D11Texture2D_Release(g_vsh_rel_tex);
+        g_vsh_rel_tex = NULL;
     }
 
     memset(g_vsh_slots, 0, sizeof(g_vsh_slots));
@@ -1548,6 +1616,7 @@ void d3d8_vsh_set_constant(int start_reg, const float *data, int count)
     }
 
     g_vsh_constants_dirty = TRUE;
+    g_vsh_rel_dirty = TRUE;
 }
 
 BOOL d3d8_vsh_is_programmable(DWORD handle)
@@ -1614,6 +1683,22 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
 
     /* Bind constant buffer to slot b1 */
     ID3D11DeviceContext_VSSetConstantBuffers(ctx, 1, 1, &g_vsh_cb);
+
+    /* Relative-read mirror at t0, only for shaders that read c[a0+n] */
+    if (entry->uses_rel && g_vsh_rel_srv) {
+        if (g_vsh_rel_dirty) {
+            /* One row, so RowPitch cannot split it: a flat copy is safe */
+            hr = ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)g_vsh_rel_tex,
+                                         0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+            if (SUCCEEDED(hr)) {
+                memcpy(mapped.pData, g_vsh_constants.c,
+                       sizeof(g_vsh_constants.c));
+                ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)g_vsh_rel_tex, 0);
+                g_vsh_rel_dirty = FALSE;
+            }
+        }
+        ID3D11DeviceContext_VSSetShaderResources(ctx, 0, 1, &g_vsh_rel_srv);
+    }
 
     return TRUE;
 }
