@@ -183,6 +183,36 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 
+/* mkdir -p for win_path's parent, so a plain file create never depends on
+ * host filesystem semantics for a missing intermediate directory.
+ *
+ * FATX has no such concept -- a title creating TDATA\4e4d0009 on real
+ * hardware never has to pre-create TDATA. On a local NTFS volume a missing
+ * parent usually surfaces as ERROR_PATH_NOT_FOUND, which titles tend to
+ * tolerate; on an SMB-backed path (this engine is routinely run from a
+ * network share) the same condition instead comes back ERROR_ACCESS_DENIED,
+ * which Breakdown's own error handling treats as fatal and reboots from
+ * (see HeroLab task 49e3133a). Creating the directory chain up front makes
+ * the two hosts agree regardless of which error a missing parent reports. */
+static void ensure_parent_directories(WCHAR* win_path)
+{
+    WCHAR* last_slash = wcsrchr(win_path, L'\\');
+    WCHAR saved;
+
+    if (!last_slash)
+        return;
+
+    saved = *last_slash;
+    *last_slash = L'\0';
+
+    if (win_path[0] != L'\0' && GetFileAttributesW(win_path) == INVALID_FILE_ATTRIBUTES) {
+        ensure_parent_directories(win_path);
+        CreateDirectoryW(win_path, NULL);
+    }
+
+    *last_slash = saved;
+}
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -203,14 +233,22 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
-        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
+        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF) {
+            ensure_parent_directories(win_path);
             CreateDirectoryW(win_path, NULL);
+        }
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
-        DWORD existing = GetFileAttributesW(win_path);
-        DWORD disp     = xbox_disposition_to_win32(CreateDisposition);
+        DWORD existing;
+        DWORD disp = xbox_disposition_to_win32(CreateDisposition);
+
+        if (CreateDisposition == XBOX_FILE_SUPERSEDE || CreateDisposition == XBOX_FILE_CREATE ||
+            CreateDisposition == XBOX_FILE_OPEN_IF   || CreateDisposition == XBOX_FILE_OVERWRITE_IF)
+            ensure_parent_directories(win_path);
+
+        existing = GetFileAttributesW(win_path);
 
         if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
             flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
@@ -816,6 +854,30 @@ static ULONG mode_to_xbox_attrs(mode_t m)
     return a;
 }
 
+/* mkdir -p for host_path's parent. See ensure_parent_directories (Win32
+ * backend) for why this matters even though POSIX mkdir's ENOENT/EACCES
+ * split is less surprising than Win32's -- a title still never has to
+ * pre-create FATX intermediate directories on real hardware. */
+static void ensure_parent_directories_posix(char* host_path)
+{
+    char* last_slash = strrchr(host_path, '/');
+    char saved;
+    struct stat st;
+
+    if (!last_slash || last_slash == host_path)
+        return;
+
+    saved = *last_slash;
+    *last_slash = '\0';
+
+    if (stat(host_path, &st) != 0) {
+        ensure_parent_directories_posix(host_path);
+        mkdir(host_path, 0755);
+    }
+
+    *last_slash = saved;
+}
+
 static NTSTATUS errno_to_status(int e)
 {
     switch (e) {
@@ -849,10 +911,15 @@ NTSTATUS __stdcall xbox_NtCreateFile(
 
     int fd;
     if (CreateOptions & XBOX_FILE_DIRECTORY_FILE) {
-        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF)
+        if (CreateDisposition == XBOX_FILE_CREATE || CreateDisposition == XBOX_FILE_OPEN_IF) {
+            ensure_parent_directories_posix(host_path);
             mkdir(host_path, 0755);   /* EEXIST is fine */
+        }
         fd = open(host_path, O_RDONLY | O_DIRECTORY);
     } else {
+        if (CreateDisposition == XBOX_FILE_SUPERSEDE || CreateDisposition == XBOX_FILE_CREATE ||
+            CreateDisposition == XBOX_FILE_OPEN_IF   || CreateDisposition == XBOX_FILE_OVERWRITE_IF)
+            ensure_parent_directories_posix(host_path);
         fd = open(host_path, posix_open_flags(DesiredAccess, CreateDisposition), 0644);
     }
 

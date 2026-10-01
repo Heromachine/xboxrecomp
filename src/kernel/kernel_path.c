@@ -43,6 +43,19 @@ typedef struct {
 
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
+    /* TDATA/UDATA under Partition1 are the title's writable save/profile
+     * data (same role as T:\TitleData and U:\UserData, just addressed
+     * through the older Partition1 path instead of the drive letter) --
+     * route them to save_dir like T:/U: already are, not to game_dir.
+     * game_dir may be a read-only disc-style install location (and, in
+     * this project's case, is routinely a NAS share whose ownership the
+     * running host has no write access to); save_dir is guaranteed
+     * writable (CSIDL_LOCAL_APPDATA / posix equivalent) and xbox_path_init
+     * already creates \TitleData and \UserData under it. These two rules
+     * must come before the generic Partition1 rule below (first match
+     * wins). See HeroLab task 49e3133a. */
+    { "\\Device\\Harddisk0\\Partition1\\TDATA\\", 1, "\\TitleData","/TitleData" },
+    { "\\Device\\Harddisk0\\Partition1\\UDATA\\", 1, "\\UserData", "/UserData"  },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     { "D:\\",                                 0, NULL,         NULL          },
     { "d:\\",                                 0, NULL,         NULL          },
