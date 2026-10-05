@@ -27,6 +27,11 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size);
 /* MMIO write to APU register space (addr is offset from 0xFE800000). */
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size);
 
+/* Called when the emulated global APU interrupt changes from clear to set.
+ * The standalone host can wake its guest ISR delivery thread immediately. */
+void mcpx_apu_set_irq_callback(MCPXAPUState *d,
+                               void (*callback)(void *opaque), void *opaque);
+
 /* Play a 440Hz test tone through the APU pipeline to verify audio output.
  * Directly programs a voice without going through DirectSound. */
 void mcpx_apu_play_test_tone(MCPXAPUState *d);

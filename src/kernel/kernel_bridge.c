@@ -27,6 +27,7 @@
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#include "../apu/apu_mmio_hook.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -1719,10 +1720,24 @@ static void bridge_KeInitializeInterrupt(void)
 static uint32_t g_connected_interrupts[MAX_DELIVERED_INTERRUPTS];
 static volatile LONG g_connected_interrupt_count = 0;
 
+/* Breakdown's APU ISR is sub_001D4F3F. The generic 60 Hz interrupt poll
+ * delays each SE2FE_IDLE_VOICE trap by up to a vblank, starving a VP that
+ * needs 1,500 32-sample subframes per second. Keep the poll as fallback,
+ * but wake this handler as soon as the APU raises GINTSTS. */
+#define BREAKDOWN_APU_ISR_ROUTINE 0x001D4F3Fu
+static HANDLE g_apu_irq_event;
+
+static void wake_breakdown_apu_isr(void *opaque)
+{
+    HANDLE event = (HANDLE)opaque;
+    if (event) SetEvent(event);
+}
+
 static DWORD WINAPI interrupt_delivery_thread(LPVOID param)
 {
     int slot;
     uint32_t stack_top, routine, context, interrupt_va;
+    bool apu_isr;
 
     interrupt_va = (uint32_t)(uintptr_t)param;
 
@@ -1740,6 +1755,7 @@ static DWORD WINAPI interrupt_delivery_thread(LPVOID param)
 
     routine = BRIDGE_MEM32(interrupt_va + 0);
     context = BRIDGE_MEM32(interrupt_va + 4);
+    apu_isr = routine == BREAKDOWN_APU_ISR_ROUTINE && g_apu_irq_event != NULL;
 
     fprintf(stderr, "  [KERNEL] interrupt delivery: armed on interrupt 0x%08X, "
             "routine=0x%08X context=0x%08X, %d Hz\n",
@@ -1749,7 +1765,10 @@ static DWORD WINAPI interrupt_delivery_thread(LPVOID param)
     for (;;) {
         recomp_func_t fn;
 
-        Sleep(1000 / INTERRUPT_DELIVERY_HZ);
+        if (apu_isr)
+            WaitForSingleObject(g_apu_irq_event, 1000 / INTERRUPT_DELIVERY_HZ);
+        else
+            Sleep(1000 / INTERRUPT_DELIVERY_HZ);
 
         fn = recomp_lookup_manual(routine);
         if (!fn) fn = recomp_lookup(routine);
@@ -1787,10 +1806,26 @@ static void bridge_KeConnectInterrupt(void)
         LONG idx = InterlockedIncrement(&g_connected_interrupt_count) - 1;
         if (idx < MAX_DELIVERED_INTERRUPTS) {
             HANDLE h;
+            if (routine == BREAKDOWN_APU_ISR_ROUTINE && !g_apu_irq_event) {
+                g_apu_irq_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+                if (g_apu_irq_event && g_apu_state)
+                    mcpx_apu_set_irq_callback(g_apu_state,
+                                               wake_breakdown_apu_isr,
+                                               g_apu_irq_event);
+            }
             g_connected_interrupts[idx] = interrupt_va;
             h = CreateThread(NULL, 0, interrupt_delivery_thread,
                               (LPVOID)(uintptr_t)interrupt_va, 0, NULL);
             if (h) {
+                /* REVERTED 2026-10-01: pinning every connected interrupt's
+                 * delivery thread (one PERSISTENT 60Hz thread per
+                 * interrupt, up to MAX_DELIVERED_INTERRUPTS=8, see above)
+                 * onto the same single core as the APU thread badly
+                 * over-subscribed that one core -- measured regression:
+                 * PGRAPH stalled at Frame 1 indefinitely (confirmed via
+                 * affinity-test2.log, zero draws logged). Left unpinned;
+                 * only the APU frame thread itself (apu_core.c) still
+                 * reserves that core. */
                 CloseHandle(h);
             } else {
                 fprintf(stderr, "  [KERNEL] KeConnectInterrupt: failed to start "

@@ -23,6 +23,9 @@
 #include <math.h>
 #include "fpconv.h"
 
+extern void apu_diag_set_voice(int voice);
+extern void apu_trace_internal_fectl(uint32_t old, uint32_t value, int voice);
+
 /* #define DEBUG_MCPX */
 
 #ifdef DEBUG_MCPX
@@ -531,10 +534,13 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case SE2FE_IDLE_VOICE:
         if (d->regs[NV_PAPU_FETFORCE1] & NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE) {
+            uint32_t old_fectl = d->regs[NV_PAPU_FECTL];
             d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FEMETHMODE;
             d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FEMETHMODE_TRAPPED;
             d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FETRAPREASON;
             d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
+            apu_trace_internal_fectl(old_fectl, d->regs[NV_PAPU_FECTL],
+                                     argument);
             d->set_irq = true;
         }
         break;
@@ -1126,7 +1132,12 @@ static void voice_process(MCPXAPUState *d,
             if (!active) return;
             int count = voice_resample(d, v, &samples[sample_count],
                                        NUM_SAMPLES_PER_FRAME - sample_count, rate);
-            if (count < 0) break;
+            /* A persistent stream can be active with no queued segment.
+             * voice_get_samples() then reports starvation and resample()
+             * returns zero. Leave the rest of this cleared frame silent so
+             * the APU thread can retry on the next frame instead of spinning
+             * forever on the same voice. */
+            if (count <= 0) break;
             sample_count += count;
         }
     }
@@ -1317,10 +1328,10 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
         }
     }
 
-    /* Voices seen per frame, reported ~every 5 s. The XAudio2 queue is never
-     * empty while sounds still cut in and out, so the question is whether the
-     * title's voices reach the mixer at all. */
+    /* Voices seen per 937 VP subframes (~0.625 s). Track persistent idle
+     * voices separately from those that require a guest completion trap. */
     int dbg_listed = 0, dbg_active = 0, dbg_idled = 0;
+    int dbg_persistent_idled = 0;
 
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
@@ -1344,31 +1355,49 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
                 dbg_idled++;
-                fe_method(d, SE2FE_IDLE_VOICE, v);
+                /* Breakdown's SE2FE_IDLE_VOICE handler (sub_001D475B)
+                 * explicitly ignores voices with FMT_PERSIST. Trapping on
+                 * one each frame stops the whole VP/DSP pipeline until the
+                 * guest resumes it, but the guest leaves that voice on the
+                 * list, causing a permanent trap cycle and output underrun.
+                 * A persistent idle voice can stay in the list for reuse;
+                 * only non-persistent idle voices need the completion trap. */
+                if (voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                                   NV_PAVS_VOICE_CFG_FMT_PERSIST)) {
+                    dbg_persistent_idled++;
+                } else {
+                    fe_method(d, SE2FE_IDLE_VOICE, v);
+                }
             } else {
                 dbg_active++;
                 /* Process voice directly (single-threaded) */
+                apu_diag_set_voice(v);
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
+                apu_diag_set_voice(-1);
             }
             d->regs[current] = d->regs[next];
         }
     }
 
     {
-        static unsigned frames, listed, active, idled, max_active, silent_frames;
+        static unsigned frames, listed, active, idled, persistent_idled;
+        static unsigned max_active, silent_frames;
         frames++;
         listed += dbg_listed;
         active += dbg_active;
         idled += dbg_idled;
+        persistent_idled += dbg_persistent_idled;
         if ((unsigned)dbg_active > max_active) max_active = dbg_active;
         if (dbg_active == 0) silent_frames++;
         if (frames >= 937) {
             fprintf(stderr, "[APU] voices per frame: %u listed, %u active "
-                    "(max %u), %u idled, %u of %u frames with no active voice "
-                    "(~5 s)\n", listed / frames, active / frames, max_active,
-                    idled / frames, silent_frames, frames);
+                    "(max %u), %u idled (%u persistent), %u of %u frames "
+                    "with no active voice (~0.6 s)\n", listed / frames,
+                    active / frames, max_active, idled / frames,
+                    persistent_idled / frames, silent_frames, frames);
             fflush(stderr);
-            frames = listed = active = idled = max_active = silent_frames = 0;
+            frames = listed = active = idled = persistent_idled = 0;
+            max_active = silent_frames = 0;
         }
     }
 
@@ -1395,6 +1424,22 @@ void mcpx_apu_vp_init(MCPXAPUState *d)
 {
     /* Single-threaded - no worker dispatch needed */
     (void)d;
+
+    /* HeroLab task 2bb0e89d: these counters are a reporting cluster only --
+     * nothing should write them except mcpx_apu_vp_frame/process_stream_voice
+     * in this file. A run showed g_apu_stream_starved print as 478084408
+     * right before the APU frame thread went silent for good, which is not
+     * reachable from this file's own code. Printing the addresses so a
+     * hardware write breakpoint can be set on them to catch the real writer.
+     * Throwaway -- remove once the corruption source is found. */
+    fprintf(stderr,
+            "[WATCH] &g_apu_stream_segments=%p &g_apu_stream_starved=%p "
+            "&g_apu_stream_empty_segment=%p &g_apu_stream_advances=%p "
+            "&g_apu_stream_notifies=%p &g_apu_stream_samples=%p\n",
+            (void *)&g_apu_stream_segments, (void *)&g_apu_stream_starved,
+            (void *)&g_apu_stream_empty_segment, (void *)&g_apu_stream_advances,
+            (void *)&g_apu_stream_notifies, (void *)&g_apu_stream_samples);
+    fflush(stderr);
 }
 
 void mcpx_apu_vp_finalize(MCPXAPUState *d)

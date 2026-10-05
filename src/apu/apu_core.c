@@ -33,6 +33,68 @@ uint8_t *g_apu_ram_ptr = NULL;
 
 MCPXAPUState *g_state = NULL;
 
+/* Optional cross-thread progress probe for a silent APU stall. */
+static bool g_apu_diag_enabled;
+static bool g_apu_state_trace;
+static uint64_t g_apu_transition_last_ms;
+
+void apu_trace_internal_fectl(uint32_t old, uint32_t value, int voice)
+{
+    if (!g_apu_state_trace ||
+        ((old ^ value) & NV_PAPU_FECTL_FEMETHMODE) == 0)
+        return;
+    uint64_t now = GetTickCount64();
+    uint64_t last = __atomic_load_n(&g_apu_transition_last_ms,
+                                    __ATOMIC_RELAXED);
+    if (now - last >= 1000 &&
+        __atomic_compare_exchange_n(&g_apu_transition_last_ms, &last, now,
+                                    false, __ATOMIC_RELAXED,
+                                    __ATOMIC_RELAXED))
+        fprintf(stderr, "[APU TRANSITION] ms=%llu idle_voice=%d FECTL "
+                "%08X -> %08X\n", (unsigned long long)now,
+                voice, old, value);
+}
+static volatile LONG g_apu_diag_stage;
+static volatile LONG g_apu_diag_voice = -1;
+static volatile LONG g_apu_diag_frames;
+static volatile LONG g_apu_diag_stop;
+static HANDLE g_apu_diag_thread;
+
+static void apu_diag_stage(LONG stage)
+{
+    if (g_apu_diag_enabled)
+        InterlockedExchange(&g_apu_diag_stage, stage);
+}
+
+void apu_diag_set_voice(int voice)
+{
+    if (g_apu_diag_enabled)
+        InterlockedExchange(&g_apu_diag_voice, voice);
+}
+
+static DWORD WINAPI apu_diag_watchdog(LPVOID arg)
+{
+    LONG prior = -1;
+    unsigned still_seconds = 0;
+    (void)arg;
+    while (!InterlockedCompareExchange(&g_apu_diag_stop, 0, 0)) {
+        Sleep(2000);
+        if (InterlockedCompareExchange(&g_apu_diag_stop, 0, 0)) break;
+        LONG frames = InterlockedCompareExchange(&g_apu_diag_frames, 0, 0);
+        if (frames == prior) still_seconds += 2;
+        else still_seconds = 0;
+        prior = frames;
+        if (still_seconds >= 4) {
+            fprintf(stderr, "[APU DIAG] stalled %u s frames=%ld stage=%ld voice=%ld\n",
+                    still_seconds, (long)frames,
+                    (long)InterlockedCompareExchange(&g_apu_diag_stage, 0, 0),
+                    (long)InterlockedCompareExchange(&g_apu_diag_voice, 0, 0));
+            fflush(stderr);
+        }
+    }
+    return 0;
+}
+
 /* Forward declarations for software mixer */
 static void mixer_init(void);
 static void mixer_render(int16_t frame_buf[][2], int num_samples);
@@ -67,14 +129,28 @@ static void update_irq(MCPXAPUState *d)
     if ((d->regs[NV_PAPU_IEN] & NV_PAPU_ISTS_GINTSTS) &&
         ((d->regs[NV_PAPU_ISTS] & ~NV_PAPU_ISTS_GINTSTS) &
          d->regs[NV_PAPU_IEN])) {
-        qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_GINTSTS);
-        /* In standalone mode we don't raise a PCI IRQ; the game's kernel
-         * stub will poll ISTS directly or we'll signal via a flag. */
+        uint32_t old_ists = qatomic_or(&d->regs[NV_PAPU_ISTS],
+                                       NV_PAPU_ISTS_GINTSTS);
+        /* APU traps can arrive much faster than the standalone kernel's
+         * periodic ISR poll. Wake the registered handler on a rising edge;
+         * otherwise each trap can hold VP/DSP for a full poll interval. */
+        void (*callback)(void *opaque) =
+            __atomic_load_n(&d->irq_callback, __ATOMIC_ACQUIRE);
+        if (!(old_ists & NV_PAPU_ISTS_GINTSTS) && callback)
+            callback(__atomic_load_n(&d->irq_opaque, __ATOMIC_RELAXED));
         pci_irq_assert(PCI_DEVICE(d));
     } else {
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
         pci_irq_deassert(PCI_DEVICE(d));
     }
+}
+
+void mcpx_apu_set_irq_callback(MCPXAPUState *d,
+                               void (*callback)(void *opaque), void *opaque)
+{
+    if (!d) return;
+    __atomic_store_n(&d->irq_opaque, opaque, __ATOMIC_RELAXED);
+    __atomic_store_n(&d->irq_callback, callback, __ATOMIC_RELEASE);
 }
 
 /* ============================================================
@@ -124,8 +200,28 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         break;
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
+        if (g_apu_state_trace) {
+            uint32_t old = qatomic_read(&d->regs[addr]);
+            uint32_t mask = addr == NV_PAPU_FECTL ?
+                NV_PAPU_FECTL_FEMETHMODE : NV_PAPU_SECTL_XCNTMODE;
+            if (((old ^ (uint32_t)val) & mask) != 0) {
+                uint64_t now = GetTickCount64();
+                uint64_t last = __atomic_load_n(&g_apu_transition_last_ms,
+                                                __ATOMIC_RELAXED);
+                if (now - last >= 1000 &&
+                    __atomic_compare_exchange_n(&g_apu_transition_last_ms,
+                                                &last, now, false,
+                                                __ATOMIC_RELAXED,
+                                                __ATOMIC_RELAXED))
+                    fprintf(stderr, "[APU TRANSITION] ms=%llu guest %s "
+                            "%08X -> %08X\n", (unsigned long long)now,
+                            addr == NV_PAPU_FECTL ? "FECTL" : "SECTL",
+                            old, (uint32_t)val);
+            }
+        }
         qatomic_set(&d->regs[addr], (uint32_t)val);
         qemu_cond_broadcast(&d->cond);
+        if (d->resume_event) SetEvent(d->resume_event);
         break;
     case NV_PAPU_FEMEMDATA:
         /* 'magic write' - value written to FEMEMADDR on notify completion */
@@ -406,7 +502,9 @@ static void se_frame(MCPXAPUState *d)
     memset(mixbins, 0, sizeof(mixbins));
 
     mcpx_apu_vp_frame(d, mixbins);
+    apu_diag_stage(3);
     mcpx_apu_dsp_frame(d, mixbins);
+    apu_diag_stage(4);
     mcpx_apu_monitor_frame(d);
 
     d->ep_frame_div++;
@@ -424,6 +522,7 @@ static void *mcpx_apu_frame_thread(void *arg)
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
+        apu_diag_stage(0);
         if (d->pause_requested && !g_test_tone.active && !g_mixer_active_count) {
             d->is_idle = true;
             qemu_cond_signal(&d->idle_cond);
@@ -431,11 +530,6 @@ static void *mcpx_apu_frame_thread(void *arg)
             d->is_idle = false;
             continue;
         }
-
-        /* Always run the audio output loop — the software mixer and test tone
-         * need continuous frame delivery regardless of APU register state.
-         * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
-        throttle(d);
 
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
@@ -449,28 +543,75 @@ static void *mcpx_apu_frame_thread(void *arg)
              * 8 sub-frames of 32 samples; the VP must run for each of them or
              * the monitor submits 256 samples of which only some are fresh. */
             static unsigned iters, full, light;
+            static unsigned xcnt_off, fe_halted, fe_trapped, fe_other;
             static ULONGLONG last;
             ULONGLONG now = GetTickCount64();
             iters++;
             if (apu_active && !g_test_tone.active) full++; else light++;
+            if (!apu_active && g_apu_state_trace) {
+                uint32_t mode = fectl & NV_PAPU_FECTL_FEMETHMODE;
+                if (xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF) xcnt_off++;
+                else if (mode == NV_PAPU_FECTL_FEMETHMODE_HALTED) fe_halted++;
+                else if (mode == NV_PAPU_FECTL_FEMETHMODE_TRAPPED) fe_trapped++;
+                else fe_other++;
+            }
             if (!last) last = now;
             if (now - last >= 5000) {
                 fprintf(stderr, "[APU] frame thread: %u iterations, %u full "
                         "pipeline, %u monitor-only (~5 s)\n", iters, full, light);
+                if (g_apu_state_trace)
+                    fprintf(stderr, "[APU STATE] SECTL=%08X XCNT=%d FECTL=%08X "
+                            "IEN=%08X ISTS=%08X FETFORCE1=%08X "
+                            "off=%u halted=%u trapped=%u other=%u mute=%d\n",
+                            qatomic_read(&d->regs[NV_PAPU_SECTL]), xcntmode,
+                            fectl, qatomic_read(&d->regs[NV_PAPU_IEN]),
+                            qatomic_read(&d->regs[NV_PAPU_ISTS]),
+                            qatomic_read(&d->regs[NV_PAPU_FETFORCE1]),
+                            xcnt_off, fe_halted, fe_trapped, fe_other,
+                            g_audio_muted);
                 fflush(stderr);
                 iters = full = light = 0;
+                xcnt_off = fe_halted = fe_trapped = fe_other = 0;
                 last = now;
             }
         }
 
+        /* Match xemu's APU clock when the guest stops the VP/DSP engine.
+         * Advancing ep_frame_div and submitting silence during a halted or
+         * trapped interval makes the output clock run while the guest's
+         * voice engine is stopped. The software mixer and test tone still
+         * need continuous delivery, so retain the monitor-only path for
+         * those host-side sources. */
+        if (!apu_active && !g_test_tone.active && !g_mixer_active_count) {
+            d->set_irq = true;
+            update_irq(d);
+            d->set_irq = false;
+            /* Wake as soon as the guest resumes FECTL/SECTL. A fixed 5 ms
+             * sleep here limits a completion trap to ~200 VP frames/s even
+             * when the guest ISR now runs promptly. Keep 5 ms as a fallback
+             * for missed signals or a halted guest. */
+            qemu_mutex_unlock(&d->lock);
+            if (d->resume_event)
+                WaitForSingleObject(d->resume_event, 5);
+            else
+                Sleep(5);
+            qemu_mutex_lock(&d->lock);
+            continue;
+        }
+
+        throttle(d);
+        apu_diag_stage(1);
+
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
+            apu_diag_stage(2);
             se_frame(d);
         } else {
             /* Lightweight: just monitor frame (test tone + software mixer).
              * No VP output this cycle, so start from silence. */
             if (((d->ep_frame_div + 1) % 8) == 0)
                 memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+            apu_diag_stage(4);
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
@@ -502,6 +643,7 @@ static void *mcpx_apu_frame_thread(void *arg)
          * delivery is not a PCI IRQ line at all -- it is the kernel's existing
          * 60 Hz ISR dispatch reading an ISTS that is finally truthful.
          */
+        apu_diag_stage(5);
         if (!apu_active) {
             d->set_irq = true;
         }
@@ -509,6 +651,8 @@ static void *mcpx_apu_frame_thread(void *arg)
             update_irq(d);
             d->set_irq = false;
         }
+        if (g_apu_diag_enabled)
+            InterlockedIncrement(&g_apu_diag_frames);
 
         /*
          * NOTE: this loop used to end with an unconditional
@@ -587,6 +731,12 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     }
 
     g_apu_ram_ptr = ram_ptr;
+    g_apu_diag_enabled = GetEnvironmentVariableA("XBOXRECOMP_APU_TRACE_DEEP", NULL, 0) > 0;
+    g_apu_state_trace = GetEnvironmentVariableA("XBOXRECOMP_APU_STATE_TRACE", NULL, 0) > 0;
+    g_apu_diag_stop = 0;
+    g_apu_diag_frames = 0;
+    g_apu_diag_stage = 0;
+    g_apu_diag_voice = -1;
     g_state = d;
     d->ram_ptr = ram_ptr;
 
@@ -594,6 +744,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     d->exiting = false;
     d->is_idle = false;
     d->pause_requested = true;
+    d->resume_event = CreateEventA(NULL, FALSE, FALSE, NULL);
 
     qemu_mutex_init(&d->lock);
     qemu_mutex_lock(&d->lock);
@@ -619,6 +770,32 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     /* Start background frame thread */
     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread",
                        mcpx_apu_frame_thread, d, QEMU_THREAD_JOINABLE);
+
+    /* Dedicate the last logical core to this thread. The main/PFIFO thread
+     * is known to be extremely CPU-hungry (task ed053492 -- millions of
+     * PGRAPH methods per few seconds) and main.c excludes this same core
+     * from its own affinity mask, so this is a genuine reservation, not
+     * just a scheduling hint: nothing else the process starts should ever
+     * land here. Investigating whether CPU starvation of this thread
+     * contributes to the audio corruption in task 2bb0e89d -- this alone
+     * is not a fix for that bug, just removes one variable. Single-core
+     * machines get no affinity call (GetSystemInfo already reflects them). */
+    {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        if (si.dwNumberOfProcessors > 1) {
+            DWORD_PTR mask = (DWORD_PTR)1 << (si.dwNumberOfProcessors - 1);
+            if (SetThreadAffinityMask(d->apu_thread.thread, mask)) {
+                fprintf(stderr, "[APU] frame thread pinned to logical core %lu of %lu\n",
+                        (unsigned long)(si.dwNumberOfProcessors - 1),
+                        (unsigned long)si.dwNumberOfProcessors);
+            } else {
+                fprintf(stderr, "[APU] SetThreadAffinityMask failed: %lu\n",
+                        (unsigned long)GetLastError());
+            }
+        }
+    }
+
     mcpx_apu_wait_for_idle(d);
 
     /*
@@ -641,6 +818,8 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
      */
     mcpx_apu_resume(d);
     qemu_mutex_unlock(&d->lock);
+    if (g_apu_diag_enabled)
+        g_apu_diag_thread = CreateThread(NULL, 0, apu_diag_watchdog, NULL, 0, NULL);
 
     fprintf(stderr, "[APU] MCPX APU initialized (standalone)\n");
     fprintf(stderr, "[APU]   RAM pointer: %p\n", (void *)ram_ptr);
@@ -654,17 +833,26 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
 {
     if (!d) return;
 
+    if (g_apu_diag_thread) {
+        InterlockedExchange(&g_apu_diag_stop, 1);
+        WaitForSingleObject(g_apu_diag_thread, 3000);
+        CloseHandle(g_apu_diag_thread);
+        g_apu_diag_thread = NULL;
+    }
+
     fprintf(stderr, "[APU] Shutting down MCPX APU...\n");
 
     qemu_mutex_lock(&d->lock);
     mcpx_apu_wait_for_idle(d);
     qatomic_set(&d->exiting, true);
     qemu_cond_signal(&d->cond);
+    if (d->resume_event) SetEvent(d->resume_event);
     qemu_mutex_unlock(&d->lock);
 
     qemu_thread_join(&d->apu_thread);
     mcpx_apu_vp_finalize(d);
     mcpx_apu_monitor_finalize(d);
+    if (d->resume_event) CloseHandle(d->resume_event);
 
     free(d);
     g_state = NULL;

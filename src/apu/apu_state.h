@@ -457,6 +457,9 @@ struct MCPXAPUState {
 
     bool exiting;
     bool set_irq;
+    void (*irq_callback)(void *opaque);
+    void *irq_opaque;
+    HANDLE resume_event;
 
     QemuThread apu_thread;
     QemuMutex lock;
