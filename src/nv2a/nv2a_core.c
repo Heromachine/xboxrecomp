@@ -590,7 +590,9 @@ void pvideo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
-    uint64_t r = d->pgraph.regs[addr];
+    uint64_t r = addr == NV_PGRAPH_PATT_COLOR0
+        ? __atomic_load_n(&d->pgraph.regs[addr], __ATOMIC_ACQUIRE)
+        : d->pgraph.regs[addr];
     nv2a_reg_log_read(NV_PGRAPH, addr, size, r);
     return r;
 }
@@ -650,6 +652,23 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
                    uint32_t method, uint32_t param)
 {
     g_pgraph_method_count++;
+
+    /* SET_OBJECT carries a RAMHT handle. The object context's low byte is
+     * the graphics class, as in xemu's pgraph_method SET_OBJECT path. */
+    if (method == 0 && subchannel < 8) {
+        uint32_t instance = nv_ramht_instance(d, param);
+        if (instance && instance + 4 <= NV_PRAMIN_SIZE)
+            d->pgraph.subchannel_class[subchannel] =
+                (uint8_t)ldl_le_p((uint32_t *)(d->ramin_ptr + instance));
+    }
+
+    /* NV044_SET_MONOCHROME_COLOR0 is also visible at PGRAPH PATT_COLOR0.
+     * Breakdown polls bits 2..6 there as a completion marker. */
+    if (subchannel < 8 &&
+        d->pgraph.subchannel_class[subchannel] == NV_CONTEXT_PATTERN &&
+        method == NV044_SET_MONOCHROME_COLOR0)
+        __atomic_store_n(&d->pgraph.regs[NV_PGRAPH_PATT_COLOR0],
+                         param, __ATOMIC_RELEASE);
 
     /* XBOXRECOMP_METHODTRACE=<frame> prints every method of that ONE frame.
      *
@@ -760,8 +779,82 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
         return;
     }
 
+    /* Sample translator cost without timing every one of millions of methods. */
+    static int profile_on = -1;
+    static LARGE_INTEGER profile_frequency;
+    static uint64_t profile_samples[7], profile_ticks[7];
+    static uint64_t profile_method_samples[0x2000 / 4];
+    static uint64_t profile_method_ticks[0x2000 / 4];
+    static ULONGLONG profile_last_report;
+    if (profile_on < 0) {
+        const char *env = getenv("XBOXRECOMP_PGRAPH_PROFILE");
+        profile_on = env && strcmp(env, "1") == 0;
+        if (profile_on) QueryPerformanceFrequency(&profile_frequency);
+    }
+    bool profile_sample = profile_on &&
+                          (g_pgraph_method_count % 101u) == 0;
+    LARGE_INTEGER profile_start, profile_end;
+    if (profile_sample) QueryPerformanceCounter(&profile_start);
+    int handled = pgraph_d3d11_method(subchannel, method, param);
+    if (profile_sample) {
+        int category = method >= NV097_SET_TRANSFORM_CONSTANT &&
+                       method < NV097_SET_TRANSFORM_CONSTANT + 0x80 ? 0 :
+                       method >= NV097_SET_TRANSFORM_PROGRAM &&
+                       method < NV097_SET_TRANSFORM_PROGRAM + 0x80 ? 1 :
+                       method == NV097_ARRAY_ELEMENT16 ||
+                       method == NV097_ARRAY_ELEMENT32 ? 2 :
+                       method == NV097_SET_BEGIN_END ? 3 :
+                       method == NV097_DRAW_ARRAYS ? 4 :
+                       method == NV097_INLINE_ARRAY ? 5 : 6;
+        QueryPerformanceCounter(&profile_end);
+        profile_samples[category]++;
+        profile_ticks[category] +=
+            profile_end.QuadPart - profile_start.QuadPart;
+        if (method < 0x2000 && !(method & 3)) {
+            profile_method_samples[method / 4]++;
+            profile_method_ticks[method / 4] +=
+                profile_end.QuadPart - profile_start.QuadPart;
+        }
+        ULONGLONG now = GetTickCount64();
+        if (!profile_last_report) profile_last_report = now;
+        if (now - profile_last_report >= 5000) {
+            fprintf(stderr, "[PGRAPH METHOD PROFILE]");
+            for (int i = 0; i < 7; i++)
+                fprintf(stderr, " c%d=%llu/%.3fus", i,
+                        (unsigned long long)profile_samples[i],
+                        profile_samples[i] ?
+                            (double)profile_ticks[i] * 1000000.0 /
+                            profile_frequency.QuadPart / profile_samples[i] : 0.0);
+            fprintf(stderr, "\n");
+            for (int rank = 0; rank < 8; rank++) {
+                uint64_t best = 0;
+                int best_method = -1;
+                for (int i = 0; i < 0x2000 / 4; i++)
+                    if (profile_method_ticks[i] > best) {
+                        best = profile_method_ticks[i];
+                        best_method = i;
+                    }
+                if (best_method < 0) break;
+                fprintf(stderr, "[PGRAPH METHOD TOP] %04X samples=%llu "
+                        "avg_us=%.3f est_ms=%.1f\n", best_method * 4,
+                        (unsigned long long)profile_method_samples[best_method],
+                        (double)best * 1000000.0 /
+                            profile_frequency.QuadPart /
+                            profile_method_samples[best_method],
+                        (double)best * 101000.0 /
+                            profile_frequency.QuadPart);
+                profile_method_ticks[best_method] = 0;
+            }
+            memset(profile_samples, 0, sizeof(profile_samples));
+            memset(profile_ticks, 0, sizeof(profile_ticks));
+            memset(profile_method_samples, 0, sizeof(profile_method_samples));
+            memset(profile_method_ticks, 0, sizeof(profile_method_ticks));
+            profile_last_report = now;
+        }
+    }
+
     /* Route through D3D11 translator first */
-    if (pgraph_d3d11_method(subchannel, method, param)) {
+    if (handled) {
         /* Handled by D3D11 translator — still store in regs for state queries */
         if (method < 0x2000 * 4) {
             d->pgraph.regs[method / 4] = param;
@@ -924,6 +1017,31 @@ void nv2a_stub_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 /* Host address of guest physical 0, and how much RAM is behind it. */
 static uint8_t *g_guest_ram = NULL;
 static uint32_t g_guest_ram_size = 0;
+static bool g_pfifo_async_enabled = false;
+static volatile LONG g_pfifo_async_stage;
+static volatile LONG g_pfifo_async_channel = -1;
+static volatile LONG g_pfifo_async_puts;
+static volatile LONG g_pfifo_async_acked_puts;
+static volatile LONG g_pfifo_async_throttles;
+static LONG g_pfifo_async_max_pending_puts = 8;
+static volatile uint64_t g_pfifo_async_wait_ms;
+static volatile uint64_t g_pfifo_async_wait_max_ms;
+static volatile uint64_t g_pfifo_async_decode_ms;
+static volatile LONG g_pfifo_async_wakes;
+static volatile LONG g_pfifo_async_batches;
+
+/* MMIO producer and PFIFO consumer exchange the pointers without holding the
+ * decoder lock. A release when publishing GET also orders completed methods
+ * before the guest observes that the command was consumed. */
+static inline uint32_t pfifo_load(const uint32_t *ptr)
+{
+    return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+}
+
+static inline void pfifo_store(uint32_t *ptr, uint32_t value)
+{
+    __atomic_store_n(ptr, value, __ATOMIC_RELEASE);
+}
 
 void nv2a_set_guest_ram(void *base, uint32_t size)
 {
@@ -991,12 +1109,37 @@ static inline uint32_t pb_read32(uint32_t phys)
  * loading the DMA context out of RAMIN. A title that reprograms the context
  * would need nv_dma_load() here; none is known to.
  */
-static void pfifo_pull(NV2AState *d, uint32_t channel)
+/* Bound the amount of synchronous GPU work performed by one guest MMIO
+ * access. The guest commonly polls DMA_GET while the pusher catches up, so
+ * each read is another safe opportunity to advance the same decoder state. */
+#define PFIFO_METHOD_BUDGET 65536u
+#define PFIFO_WORD_BUDGET   (PFIFO_METHOD_BUDGET * 2u + 64u)
+
+static bool pfifo_trace_enabled(void)
 {
-    uint32_t get = d->user.dma_get[channel];
-    uint32_t put = d->user.dma_put[channel];
-    uint32_t jmp_shadow = 0;
-    uint32_t words = 0;
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("XBOXRECOMP_PFIFO_TRACE") != NULL;
+    return enabled != 0;
+}
+
+static bool pfifo_deep_trace_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("XBOXRECOMP_PFIFO_TRACE_DEEP") != NULL;
+    return enabled != 0;
+}
+
+static void pfifo_pull(NV2AState *d, uint32_t channel, const char *source)
+{
+    static uint32_t trace_lines;
+    PFIFOChannelState *s = &d->user.decoder[channel];
+    uint32_t get = pfifo_load(&d->user.dma_get[channel]);
+    uint32_t put = pfifo_load(&d->user.dma_put[channel]);
+    uint32_t start_get = get;
+    uint32_t methods = 0;
+    uint32_t words_this_call = 0;
 
     /* The first submission establishes where the stream starts.
      *
@@ -1009,14 +1152,41 @@ static void pfifo_pull(NV2AState *d, uint32_t channel)
      * guest physical 0 (the KPCR) and decodes noise; that is exactly what the
      * "unrecognised command 0x00000007 at 0x00000004" abort was. */
     if (get == 0) {
-        d->user.dma_get[channel] = put;
+        pfifo_store(&d->user.dma_get[channel], put);
+        if (pfifo_trace_enabled() && trace_lines++ < 64)
+            fprintf(stderr, "[PFIFO TRACE] %s init ch=%u put=%08X\n",
+                    source, channel, put);
         return;
     }
 
-    while (get != put) {
+    while (methods < PFIFO_METHOD_BUDGET &&
+           words_this_call < PFIFO_WORD_BUDGET) {
+        /* The producer may wrap or advance PUT while the async worker is
+         * decoding. Hardware observes the live pointer; retaining the PUT
+         * from entry can make GET chase a target that is no longer current. */
+        put = pfifo_load(&d->user.dma_put[channel]);
+        if (get == put)
+            break;
+        if (s->method_data_pending) {
+            uint32_t param = pb_read32(get);
+            get += 4;
+            pgraph_method(d, s->subchannel,
+                          s->increasing ? s->method + s->method_index * 4
+                                        : s->method,
+                          param);
+            s->method_index++;
+            s->method_count--;
+            methods++;
+            pfifo_store(&d->user.dma_get[channel], get);
+            if (s->method_count == 0)
+                s->method_data_pending = false;
+            continue;
+        }
+
         /* A malformed or mis-decoded stream can loop forever on a jump back to
-         * itself. Bail rather than wedge the faulting thread inside the VEH. */
-        if (++words > (1u << 20)) {
+         * itself. Preserve the guard across budget yields rather than resetting
+         * it on every DMA_GET poll. */
+        if (++s->words > (1u << 20)) {
             static int warned;
             if (!warned) {
                 warned = 1;
@@ -1025,52 +1195,173 @@ static void pfifo_pull(NV2AState *d, uint32_t channel)
                 fflush(stderr);
             }
             get = put;
+            s->method_data_pending = false;
+            s->words = 0;
             break;
         }
 
         uint32_t word = pb_read32(get);
         get += 4;
+        words_this_call++;
 
         if ((word & 0xe0000003) == 0x20000000) {          /* old jump */
-            jmp_shadow = get;
+            s->jmp_shadow = get;
             get = word & 0x1ffffffc;
         } else if ((word & 3) == 1) {                     /* jump */
-            jmp_shadow = get;
+            s->jmp_shadow = get;
             get = word & 0xfffffffc;
         } else if ((word & 3) == 2) {                     /* call */
-            jmp_shadow = get;
+            s->jmp_shadow = get;
             get = word & 0xfffffffc;
         } else if (word == 0x00020000) {                  /* return */
-            get = jmp_shadow;
+            get = s->jmp_shadow;
         } else if ((word & 0xe0030003) == 0x00000000 ||
                    (word & 0xe0030003) == 0x40000000) {
-            int increasing = (word & 0x40000000) == 0;
-            uint32_t count = (word >> 18) & 0x7ff;
-            uint32_t method = word & 0x1ffc;
-            uint32_t subchan = (word >> 13) & 7;
-
-            for (uint32_t i = 0; i < count; i++) {
-                uint32_t param = pb_read32(get);
-                get += 4;
-                pgraph_method(d, subchan, increasing ? method + i * 4 : method,
-                              param);
-            }
+            s->increasing = (word & 0x40000000) == 0;
+            s->method_count = (word >> 18) & 0x7ff;
+            s->method_index = 0;
+            s->method = word & 0x1ffc;
+            s->subchannel = (word >> 13) & 7;
+            s->method_data_pending = s->method_count != 0;
         } else {
             static int warned;
             if (!warned) {
                 warned = 1;
                 fprintf(stderr, "[NV2A] puller: unrecognised command 0x%08X at "
-                        "0x%08X, abandoning frame\n", word, get - 4);
+                        "0x%08X ch=%u source=%s put=0x%08X jump=0x%08X "
+                        "pending=%u method=0x%04X index=%u remaining=%u "
+                        "subchannel=%u words=%u, abandoning frame\n",
+                        word, get - 4, channel, source, put, s->jmp_shadow,
+                        s->method_data_pending, s->method, s->method_index,
+                        s->method_count, s->subchannel, s->words);
                 fflush(stderr);
             }
             get = put;
+            s->method_data_pending = false;
+            s->words = 0;
             break;
         }
 
-        d->user.dma_get[channel] = get;
+        pfifo_store(&d->user.dma_get[channel], get);
     }
 
-    d->user.dma_get[channel] = get;
+    put = pfifo_load(&d->user.dma_put[channel]);
+    pfifo_store(&d->user.dma_get[channel], get);
+    if (get == put && !s->method_data_pending) {
+        if (g_pfifo_async_enabled)
+            memset(s, 0, sizeof(*s));
+        else
+            s->words = 0;
+    }
+    if (get != put && (methods >= PFIFO_METHOD_BUDGET ||
+                       words_this_call >= PFIFO_WORD_BUDGET) &&
+        pfifo_deep_trace_enabled()) {
+        static uint32_t detail_lines;
+        if (detail_lines < 8192) {
+            detail_lines++;
+            fprintf(stderr, "[PFIFO DETAIL] YIELD %s ch=%u start=%08X "
+                    "end=%08X put=%08X methods=%u words=%u jump=%08X "
+                    "pending=%u method=%04X index=%u remaining=%u\n",
+                    source, channel, start_get, get, put, methods,
+                    words_this_call, s->jmp_shadow, s->method_data_pending,
+                    s->method, s->method_index, s->method_count);
+            fflush(stderr);
+        }
+    }
+    if (pfifo_trace_enabled() && trace_lines < 64 &&
+        (trace_lines < 24 || get != put)) {
+        trace_lines++;
+        fprintf(stderr, "[PFIFO TRACE] %s ch=%u start=%08X put=%08X "
+                "end=%08X methods=%u pending=%u remaining=%u\n",
+                source, channel, start_get, put, get, methods,
+                s->method_data_pending, s->method_count);
+    }
+}
+
+/* Decode on a dedicated thread. PUT only publishes a pointer and signals the
+ * event; GET polling observes published progress without taking the decoder
+ * lock. The event remembers a kick that arrives while the worker is busy. */
+static DWORD WINAPI pfifo_async_worker(LPVOID opaque)
+{
+    NV2AState *d = (NV2AState *)opaque;
+    while (!d->exiting) {
+        InterlockedExchange(&g_pfifo_async_stage, 0);
+        DWORD result = WaitForSingleObject(d->pfifo.work_event, INFINITE);
+        if (result != WAIT_OBJECT_0 || d->exiting) break;
+        InterlockedIncrement(&g_pfifo_async_wakes);
+        InterlockedExchange(&g_pfifo_async_stage, 1);
+
+        for (;;) {
+            bool did_work = false;
+            qemu_mutex_lock(&d->pfifo.lock);
+            for (uint32_t channel = 0; channel < NV2A_USER_NUM_CHANNELS;
+                 channel++) {
+                uint32_t get = pfifo_load(&d->user.dma_get[channel]);
+                uint32_t put = pfifo_load(&d->user.dma_put[channel]);
+                if (get == put) continue;
+                did_work = true;
+                InterlockedExchange(&g_pfifo_async_channel, (LONG)channel);
+                InterlockedExchange(&g_pfifo_async_stage, 2);
+                if (g_guest_ram) {
+                    ULONGLONG decode_start = GetTickCount64();
+                    pfifo_pull(d, channel, "WORKER");
+                    __atomic_fetch_add(&g_pfifo_async_decode_ms,
+                                       GetTickCount64() - decode_start,
+                                       __ATOMIC_RELAXED);
+                } else {
+                    pfifo_store(&d->user.dma_get[channel], put);
+                    memset(&d->user.decoder[channel], 0,
+                           sizeof(d->user.decoder[channel]));
+                }
+                InterlockedIncrement(&g_pfifo_async_batches);
+                InterlockedExchange(&g_pfifo_async_stage, 3);
+            }
+            qemu_mutex_unlock(&d->pfifo.lock);
+            InterlockedExchange(&g_pfifo_async_stage, 4);
+            if (!did_work) {
+                InterlockedExchange(&g_pfifo_async_acked_puts,
+                    InterlockedCompareExchange(&g_pfifo_async_puts, 0, 0));
+                break;
+            }
+            Sleep(0);
+        }
+    }
+    return 0;
+}
+
+static DWORD WINAPI pfifo_async_watchdog(LPVOID opaque)
+{
+    NV2AState *d = (NV2AState *)opaque;
+    uint64_t previous_wait_ms = 0;
+    uint64_t previous_decode_ms = 0;
+    while (!d->exiting) {
+        Sleep(5000);
+        uint64_t wait_ms = __atomic_load_n(&g_pfifo_async_wait_ms,
+                                           __ATOMIC_RELAXED);
+        uint64_t decode_ms = __atomic_load_n(&g_pfifo_async_decode_ms,
+                                             __ATOMIC_RELAXED);
+        fprintf(stderr, "[PFIFO ASYNC] puts=%ld acked=%ld throttles=%ld "
+                "wakes=%ld batches=%ld "
+                "wait_ms=%llu decode_ms=%llu max_wait_ms=%llu "
+                "stage=%ld ch=%ld GET=%08X PUT=%08X\n",
+                (long)InterlockedCompareExchange(&g_pfifo_async_puts, 0, 0),
+                (long)InterlockedCompareExchange(&g_pfifo_async_acked_puts, 0, 0),
+                (long)InterlockedCompareExchange(&g_pfifo_async_throttles, 0, 0),
+                (long)InterlockedCompareExchange(&g_pfifo_async_wakes, 0, 0),
+                (long)InterlockedCompareExchange(&g_pfifo_async_batches, 0, 0),
+                (unsigned long long)(wait_ms - previous_wait_ms),
+                (unsigned long long)(decode_ms - previous_decode_ms),
+                (unsigned long long)__atomic_load_n(
+                    &g_pfifo_async_wait_max_ms, __ATOMIC_RELAXED),
+                (long)InterlockedCompareExchange(&g_pfifo_async_stage, 0, 0),
+                (long)InterlockedCompareExchange(&g_pfifo_async_channel, 0, 0),
+                pfifo_load(&d->user.dma_get[0]),
+                pfifo_load(&d->user.dma_put[0]));
+        fflush(stderr);
+        previous_wait_ms = wait_ms;
+        previous_decode_ms = decode_ms;
+    }
+    return 0;
 }
 
 uint64_t user_read(void *opaque, hwaddr addr, unsigned int size)
@@ -1082,8 +1373,27 @@ uint64_t user_read(void *opaque, hwaddr addr, unsigned int size)
 
     if (channel < NV2A_USER_NUM_CHANNELS) {
         switch (reg) {
-        case NV_USER_DMA_PUT: r = d->user.dma_put[channel]; break;
-        case NV_USER_DMA_GET: r = d->user.dma_get[channel]; break;
+        case NV_USER_DMA_PUT:
+            if (g_pfifo_async_enabled) {
+                r = pfifo_load(&d->user.dma_put[channel]);
+                break;
+            }
+            qemu_mutex_lock(&d->pfifo.lock);
+            r = d->user.dma_put[channel];
+            qemu_mutex_unlock(&d->pfifo.lock);
+            break;
+        case NV_USER_DMA_GET:
+            if (g_pfifo_async_enabled) {
+                r = pfifo_load(&d->user.dma_get[channel]);
+                break;
+            }
+            qemu_mutex_lock(&d->pfifo.lock);
+            if (g_guest_ram &&
+                d->user.dma_get[channel] != d->user.dma_put[channel])
+                pfifo_pull(d, channel, "GET");
+            r = d->user.dma_get[channel];
+            qemu_mutex_unlock(&d->pfifo.lock);
+            break;
         case NV_USER_REF:     r = d->user.ref[channel];     break;
         default: break;
         }
@@ -1106,14 +1416,116 @@ void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 
     switch (reg) {
     case NV_USER_DMA_PUT:
-        d->user.dma_put[channel] = (uint32_t)val;
+        if (g_pfifo_async_enabled) {
+            uint32_t new_put = (uint32_t)val;
+            uint32_t old_put = pfifo_load(&d->user.dma_put[channel]);
+            pfifo_store(&d->user.dma_put[channel], new_put);
+            LONG put_seq = InterlockedIncrement(&g_pfifo_async_puts);
+            if (pfifo_deep_trace_enabled() && new_put < old_put) {
+                static LONG wraps_logged;
+                if (InterlockedIncrement(&wraps_logged) <= 8192)
+                    fprintf(stderr, "[PFIFO ASYNC] PUT wrap ch=%u get=%08X "
+                            "old=%08X new=%08X\n", channel,
+                            pfifo_load(&d->user.dma_get[channel]), old_put,
+                            new_put);
+            }
+            SetEvent(d->pfifo.work_event);
+            if (put_seq - InterlockedCompareExchange(
+                    &g_pfifo_async_acked_puts, 0, 0) >=
+                    g_pfifo_async_max_pending_puts) {
+                InterlockedIncrement(&g_pfifo_async_throttles);
+                ULONGLONG wait_start = GetTickCount64();
+                while (!d->exiting &&
+                       put_seq - InterlockedCompareExchange(
+                           &g_pfifo_async_acked_puts, 0, 0) >=
+                           g_pfifo_async_max_pending_puts)
+                    Sleep(1);
+                uint64_t elapsed = GetTickCount64() - wait_start;
+                __atomic_fetch_add(&g_pfifo_async_wait_ms, elapsed,
+                                   __ATOMIC_RELAXED);
+                uint64_t old_max = __atomic_load_n(&g_pfifo_async_wait_max_ms,
+                                                    __ATOMIC_RELAXED);
+                while (elapsed > old_max &&
+                       !__atomic_compare_exchange_n(
+                           &g_pfifo_async_wait_max_ms, &old_max, elapsed,
+                           false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+            }
+            break;
+        }
+        qemu_mutex_lock(&d->pfifo.lock);
+        if (pfifo_deep_trace_enabled()) {
+            static uint32_t detail_lines;
+            PFIFOChannelState *s = &d->user.decoder[channel];
+            uint32_t old_get = d->user.dma_get[channel];
+            uint32_t old_put = d->user.dma_put[channel];
+            uint32_t new_put = (uint32_t)val;
+            if (detail_lines < 8192 &&
+                (new_put < old_put || old_get > new_put ||
+                 s->method_data_pending)) {
+                detail_lines++;
+                fprintf(stderr, "[PFIFO DETAIL] PUT ch=%u get=%08X "
+                        "old_put=%08X new_put=%08X jump=%08X pending=%u "
+                        "method=%04X index=%u remaining=%u words=%u\n",
+                        channel, old_get, old_put, new_put, s->jmp_shadow,
+                        s->method_data_pending, s->method, s->method_index,
+                        s->method_count, s->words);
+                fflush(stderr);
+            }
+        }
+        /* Match the old per-submission local jmp_shadow lifetime while
+         * retaining it across any budget yields within this submission. */
+        if (d->user.dma_get[channel] == d->user.dma_put[channel] &&
+            !d->user.decoder[channel].method_data_pending)
+            memset(&d->user.decoder[channel], 0,
+                   sizeof(d->user.decoder[channel]));
+        pfifo_store(&d->user.dma_put[channel], (uint32_t)val);
         if (g_guest_ram)
-            pfifo_pull(d, channel);
-        else
-            d->user.dma_get[channel] = (uint32_t)val;  /* ack only; see above */
+            pfifo_pull(d, channel, "PUT");
+        else {
+            pfifo_store(&d->user.dma_get[channel], (uint32_t)val); /* ack only */
+            memset(&d->user.decoder[channel], 0,
+                   sizeof(d->user.decoder[channel]));
+        }
+        qemu_mutex_unlock(&d->pfifo.lock);
         break;
     case NV_USER_DMA_GET:
-        d->user.dma_get[channel] = (uint32_t)val;
+        qemu_mutex_lock(&d->pfifo.lock);
+        if (pfifo_deep_trace_enabled()) {
+            static uint32_t detail_lines;
+            PFIFOChannelState *s = &d->user.decoder[channel];
+            if (detail_lines < 8192) {
+                detail_lines++;
+                fprintf(stderr, "[PFIFO DETAIL] GET RESET ch=%u old=%08X "
+                        "new=%08X put=%08X jump=%08X pending=%u method=%04X "
+                        "index=%u remaining=%u words=%u\n",
+                        channel, d->user.dma_get[channel], (uint32_t)val,
+                        d->user.dma_put[channel], s->jmp_shadow,
+                        s->method_data_pending, s->method, s->method_index,
+                        s->method_count, s->words);
+                fflush(stderr);
+            }
+        }
+        if (pfifo_trace_enabled()) {
+            static uint32_t reset_traces;
+            PFIFOChannelState *s = &d->user.decoder[channel];
+            if (reset_traces < 128 &&
+                (s->jmp_shadow || s->method_data_pending || s->words)) {
+                reset_traces++;
+                fprintf(stderr, "[PFIFO TRACE] GET write ch=%u old=%08X "
+                        "new=%08X put=%08X jump=%08X pending=%u "
+                        "method=%04X index=%u remaining=%u words=%u\n",
+                        channel, d->user.dma_get[channel], (uint32_t)val,
+                        d->user.dma_put[channel], s->jmp_shadow,
+                        s->method_data_pending, s->method, s->method_index,
+                        s->method_count, s->words);
+            }
+        }
+        pfifo_store(&d->user.dma_get[channel], (uint32_t)val);
+        memset(&d->user.decoder[channel], 0,
+               sizeof(d->user.decoder[channel]));
+        qemu_mutex_unlock(&d->pfifo.lock);
+        if (g_pfifo_async_enabled)
+            SetEvent(d->pfifo.work_event);
         break;
     case NV_USER_REF:
         d->user.ref[channel] = (uint32_t)val;
@@ -1317,6 +1729,37 @@ NV2AState *nv2a_init_standalone(uint8_t *vram_ptr, uint32_t vram_size,
     qemu_mutex_init(&d->pfifo.lock);
     qemu_cond_init(&d->pfifo.fifo_cond);
     qemu_cond_init(&d->pfifo.fifo_idle_cond);
+
+    const char *async_env = getenv("XBOXRECOMP_PFIFO_ASYNC");
+    if (async_env && strcmp(async_env, "1") == 0) {
+        const char *limit_env = getenv("XBOXRECOMP_PFIFO_MAX_PENDING_PUTS");
+        if (limit_env && *limit_env) {
+            char *end;
+            long limit = strtol(limit_env, &end, 10);
+            if (*end == '\0' && limit >= 1 && limit <= 1024)
+                g_pfifo_async_max_pending_puts = (LONG)limit;
+        }
+        d->pfifo.work_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (d->pfifo.work_event) {
+            g_pfifo_async_enabled = true;
+            d->pfifo.thread.thread = CreateThread(NULL, 0,
+                                                  pfifo_async_worker, d,
+                                                  0, NULL);
+            if (!d->pfifo.thread.thread) {
+                g_pfifo_async_enabled = false;
+                CloseHandle(d->pfifo.work_event);
+                d->pfifo.work_event = NULL;
+            } else {
+                HANDLE watchdog = CreateThread(NULL, 0,
+                                               pfifo_async_watchdog, d,
+                                               0, NULL);
+                if (watchdog) CloseHandle(watchdog);
+            }
+        }
+        fprintf(stderr, "[PFIFO ASYNC] worker %s (max pending PUTs %ld)\n",
+                g_pfifo_async_enabled ? "started" : "failed; using inline pull",
+                (long)g_pfifo_async_max_pending_puts);
+    }
 
     g_nv2a = d;
 

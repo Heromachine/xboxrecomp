@@ -40,6 +40,18 @@
 #define NV2A_USER_NUM_CHANNELS   32u
 #define NV2A_USER_CHANNEL_SIZE   0x10000u
 
+/* Decoder state that survives a bounded PFIFO pull. */
+typedef struct PFIFOChannelState {
+    uint32_t jmp_shadow;
+    uint32_t words;
+    uint32_t method;
+    uint32_t method_index;
+    uint32_t method_count;
+    uint32_t subchannel;
+    bool increasing;
+    bool method_data_pending;
+} PFIFOChannelState;
+
 /* ============================================================
  * FIFO Engine types
  * ============================================================ */
@@ -67,6 +79,7 @@ struct PGRAPHState {
     uint32_t pending_interrupts;
     uint32_t enabled_interrupts;
     uint32_t regs[0x2000];
+    uint8_t subchannel_class[8];
 
     /* Back-end write semaphore: how the GPU tells the driver how far it has
      * got. dma_semaphore is the RAMIN offset of the DMA object bound by
@@ -115,6 +128,7 @@ typedef struct NV2AState {
         uint32_t regs[0x2000];
         QemuMutex lock;
         QemuThread thread;
+        HANDLE work_event;
         QemuCond fifo_cond;
         QemuCond fifo_idle_cond;
         bool fifo_kick;
@@ -127,6 +141,7 @@ typedef struct NV2AState {
         uint32_t dma_put[NV2A_USER_NUM_CHANNELS];
         uint32_t dma_get[NV2A_USER_NUM_CHANNELS];
         uint32_t ref[NV2A_USER_NUM_CHANNELS];
+        PFIFOChannelState decoder[NV2A_USER_NUM_CHANNELS];
     } user;
 
     struct {

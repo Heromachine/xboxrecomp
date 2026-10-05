@@ -40,6 +40,22 @@
 #include <malloc.h>
 #include <math.h>
 
+static int pgraph_texdump_on(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("XBOXRECOMP_TEXDUMP") != NULL;
+    return enabled;
+}
+
+static int pgraph_vshdump_on(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("XBOXRECOMP_VSHDUMP") != NULL;
+    return enabled;
+}
+
 /* D3D8 device — we include the full header for COM vtable access */
 #include "../d3d/d3d8_xbox.h"
 extern IDirect3DDevice8 *xbox_GetD3DDevice(void);
@@ -760,7 +776,7 @@ static void vsh_constant_write(uint32_t method, uint32_t param)
              * transforms) get rewritten every draw and would otherwise
              * crowd out the ones only ever set once (e.g. a viewport-style
              * scale/offset pair) long before this ever got to show them. */
-            if (getenv("XBOXRECOMP_VSHDUMP")) {
+            if (pgraph_vshdump_on()) {
                 static int shown_reg[NV2A_VS_MAX_CONSTANTS];
                 if (!shown_reg[hw_reg]) {
                     fprintf(stderr, "[PGRAPH-D3D11] VSH const c[%d] = "
@@ -1592,7 +1608,7 @@ static TexCacheEntry *resolve_texture_stage(int stage)
         }
     }
 
-    if (getenv("XBOXRECOMP_TEXDUMP")) {
+    if (pgraph_texdump_on()) {
         /* The first source bytes, so "the upload path is wired but the bytes
          * are blank" can be told apart from "the offset math reads the wrong
          * place". */
@@ -2645,6 +2661,20 @@ static void *scratch_grow(void **buf, size_t *cap, size_t need)
 static void submit_vertices(const uint8_t *base, uint32_t num_verts,
                             const uint32_t byte_offset[16], uint32_t stride_bytes);
 
+static int pgraph_profile_on(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("XBOXRECOMP_PGRAPH_PROFILE");
+        enabled = env && strcmp(env, "1") == 0;
+    }
+    return enabled;
+}
+
+static LONGLONG g_profile_inline_ticks, g_profile_gather_ticks;
+static LONGLONG g_profile_array_ticks;
+static uint32_t g_profile_inline_calls, g_profile_array_calls;
+
 /* Decode the real per-vertex layout from what the title actually programmed
  * via SET_VERTEX_DATA_ARRAY_FORMAT -- see the block comment above
  * compute_vertex_layout(). */
@@ -2658,8 +2688,16 @@ static void submit_draw(void)
     if (stride_bytes == 0)
         return;  /* Title has not enabled any attribute -- nothing to draw */
 
+    LARGE_INTEGER start, end;
+    int profile = pgraph_profile_on();
+    if (profile) QueryPerformanceCounter(&start);
     submit_vertices((const uint8_t *)g_pg.inline_data,
                     (g_pg.inline_count * 4) / stride_bytes, byte_offset, stride_bytes);
+    if (profile) {
+        QueryPerformanceCounter(&end);
+        g_profile_inline_ticks += end.QuadPart - start.QuadPart;
+        g_profile_inline_calls++;
+    }
 }
 
 /* Vertex-array memory under the same "whole of RAM, zero base" DMA convention
@@ -2681,18 +2719,28 @@ static void submit_array_elements(const uint32_t *elements, uint32_t n)
     static size_t packed_cap;
     uint32_t byte_offset[16];
     uint32_t stride_bytes = compute_vertex_layout(byte_offset);
+    LARGE_INTEGER start, after_gather, end;
+    int profile = pgraph_profile_on();
 
     if (n == 0 || stride_bytes == 0)
         return;
     if (!scratch_grow(&packed, &packed_cap, (size_t)n * stride_bytes))
         return;
+    if (profile) QueryPerformanceCounter(&start);
     if (nv2a_vtx_gather(g_pg.vattr, elements, n, vtx_guest_span, NULL,
                         byte_offset, stride_bytes, packed) != 0) {
         g_pg.stats.array_gather_failures++;
         return;
     }
+    if (profile) QueryPerformanceCounter(&after_gather);
     g_pg.stats.array_draws++;
     submit_vertices(packed, n, byte_offset, stride_bytes);
+    if (profile) {
+        QueryPerformanceCounter(&end);
+        g_profile_gather_ticks += after_gather.QuadPart - start.QuadPart;
+        g_profile_array_ticks += end.QuadPart - after_gather.QuadPart;
+        g_profile_array_calls++;
+    }
 }
 
 /* Draw DRAW_ARRAYS runs [0, count) as separate primitives -- joining two
@@ -3265,7 +3313,7 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
          * bound vs fell back to diffuse-only, so "textures upload fine
          * but the screen doesn't change" can be told apart from "stage 0
          * just isn't enabled for whichever draws end up visible." */
-        if (getenv("XBOXRECOMP_TEXDUMP")) {
+        if (pgraph_texdump_on()) {
             static uint32_t textured_draws, untextured_draws;
             if (te) textured_draws++; else untextured_draws++;
             if ((textured_draws + untextured_draws) <= 10 ||
@@ -3320,7 +3368,7 @@ static void texdump_stage(int stage)
                      last_control1[4], last_image_rect[4];
     static int have_last[4];
 
-    if (!getenv("XBOXRECOMP_TEXDUMP"))
+    if (!pgraph_texdump_on())
         return;
     if (stage < 0 || stage >= 4)
         return;
@@ -3576,7 +3624,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         int idx = (method - NV097_SET_VIEWPORT_OFFSET) / 4;
         g_pg.vp_offset[idx] = u2f(param);
         d3d8_vsh_set_constant(NV_IGRAPH_XF_XFCTX_VPOFF, g_pg.vp_offset, 1);
-        if (idx == 3 && getenv("XBOXRECOMP_VSHDUMP")) {
+        if (idx == 3 && pgraph_vshdump_on()) {
             fprintf(stderr, "[PGRAPH-D3D11] VPOFF -> c[%d] = (%.4f, %.4f, %.4f, %.4f)\n",
                     NV_IGRAPH_XF_XFCTX_VPOFF, g_pg.vp_offset[0], g_pg.vp_offset[1],
                     g_pg.vp_offset[2], g_pg.vp_offset[3]);
@@ -3592,7 +3640,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         int idx = (method - NV097_SET_VIEWPORT_SCALE) / 4;
         g_pg.vp_scale[idx] = u2f(param);
         d3d8_vsh_set_constant(NV_IGRAPH_XF_XFCTX_VPSCL, g_pg.vp_scale, 1);
-        if (idx == 3 && getenv("XBOXRECOMP_VSHDUMP")) {
+        if (idx == 3 && pgraph_vshdump_on()) {
             fprintf(stderr, "[PGRAPH-D3D11] VPSCL -> c[%d] = (%.4f, %.4f, %.4f, %.4f)\n",
                     NV_IGRAPH_XF_XFCTX_VPSCL, g_pg.vp_scale[0], g_pg.vp_scale[1],
                     g_pg.vp_scale[2], g_pg.vp_scale[3]);
@@ -3734,7 +3782,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         /* TEMPORARY diagnostic (XBOXRECOMP_TEXDUMP): is per-vertex diffuse
          * ever actually part of the stream for any draw, independent of
          * both texturing and the current_diffuse default question? */
-        if (getenv("XBOXRECOMP_TEXDUMP") && slot == NV2A_VERTEX_ATTR_DIFFUSE &&
+        if (pgraph_texdump_on() && slot == NV2A_VERTEX_ATTR_DIFFUSE &&
             cnt != g_pg.vattr[slot].count) {
             fprintf(stderr, "[PGRAPH-D3D11] vattr[DIFFUSE] count: %u -> %u\n",
                     g_pg.vattr[slot].count, cnt);
@@ -3793,7 +3841,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
          * actually call this at all, or does every draw run on the static
          * default the whole session? Deduped by value so it doesn't flood
          * if the title does call it frequently with the same color. */
-        if (getenv("XBOXRECOMP_TEXDUMP") && param != g_pg.current_diffuse) {
+        if (pgraph_texdump_on() && param != g_pg.current_diffuse) {
             fprintf(stderr, "[PGRAPH-D3D11] SET_DIFFUSE_COLOR4UB: 0x%08X -> 0x%08X\n",
                     g_pg.current_diffuse, param);
         }
@@ -3985,12 +4033,50 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
 
 void pgraph_d3d11_flush(void)
 {
+    static LARGE_INTEGER frequency;
+    static ULONGLONG last_report;
+    static LONGLONG flush_ticks, copy_ticks;
+    static uint32_t flush_count;
+    LARGE_INTEGER start, before_copy, end;
+    int profile = pgraph_profile_on();
+    if (profile && !frequency.QuadPart)
+        QueryPerformanceFrequency(&frequency);
+    if (profile) QueryPerformanceCounter(&start);
     if (g_pg.in_draw) {
         submit_draw();
         g_pg.in_draw = 0;
     }
+    if (profile) QueryPerformanceCounter(&before_copy);
     present_surface();
     g_pg.stats.frames++;
+    if (profile) {
+        QueryPerformanceCounter(&end);
+        flush_ticks += end.QuadPart - start.QuadPart;
+        copy_ticks += end.QuadPart - before_copy.QuadPart;
+        flush_count++;
+        ULONGLONG now = GetTickCount64();
+        if (!last_report) last_report = now;
+        if (now - last_report >= 5000) {
+            fprintf(stderr, "[PGRAPH PROFILE] flushes=%u flush_ms=%.1f "
+                    "copy_ms=%.1f inline=%u/%.1fms "
+                    "array=%u gather=%.1fms draw=%.1fms\n", flush_count,
+                    (double)flush_ticks * 1000.0 / frequency.QuadPart,
+                    (double)copy_ticks * 1000.0 / frequency.QuadPart,
+                    g_profile_inline_calls,
+                    (double)g_profile_inline_ticks * 1000.0 / frequency.QuadPart,
+                    g_profile_array_calls,
+                    (double)g_profile_gather_ticks * 1000.0 / frequency.QuadPart,
+                    (double)g_profile_array_ticks * 1000.0 / frequency.QuadPart);
+            flush_ticks = copy_ticks = 0;
+            flush_count = 0;
+            g_profile_inline_ticks = 0;
+            g_profile_gather_ticks = 0;
+            g_profile_array_ticks = 0;
+            g_profile_inline_calls = 0;
+            g_profile_array_calls = 0;
+            last_report = now;
+        }
+    }
 }
 
 void pgraph_d3d11_set_chyron_scroll(uint32_t pixels)
