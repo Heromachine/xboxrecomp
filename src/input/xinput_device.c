@@ -38,6 +38,7 @@ static DWORD g_packet[XBOX_MAX_CONTROLLERS];
 
 static int g_setup_done;
 static int g_keyboard_pad = 1;          /* XBOXRECOMP_KEYBOARD_PAD=0 turns it off */
+static int g_input_trace;
 static XboxPadScript g_script;          /* XBOXRECOMP_PAD_SCRIPT */
 static LARGE_INTEGER g_t0, g_freq;
 
@@ -54,6 +55,9 @@ static void input_setup(void)
     e = getenv("XBOXRECOMP_KEYBOARD_PAD");
     if (e && e[0] == '0')
         g_keyboard_pad = 0;
+
+    e = getenv("XBOXRECOMP_INPUT_TRACE");
+    g_input_trace = e && e[0] == '1';
 
     e = getenv("XBOXRECOMP_PAD_SCRIPT");
     if (e && *e) {
@@ -214,6 +218,29 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         for (int i = 0; i < 8; i++)
             if (held.analog[i] > pad.bAnalogButtons[i])
                 pad.bAnalogButtons[i] = held.analog[i];
+    }
+
+    if (dwPort == 0 && g_input_trace) {
+        static int last_a = -1, last_lx = 2, last_ly = 2;
+        static WORD last_dpad = 0xFFFF;
+        static int last_source = -1;
+        int a = pad.bAnalogButtons[XBOX_BUTTON_A] > 0;
+        int lx = pad.sThumbLX < -12000 ? -1 : pad.sThumbLX > 12000 ? 1 : 0;
+        int ly = pad.sThumbLY < -12000 ? -1 : pad.sThumbLY > 12000 ? 1 : 0;
+        WORD dpad = pad.wButtons & 0x000F;
+        int source = result == ERROR_SUCCESS ? 1 : g_keyboard_pad ? 0 : 2;
+        if (a != last_a || lx != last_lx || ly != last_ly ||
+            dpad != last_dpad || source != last_source) {
+            fprintf(stderr, "[INPUT TRACE] ms=%llu source=%s dpad=%04X "
+                    "A=%u LX=%d LY=%d packet=%lu\n",
+                    (unsigned long long)GetTickCount64(),
+                    source == 1 ? "controller" : source == 0 ? "keyboard" : "script",
+                    dpad, pad.bAnalogButtons[XBOX_BUTTON_A],
+                    pad.sThumbLX, pad.sThumbLY,
+                    (unsigned long)g_packet[dwPort]);
+            last_a = a; last_lx = lx; last_ly = ly;
+            last_dpad = dpad; last_source = source;
+        }
     }
 
     if (g_packet[dwPort] == 0 || memcmp(&pad, &g_last_pad[dwPort], sizeof(pad)) != 0) {
