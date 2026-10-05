@@ -13,6 +13,8 @@
 
 #include "kernel.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include "xbox_memory_layout.h"
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -35,6 +37,290 @@
 
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
 
+/* KPCR.Irql is at fs:[0x24], and XDK code reads it there rather than calling
+ * KeGetCurrentIrql: Breakdown's DSOUND scoped lock (sub_001D12F0) raises only
+ * when fs:[0x24] < DISPATCH_LEVEL and later lowers to the level it saved. Keep
+ * the fake TIB's copy equal to the tracked IRQL, or that check and this file
+ * disagree, and raise/lower pairs stop balancing. */
+#define KPCR_IRQL_OFFSET 0x24
+static void set_irql(KIRQL irql)
+{
+    g_current_irql = irql;
+    g_fake_tib[KPCR_IRQL_OFFSET] = irql;
+}
+
+/* XBOXRECOMP_IRQL_TRACE=1: log IRQL changes (thread, old -> new, guest site),
+ * capped, to find a raise that is never lowered. Diagnostic. */
+extern RECOMP_TLS uint32_t g_esp;
+extern ptrdiff_t g_xbox_mem_offset;
+static void irql_trace(const char *what, KIRQL old, KIRQL new_irql)
+{
+    static int on = -1;
+    static volatile LONG lines;
+    uint32_t site;
+    if (on < 0) {
+        const char *e = getenv("XBOXRECOMP_IRQL_TRACE");
+        on = e && e[0] == '1';
+    }
+    if (!on || InterlockedIncrement(&lines) > 20000)
+        return;
+    site = g_esp ? *(volatile uint32_t *)((uintptr_t)(g_esp - 4) + g_xbox_mem_offset) : 0;
+    fprintf(stderr, "[IRQL] t%lu %s %u->%u site 0x%08X\n", GetCurrentThreadId(),
+            what, old, new_irql, site);
+}
+
+/* ----------------------------------------------------------------------------
+ * The single-CPU lock (PROTOTYPE, HeroLab Xbox Recompiler task a4e42446).
+ *
+ * The Xbox has one CPU. Code at DISPATCH_LEVEL or above cannot be preempted by
+ * another thread, so titles and the XDK libraries use "raise IRQL to
+ * DISPATCH_LEVEL" as their lock: Breakdown's DSOUND brackets its voice-list
+ * work with KfRaiseIrql/KfLowerIrql. Here guest threads are parallel host
+ * threads, so a thread-local IRQL alone excluded nothing, and DSOUND's
+ * service routine walked voice lists another thread was editing (a crash
+ * writing through a corrupted list node at an area load).
+ *
+ * This lock stands in for the CPU: taken when a thread's IRQL rises from below
+ * DISPATCH_LEVEL to DISPATCH_LEVEL or above, released when it falls back
+ * below. Interrupt delivery, DPCs and KeSynchronizeExecution run under it too
+ * (kernel_bridge.c). It is recursive, so an ISR that queues a DPC, or a DPC
+ * that raises IRQL, nests without deadlock.
+ *
+ * XBOXRECOMP_SINGLE_CPU_DISPATCH=0 turns it off. A [CPULOCK] line every 5 s
+ * reports contention while it is on.
+ * ------------------------------------------------------------------------- */
+
+static CRITICAL_SECTION g_cpu_lock;
+/* Owner bookkeeping, touched only by the thread holding g_cpu_lock: where the
+ * outermost acquisition came from (guest VA) and when, so long holds name
+ * their code. */
+static uint32_t g_cpu_hold_site;
+static LONGLONG g_cpu_hold_start;
+static INIT_ONCE g_cpu_lock_once = INIT_ONCE_STATIC_INIT;
+static int g_cpu_lock_on;
+static volatile LONG g_cpu_enters, g_cpu_contended;
+static volatile LONG64 g_cpu_wait_ticks, g_cpu_max_wait;
+static LARGE_INTEGER g_cpu_freq;
+
+static DWORD WINAPI cpu_lock_report_thread(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        Sleep(5000);
+        LONG enters = InterlockedExchange(&g_cpu_enters, 0);
+        LONG contended = InterlockedExchange(&g_cpu_contended, 0);
+        LONG64 wait = InterlockedExchange64(&g_cpu_wait_ticks, 0);
+        LONG64 mx = InterlockedExchange64(&g_cpu_max_wait, 0);
+        fprintf(stderr, "[CPULOCK] %ld entries, %ld contended, waited %.1f ms "
+                "(longest %.2f ms) over ~5 s\n", enters, contended,
+                (double)wait * 1000.0 / (double)g_cpu_freq.QuadPart,
+                (double)mx * 1000.0 / (double)g_cpu_freq.QuadPart);
+        fflush(stderr);
+    }
+    return 0;
+}
+
+static BOOL CALLBACK cpu_lock_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    const char *e = getenv("XBOXRECOMP_SINGLE_CPU_DISPATCH");
+    (void)once; (void)param; (void)ctx;
+    g_cpu_lock_on = !(e && e[0] == '0');
+    InitializeCriticalSectionAndSpinCount(&g_cpu_lock, 4000);
+    QueryPerformanceFrequency(&g_cpu_freq);
+    fprintf(stderr, "[CPULOCK] single-CPU DISPATCH_LEVEL lock %s\n",
+            g_cpu_lock_on ? "ON" : "OFF (XBOXRECOMP_SINGLE_CPU_DISPATCH=0)");
+    if (g_cpu_lock_on)
+        CloseHandle(CreateThread(NULL, 0, cpu_lock_report_thread, NULL, 0, NULL));
+    return TRUE;
+}
+
+static void cpu_lock_note_acquired(uint32_t site)
+{
+    if (g_cpu_lock.RecursionCount == 1) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        g_cpu_hold_site = site;
+        g_cpu_hold_start = now.QuadPart;
+    }
+}
+
+void xbox_cpu_lock_enter_at(uint32_t site)
+{
+    InitOnceExecuteOnce(&g_cpu_lock_once, cpu_lock_init, NULL, NULL);
+    if (!g_cpu_lock_on)
+        return;
+    InterlockedIncrement(&g_cpu_enters);
+    if (TryEnterCriticalSection(&g_cpu_lock)) {
+        cpu_lock_note_acquired(site);
+        return;
+    }
+    {
+        LARGE_INTEGER t0, t1;
+        LONG64 d, cur;
+        int warned = 0;
+        QueryPerformanceCounter(&t0);
+        /* Polled rather than EnterCriticalSection so a probable deadlock (a
+         * holder blocked while "at DISPATCH_LEVEL") names itself after 2 s. */
+        for (;;) {
+            if (TryEnterCriticalSection(&g_cpu_lock))
+                break;
+            QueryPerformanceCounter(&t1);
+            d = t1.QuadPart - t0.QuadPart;
+            if (!warned && d > 2 * g_cpu_freq.QuadPart) {
+                warned = 1;
+                fprintf(stderr, "[CPULOCK] WARNING: thread %lu waiting > 2 s; "
+                        "holder thread %lu (recursion %ld), taken at guest 0x%08X\n",
+                        GetCurrentThreadId(),
+                        (unsigned long)(uintptr_t)g_cpu_lock.OwningThread,
+                        g_cpu_lock.RecursionCount, g_cpu_hold_site);
+                fflush(stderr);
+            }
+            if (d < g_cpu_freq.QuadPart / 1000)
+                SwitchToThread();
+            else
+                Sleep(1);
+        }
+        QueryPerformanceCounter(&t1);
+        d = t1.QuadPart - t0.QuadPart;
+        InterlockedIncrement(&g_cpu_contended);
+        InterlockedAdd64(&g_cpu_wait_ticks, d);
+        while (d > (cur = g_cpu_max_wait) &&
+               InterlockedCompareExchange64(&g_cpu_max_wait, d, cur) != cur)
+            ;
+        cpu_lock_note_acquired(site);
+    }
+}
+
+void xbox_cpu_lock_enter(void)
+{
+    xbox_cpu_lock_enter_at(0);
+}
+
+void xbox_cpu_lock_leave(void)
+{
+    if (!g_cpu_lock_on)
+        return;
+    if (g_cpu_lock.RecursionCount == 1) {
+        LARGE_INTEGER now;
+        double held;
+        QueryPerformanceCounter(&now);
+        held = (double)(now.QuadPart - g_cpu_hold_start) * 1000.0 /
+               (double)g_cpu_freq.QuadPart;
+        if (held > 100.0) {
+            fprintf(stderr, "[CPULOCK] long hold: thread %lu held %.0f ms, "
+                    "taken at guest 0x%08X\n", GetCurrentThreadId(), held,
+                    g_cpu_hold_site);
+            fflush(stderr);
+        }
+    }
+    LeaveCriticalSection(&g_cpu_lock);
+}
+
+/* Interrupt level. Hardware ISRs preempt DISPATCH_LEVEL code, and DISPATCH
+ * code may legitimately spin until an ISR sets something (DSOUND waits on the
+ * APU this way), so ISR delivery must NOT take the DISPATCH lock above: a
+ * first prototype that did deadlocked at boot. ISRs exclude each other and
+ * KeSynchronizeExecution only. DPCs an ISR queues run after it returns, under
+ * the DISPATCH lock (kernel_bridge.c). */
+static CRITICAL_SECTION g_isr_lock;
+static INIT_ONCE g_isr_lock_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK isr_lock_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitOnceExecuteOnce(&g_cpu_lock_once, cpu_lock_init, NULL, NULL);
+    InitializeCriticalSectionAndSpinCount(&g_isr_lock, 4000);
+    return TRUE;
+}
+
+void xbox_isr_lock_enter(void)
+{
+    InitOnceExecuteOnce(&g_isr_lock_once, isr_lock_init, NULL, NULL);
+    if (g_cpu_lock_on)
+        EnterCriticalSection(&g_isr_lock);
+}
+
+void xbox_isr_lock_leave(void)
+{
+    if (g_cpu_lock_on)
+        LeaveCriticalSection(&g_isr_lock);
+}
+
+/* Set the calling thread's IRQL without lock side effects, returning the old
+ * one. The bridge runs ISRs and KeSynchronizeExecution at device level and
+ * DPCs at DISPATCH_LEVEL this way, so a KfRaiseIrql(DISPATCH_LEVEL) inside
+ * them is not a crossing: an ISR that took the DISPATCH lock that way held it
+ * indefinitely and starved the vblank ISR (second prototype run). */
+KIRQL xbox_irql_swap(KIRQL new_irql)
+{
+    KIRQL old = g_current_irql;
+    irql_trace("swap", old, new_irql);
+    set_irql(new_irql);
+    return old;
+}
+
+/* Interrupt work in flight. On the one-CPU Xbox, an ISR that interrupts a
+ * thread below DISPATCH_LEVEL -- and every DPC it queues -- finishes before that
+ * thread executes another instruction. Here the thread keeps running on its own
+ * core, so a game thread began destroying a DSOUND voice 2 us after the APU ISR
+ * linked it onto a deferred list and 30 us before the DPC drained it (timing
+ * probe, HeroLab task a4e42446). Approximation: a thread entering DISPATCH_LEVEL
+ * from below first waits until no ISR is running, none of their DPCs is pending,
+ * and no device interrupt is raised but undelivered. Threads already at or above
+ * DISPATCH are unaffected, so DISPATCH code that spins on an ISR cannot
+ * deadlock against this. */
+static volatile LONG g_isr_work_pending;
+static int (*volatile g_irq_line_query)(void);
+
+void xbox_isr_work_begin(void) { InterlockedIncrement(&g_isr_work_pending); }
+void xbox_isr_work_end(void)   { InterlockedDecrement(&g_isr_work_pending); }
+void xbox_set_irq_line_query(int (*query)(void)) { g_irq_line_query = query; }
+
+static void wait_for_interrupt_work(void)
+{
+    LARGE_INTEGER t0, now;
+    int (*query)(void);
+    int warned = 0;
+
+    if (!g_cpu_lock_on)
+        return;
+    query = g_irq_line_query;
+    if (!g_isr_work_pending && !(query && query()))
+        return;
+    QueryPerformanceCounter(&t0);
+    for (;;) {
+        query = g_irq_line_query;
+        if (!g_isr_work_pending && !(query && query()))
+            return;
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart - t0.QuadPart > g_cpu_freq.QuadPart / 20) {   /* 50 ms */
+            if (!warned) {
+                fprintf(stderr, "[CPULOCK] WARNING: thread %lu gave up waiting 50 ms "
+                        "for interrupt work (pending %ld, line %d)\n",
+                        GetCurrentThreadId(), g_isr_work_pending,
+                        query ? query() : -1);
+                fflush(stderr);
+            }
+            return;
+        }
+        SwitchToThread();
+    }
+}
+
+/* The lock follows IRQL crossings of DISPATCH_LEVEL, in either direction. */
+static void irql_transition(KIRQL old, KIRQL new_irql)
+{
+    if (old < DISPATCH_LEVEL && new_irql >= DISPATCH_LEVEL)
+        wait_for_interrupt_work();
+    if (old < DISPATCH_LEVEL && new_irql >= DISPATCH_LEVEL)
+        /* The kernel dispatcher pops the guest return VA before calling the
+         * bridge, so it sits just below g_esp. */
+        xbox_cpu_lock_enter_at(g_esp ? *(volatile uint32_t *)((uintptr_t)(g_esp - 4) +
+                                                             g_xbox_mem_offset) : 0);
+    else if (old >= DISPATCH_LEVEL && new_irql < DISPATCH_LEVEL)
+        xbox_cpu_lock_leave();
+}
+
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).
@@ -43,13 +329,18 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
 {
     KIRQL old = g_current_irql;
 
-    if (NewIrql < old) {
+    /* Not a misuse when both levels are at or above DISPATCH_LEVEL: an ISR or
+     * KeSynchronizeExecution routine runs at device level here and raises to
+     * DISPATCH_LEVEL as if from below. */
+    if (NewIrql < old && NewIrql < DISPATCH_LEVEL) {
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
             "KfRaiseIrql: attempt to lower IRQL from %d to %d (use KfLowerIrql)",
             old, NewIrql);
     }
 
-    g_current_irql = NewIrql;
+    irql_trace("raise", old, NewIrql);
+    irql_transition(old, NewIrql);
+    set_irql(NewIrql);
     return old;
 }
 
@@ -59,13 +350,17 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
  */
 VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 {
-    if (NewIrql > g_current_irql) {
+    KIRQL old = g_current_irql;
+
+    if (NewIrql > old && old < DISPATCH_LEVEL) {
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
             "KfLowerIrql: attempt to raise IRQL from %d to %d (use KfRaiseIrql)",
-            g_current_irql, NewIrql);
+            old, NewIrql);
     }
 
-    g_current_irql = NewIrql;
+    irql_trace("lower", old, NewIrql);
+    set_irql(NewIrql);
+    irql_transition(old, NewIrql);
 }
 
 /*
@@ -74,7 +369,9 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
-    g_current_irql = DISPATCH_LEVEL;
+    irql_trace("todpc", old, DISPATCH_LEVEL);
+    irql_transition(old, DISPATCH_LEVEL);
+    set_irql(DISPATCH_LEVEL);
     return old;
 }
 

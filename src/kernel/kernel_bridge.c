@@ -1546,22 +1546,51 @@ static void bridge_KeInitializeDpc(void)
  * vblank and the DeferredRoutine that was supposed to drive per-frame work
  * never ran).
  *
- * Runs the DeferredRoutine synchronously, immediately, on the calling
- * thread -- matches this bridge's existing preference for running a
- * callback rather than modeling real scheduling (see
- * bridge_PsCreateSystemThreadEx's own "must run synchronously" comment).
- * The calling thread already has a valid guest stack (the interrupt-delivery
- * thread above, or whatever thread is already running recompiled code if a
- * title queues its own DPC outside interrupt context), so this nests an
- * ordinary guest call rather than needing a stack of its own.
+ * Queued from an ISR, the DeferredRoutine runs on the interrupt-delivery
+ * thread after the ISR returns; queued outside one, it runs at once on the
+ * calling thread. Either way it runs under the single-CPU (DISPATCH) lock at
+ * IRQL 2 (run_dpc below, kernel_hal.c). The calling thread already has a
+ * valid guest stack, so this nests an ordinary guest call rather than
+ * needing a stack of its own.
  */
-static void bridge_KeInsertQueueDpc(void)
+/* A guest routine the bridge calls is stdcall: its own "ret N" must leave
+ * g_esp exactly where it was before the bridge pushed its arguments. If a
+ * routine was lifted with a different cleanup, the guest stack drifts, and the
+ * code above it reads shifted locals (a crash in DSOUND read KeSynchronize-
+ * Execution's thunk address, 0xFE0001CC, as a voice object). Log the first
+ * mismatches per call site and restore g_esp. HeroLab task a4e42446. */
+static void check_guest_call_balance(const char *what, uint32_t routine,
+                                     uint32_t expected_esp)
 {
-    uint32_t dpc_va   = STACK_ARG(0);
-    uint32_t sysarg1  = STACK_ARG(1);
-    uint32_t sysarg2  = STACK_ARG(2);
+    static volatile LONG reported;
+    if (g_esp == expected_esp)
+        return;
+    if (InterlockedIncrement(&reported) <= 50) {
+        fprintf(stderr, "[ESPBAL] %s routine 0x%08X left g_esp 0x%08X, expected "
+                "0x%08X (%+d); restored\n", what, routine, g_esp, expected_esp,
+                (int)(g_esp - expected_esp));
+        fflush(stderr);
+    }
+    g_esp = expected_esp;
+}
+
+/* DPCs queued by an ISR are deferred until the ISR returns, then run under
+ * the single-CPU (DISPATCH) lock, as on hardware, where a DPC runs only once
+ * the CPU drops below DISPATCH_LEVEL. A DPC queued outside an ISR runs at once
+ * under the same lock (recursive, so callers already at DISPATCH nest).
+ * HeroLab Xbox Recompiler task a4e42446. */
+#define MAX_PENDING_DPCS 8
+/* Any level above DISPATCH_LEVEL; ISRs and KeSynchronizeExecution run here. */
+#define DEVICE_IRQL 26
+static RECOMP_TLS int t_in_isr;
+static RECOMP_TLS int t_pending_dpcs;
+static RECOMP_TLS uint32_t t_pending_dpc[MAX_PENDING_DPCS][3];
+
+static void run_dpc(uint32_t dpc_va, uint32_t sysarg1, uint32_t sysarg2)
+{
     uint32_t routine  = BRIDGE_MEM32(dpc_va + 12);
     uint32_t context  = BRIDGE_MEM32(dpc_va + 16);
+    uint32_t esp_before = g_esp;
     recomp_func_t fn;
 
     fn = recomp_lookup_manual(routine);
@@ -1569,7 +1598,6 @@ static void bridge_KeInsertQueueDpc(void)
     if (!fn) {
         fprintf(stderr, "  [KERNEL] KeInsertQueueDpc: DPC 0x%08X routine 0x%08X "
                 "not resolvable\n", dpc_va, routine);
-        g_eax = 0;
         return;
     }
 
@@ -1581,8 +1609,53 @@ static void bridge_KeInsertQueueDpc(void)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;  /* dummy return address */
-    fn();
+    xbox_cpu_lock_enter_at(routine);
+    {
+        KIRQL old = xbox_irql_swap(DISPATCH_LEVEL);
+        fn();
+        xbox_irql_swap(old);
+    }
+    xbox_cpu_lock_leave();
+    check_guest_call_balance("DPC", routine, esp_before);
+}
 
+/* Called by the interrupt delivery thread after its ISR returns. */
+static void run_pending_dpcs(void)
+{
+    int i, n = t_pending_dpcs;
+    t_pending_dpcs = 0;
+    for (i = 0; i < n; i++)
+        run_dpc(t_pending_dpc[i][0], t_pending_dpc[i][1], t_pending_dpc[i][2]);
+}
+
+static void bridge_KeInsertQueueDpc(void)
+{
+    uint32_t dpc_va   = STACK_ARG(0);
+    uint32_t sysarg1  = STACK_ARG(1);
+    uint32_t sysarg2  = STACK_ARG(2);
+    int i;
+
+    if (t_in_isr) {
+        /* Already queued: real KeInsertQueueDpc returns FALSE. */
+        for (i = 0; i < t_pending_dpcs; i++) {
+            if (t_pending_dpc[i][0] == dpc_va) {
+                g_eax = 0;
+                return;
+            }
+        }
+        if (t_pending_dpcs < MAX_PENDING_DPCS) {
+            t_pending_dpc[t_pending_dpcs][0] = dpc_va;
+            t_pending_dpc[t_pending_dpcs][1] = sysarg1;
+            t_pending_dpc[t_pending_dpcs][2] = sysarg2;
+            t_pending_dpcs++;
+            g_eax = 1;
+        } else {
+            g_eax = 0;
+        }
+        return;
+    }
+
+    run_dpc(dpc_va, sysarg1, sysarg2);
     g_eax = 1;  /* TRUE: approximation -- we don't track already-queued state */
 }
 
@@ -1640,9 +1713,19 @@ static void bridge_KeSynchronizeExecution(void)
 
     /* BOOLEAN SynchronizeRoutine(PVOID SynchronizeContext);
      * stdcall, one argument, so the callee's own "ret 4" restores g_esp. */
+    uint32_t esp_before = g_esp;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;  /* dummy return address */
-    fn();
+    /* Its whole purpose is to exclude the ISR, which runs under the
+     * interrupt lock on its delivery thread, so take the same lock. */
+    xbox_isr_lock_enter();
+    {
+        KIRQL old = xbox_irql_swap(DEVICE_IRQL);
+        fn();
+        xbox_irql_swap(old);
+    }
+    xbox_isr_lock_leave();
+    check_guest_call_balance("KeSynchronizeExecution", routine, esp_before);
     /* g_eax is now whatever SynchronizeRoutine returned -- pass it through
      * unmodified, matching how a real call would leave eax for the caller. */
 }
@@ -1733,6 +1816,36 @@ static void wake_breakdown_apu_isr(void *opaque)
     if (event) SetEvent(event);
 }
 
+/* After a guest IEN write: wait out an APU ISR already running (it holds the
+ * ISR lock for its whole run). New ones check the line before running. */
+static void apu_ien_barrier(void *opaque)
+{
+    (void)opaque;
+    xbox_isr_lock_enter();
+    xbox_isr_lock_leave();
+}
+
+/* For xbox_set_irq_line_query(): an APU interrupt raised but not yet
+ * delivered counts as interrupt work in flight. */
+static int apu_irq_line_pending(void)
+{
+    return g_apu_state && mcpx_apu_irq_line(g_apu_state);
+}
+
+/* XBOXRECOMP_APU_IRQ_LINE=0 restores unconditional APU ISR polling. */
+static int apu_irq_line_gating(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XBOXRECOMP_APU_IRQ_LINE");
+        on = !(e && e[0] == '0');
+        fprintf(stderr, "  [KERNEL] APU ISR delivery %s\n", on ?
+                "gated on the APU interrupt line (IEN & pending)" :
+                "ungated (XBOXRECOMP_APU_IRQ_LINE=0)");
+    }
+    return on;
+}
+
 static DWORD WINAPI interrupt_delivery_thread(LPVOID param)
 {
     int slot;
@@ -1758,8 +1871,9 @@ static DWORD WINAPI interrupt_delivery_thread(LPVOID param)
     apu_isr = routine == BREAKDOWN_APU_ISR_ROUTINE && g_apu_irq_event != NULL;
 
     fprintf(stderr, "  [KERNEL] interrupt delivery: armed on interrupt 0x%08X, "
-            "routine=0x%08X context=0x%08X, %d Hz\n",
-            interrupt_va, routine, context, INTERRUPT_DELIVERY_HZ);
+            "routine=0x%08X context=0x%08X, %d Hz, thread %lu\n",
+            interrupt_va, routine, context, INTERRUPT_DELIVERY_HZ,
+            GetCurrentThreadId());
     fflush(stderr);
 
     for (;;) {
@@ -1778,11 +1892,38 @@ static DWORD WINAPI interrupt_delivery_thread(LPVOID param)
          * stdcall, so the callee's own "ret 8" restores g_esp fully -- no
          * cleanup needed here after fn() returns. */
         g_esp = stack_top;
+        {
+        uint32_t esp_before = g_esp;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = interrupt_va;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;  /* dummy return address */
         g_seh_ebp = g_esp;
-        fn();
+        /* ISRs preempt DISPATCH-level code, so they take only the
+         * interrupt lock; DPCs they queue run afterwards at DISPATCH. */
+        xbox_isr_lock_enter();
+        /* On hardware the ISR runs only while the device asserts its line.
+         * The 60 Hz poll used to call the APU ISR regardless, so it ran while
+         * DSOUND had cleared IEN to keep it out, and touched voices the game
+         * thread was destroying (crash: a voice's vtable changed from
+         * 0x00226374 to 0x0022624C between insert and drain). */
+        if (apu_isr && apu_irq_line_gating() && !mcpx_apu_irq_line(g_apu_state)) {
+            xbox_isr_lock_leave();
+            g_esp = esp_before;
+            continue;
+        }
+        xbox_isr_work_begin();   /* ended after this ISR's DPCs have run */
+        t_in_isr = 1;
+        {
+            KIRQL old = xbox_irql_swap(DEVICE_IRQL);
+            fn();
+            xbox_irql_swap(old);
+        }
+        t_in_isr = 0;
+        xbox_isr_lock_leave();
+        check_guest_call_balance("ISR", routine, esp_before);
+        }
+        run_pending_dpcs();
+        xbox_isr_work_end();
     }
 }
 
@@ -1808,10 +1949,15 @@ static void bridge_KeConnectInterrupt(void)
             HANDLE h;
             if (routine == BREAKDOWN_APU_ISR_ROUTINE && !g_apu_irq_event) {
                 g_apu_irq_event = CreateEventA(NULL, FALSE, FALSE, NULL);
-                if (g_apu_irq_event && g_apu_state)
+                if (g_apu_irq_event && g_apu_state) {
                     mcpx_apu_set_irq_callback(g_apu_state,
                                                wake_breakdown_apu_isr,
                                                g_apu_irq_event);
+                    if (apu_irq_line_gating()) {
+                        mcpx_apu_set_ien_barrier(g_apu_state, apu_ien_barrier, NULL);
+                        xbox_set_irq_line_query(apu_irq_line_pending);
+                    }
+                }
             }
             g_connected_interrupts[idx] = interrupt_va;
             h = CreateThread(NULL, 0, interrupt_delivery_thread,

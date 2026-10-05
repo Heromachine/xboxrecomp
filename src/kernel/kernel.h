@@ -789,6 +789,19 @@ BOOLEAN __stdcall xbox_HalIsResetOrShutdownPending(void);
 KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
 VOID    __fastcall xbox_KfLowerIrql(KIRQL NewIrql);
 KIRQL   __stdcall xbox_KeRaiseIrqlToDpcLevel(void);
+/* Single-CPU lock: held while a thread is at DISPATCH_LEVEL or above, and
+ * while DPCs run; the ISR lock serialises ISRs and KeSynchronizeExecution. */
+void    xbox_cpu_lock_enter(void);
+void    xbox_cpu_lock_enter_at(uint32_t guest_site);
+void    xbox_cpu_lock_leave(void);
+void    xbox_isr_lock_enter(void);
+void    xbox_isr_lock_leave(void);
+KIRQL   xbox_irql_swap(KIRQL new_irql);
+/* Interrupt work in flight (an ISR running or its DPCs pending); threads
+ * entering DISPATCH_LEVEL from below wait for it, as on one CPU. */
+void    xbox_isr_work_begin(void);
+void    xbox_isr_work_end(void);
+void    xbox_set_irq_line_query(int (*query)(void));
 
 VOID    __stdcall xbox_KeStallExecutionProcessor(ULONG MicroSeconds);
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void);
