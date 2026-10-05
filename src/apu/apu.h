@@ -5,6 +5,7 @@
  */
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -31,6 +32,13 @@ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned 
  * The standalone host can wake its guest ISR delivery thread immediately. */
 void mcpx_apu_set_irq_callback(MCPXAPUState *d,
                                void (*callback)(void *opaque), void *opaque);
+
+/* Called after every guest write to NV_PAPU_IEN (see apu_state.h). */
+void mcpx_apu_set_ien_barrier(MCPXAPUState *d,
+                              void (*barrier)(void *opaque), void *opaque);
+
+/* True when the APU interrupt line is asserted (enabled and pending). */
+bool mcpx_apu_irq_line(MCPXAPUState *d);
 
 /* Play a 440Hz test tone through the APU pipeline to verify audio output.
  * Directly programs a voice without going through DirectSound. */

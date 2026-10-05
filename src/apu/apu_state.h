@@ -459,6 +459,11 @@ struct MCPXAPUState {
     bool set_irq;
     void (*irq_callback)(void *opaque);
     void *irq_opaque;
+    /* Called after a guest write to NV_PAPU_IEN. The host uses it to wait out
+     * an ISR already in flight, so "interrupts off" means what it does on one
+     * CPU (HeroLab task a4e42446). */
+    void (*ien_barrier)(void *opaque);
+    void *ien_barrier_opaque;
     HANDLE resume_event;
 
     QemuThread apu_thread;

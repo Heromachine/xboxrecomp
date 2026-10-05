@@ -134,8 +134,14 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
  * Voice off / lock
  * ============================================================ */
 
+/* Diagnostic hook (HeroLab task a4e42446): host-side voice events, 'O' when
+ * the guest turns voice v off, 'T' when the VP raises SE2FE_IDLE_VOICE for v.
+ * Set by a title-side probe; NULL in normal builds. */
+void (*volatile g_apu_voice_event_hook)(char op, unsigned voice);
+
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
+    if (g_apu_voice_event_hook) g_apu_voice_event_hook('O', v);
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 0);
 
@@ -533,6 +539,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         break;
 
     case SE2FE_IDLE_VOICE:
+        if (g_apu_voice_event_hook) g_apu_voice_event_hook('T', argument);
         if (d->regs[NV_PAPU_FETFORCE1] & NV_PAPU_FETFORCE1_SE2FE_IDLE_VOICE) {
             uint32_t old_fectl = d->regs[NV_PAPU_FECTL];
             d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FEMETHMODE;

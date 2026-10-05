@@ -153,6 +153,26 @@ void mcpx_apu_set_irq_callback(MCPXAPUState *d,
     __atomic_store_n(&d->irq_callback, callback, __ATOMIC_RELEASE);
 }
 
+void mcpx_apu_set_ien_barrier(MCPXAPUState *d,
+                              void (*barrier)(void *opaque), void *opaque)
+{
+    if (!d) return;
+    __atomic_store_n(&d->ien_barrier_opaque, opaque, __ATOMIC_RELAXED);
+    __atomic_store_n(&d->ien_barrier, barrier, __ATOMIC_RELEASE);
+}
+
+/* Is the APU's interrupt line asserted -- global enable set and an enabled
+ * event pending? The same condition update_irq() raises GINTSTS on. */
+bool mcpx_apu_irq_line(MCPXAPUState *d)
+{
+    uint32_t ien, ists;
+    if (!d) return true;
+    ien = qatomic_read(&d->regs[NV_PAPU_IEN]);
+    ists = qatomic_read(&d->regs[NV_PAPU_ISTS]);
+    return (ien & NV_PAPU_ISTS_GINTSTS) &&
+           ((ists & ~NV_PAPU_ISTS_GINTSTS) & ien);
+}
+
 /* ============================================================
  * MMIO Read / Write
  * ============================================================ */
@@ -223,6 +243,19 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
         qemu_cond_broadcast(&d->cond);
         if (d->resume_event) SetEvent(d->resume_event);
         break;
+    case NV_PAPU_IEN: {
+        /* Was handled by the default case: stored, but the IRQ state was not
+         * re-evaluated, unlike xemu. DSOUND (sub_001D9D2E) toggles bit 0 to
+         * keep its ISR out while it changes voice state; after the store, wait
+         * for any ISR already running so none overlaps the caller. */
+        void (*barrier)(void *);
+        qatomic_set(&d->regs[addr], (uint32_t)val);
+        update_irq(d);
+        barrier = __atomic_load_n(&d->ien_barrier, __ATOMIC_ACQUIRE);
+        if (barrier)
+            barrier(__atomic_load_n(&d->ien_barrier_opaque, __ATOMIC_RELAXED));
+        break;
+    }
     case NV_PAPU_FEMEMDATA:
         /* 'magic write' - value written to FEMEMADDR on notify completion */
         stl_le_phys(address_space_memory, d->regs[NV_PAPU_FEMEMADDR], (uint32_t)val);
