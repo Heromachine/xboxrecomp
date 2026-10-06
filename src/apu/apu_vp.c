@@ -21,6 +21,7 @@
 
 #include "apu_state.h"
 #include <math.h>
+#include <stdlib.h>
 #include "fpconv.h"
 
 extern void apu_diag_set_voice(int voice);
@@ -1340,6 +1341,44 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
     int dbg_listed = 0, dbg_active = 0, dbg_idled = 0;
     int dbg_persistent_idled = 0;
 
+    /* XBOXRECOMP_APU_VOICE_DUMP=1: every ~5 s (7,500 VP frames), one
+     * [APUVOICE] line per active voice with its format and buffer offsets,
+     * to identify a voice by its loop length or rate (a looping fragment, a
+     * voice at the wrong pitch). Pitch is the hardware's octave fixed point:
+     * rate = 48000 * 2^(pitch/4096) samples per second. */
+    static int voice_dump = -1;
+    static unsigned voice_dump_frames;
+    bool dump_now = false;
+    if (voice_dump < 0) {
+        const char *e = getenv("XBOXRECOMP_APU_VOICE_DUMP");
+        voice_dump = e && e[0] == '1';
+    }
+    if (voice_dump && ++voice_dump_frames >= 7500) {
+        voice_dump_frames = 0;
+        dump_now = true;
+    }
+
+    /* XBOXRECOMP_APU_MUTE_FILE=<path>: voice handles listed in that file
+     * (whitespace-separated, re-read every ~0.25 s) are skipped, so a sound
+     * can be traced to its voice while the game runs: mute one, listen or
+     * record, mute the next. A skipped voice does not advance either. */
+    static const char *mute_path = (const char *)1;
+    static unsigned mute_frames;
+    static uint8_t muted[MCPX_HW_MAX_VOICES];
+    if (mute_path == (const char *)1)
+        mute_path = getenv("XBOXRECOMP_APU_MUTE_FILE");
+    if (mute_path && ++mute_frames >= 375) {
+        FILE *mf = fopen(mute_path, "r");
+        unsigned h;
+        mute_frames = 0;
+        memset(muted, 0, sizeof muted);
+        if (mf) {
+            while (fscanf(mf, "%u", &h) == 1)
+                if (h < MCPX_HW_MAX_VOICES) muted[h] = 1;
+            fclose(mf);
+        }
+    }
+
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
         top = voice_list_regs[list].top;
@@ -1377,6 +1416,35 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                 }
             } else {
                 dbg_active++;
+                if (dump_now) {
+                    uint32_t fmt = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFF);
+                    int16_t pitch = (int16_t)voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                                        NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH);
+                    uint32_t lbo = voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSH_SAMPLE,
+                                                  NV_PAVS_VOICE_CUR_PSH_SAMPLE_LBO);
+                    uint32_t ebo = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_NEXT,
+                                                  NV_PAVS_VOICE_PAR_NEXT_EBO);
+                    double rate = 48000.0 * pow(2.0, pitch / 4096.0);
+                    fprintf(stderr, "[APUVOICE] v=%u list=%d fmt=0x%08X stream=%d loop=%d "
+                            "persist=%d stereo=%d container=%u spb=%u ba=0x%06X lbo=%u "
+                            "ebo=%u cbo=%u pitch=%d rate=%.0f loop_ms=%.1f state=0x%08X\n",
+                            v, list, fmt, !!(fmt & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE),
+                            !!(fmt & NV_PAVS_VOICE_CFG_FMT_LOOP),
+                            !!(fmt & NV_PAVS_VOICE_CFG_FMT_PERSIST),
+                            !!(fmt & NV_PAVS_VOICE_CFG_FMT_STEREO), fmt >> 30,
+                            ((fmt >> 16) & 0x1F) + 1,
+                            voice_get_mask(d, v, NV_PAVS_VOICE_CUR_PSL_START,
+                                           NV_PAVS_VOICE_CUR_PSL_START_BA),
+                            lbo, ebo,
+                            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
+                                           NV_PAVS_VOICE_PAR_OFFSET_CBO),
+                            pitch, rate, rate > 0 ? (ebo - (lbo <= ebo ? lbo : 0) + 1) * 1000.0 / rate : 0,
+                            voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE, 0xFFFFFFFF));
+                }
+                if (mute_path && v < MCPX_HW_MAX_VOICES && muted[v]) {
+                    d->regs[current] = d->regs[next];
+                    continue;
+                }
                 /* Process voice directly (single-threaded) */
                 apu_diag_set_voice(v);
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
