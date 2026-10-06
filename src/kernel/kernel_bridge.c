@@ -2025,36 +2025,238 @@ static void bridge_HalRegisterShutdownNotification(void)
     g_eax = 0;
 }
 
-/* ── KeInitializeTimerEx (ordinal 113) ────────────────────
- * VOID KeInitializeTimerEx(PKTIMER Timer, TIMER_TYPE Type)
+/* ── Guest kernel timers: KeInitializeTimerEx (113), KeSetTimer (149),
+ *    KeSetTimerEx (150), KeCancelTimer (97) ──────────────────────────
  *
- * Initializes a timer object. Xbox KTIMER is 40 bytes.
- */
+ * KeSetTimer used to be a stub that never started anything, so no guest
+ * timer ever expired and no timer DPC ever ran. Breakdown's DSOUND schedules
+ * its per-buffer work on one (a queue of events with absolute due times,
+ * serviced by the timer DPC sub_001D4BF0 -> sub_001D4832). Among those is
+ * the position-notification check that tells the game's music streamer to
+ * refill, so in-game music looped its last 280 ms buffer forever.
+ * HeroLab Xbox Recompiler task 6bca0891.
+ *
+ * Xbox KTIMER, 40 bytes:
+ *   +0  Header.Type (8 notification, 9 synchronization)   +1 Absolute
+ *   +2  Header.Size (in dwords)   +3 Header.Inserted
+ *   +4  Header.SignalState        +8 Header.WaitListHead (LIST_ENTRY)
+ *   +16 DueTime (ULARGE_INTEGER)  +24 TimerListEntry
+ *   +32 Dpc (PKDPC)               +36 Period (ms)
+ *
+ * A service thread keeps the armed timers in a table and, as each expires,
+ * signals it and runs its DPC as guest code on a guest stack of its own,
+ * under the single-CPU lock (run_dpc), like a DPC queued from the clock
+ * interrupt. A periodic timer re-arms itself.
+ *
+ * DueTime: negative is relative, in 100 ns units; positive is absolute, in
+ * the clock KeQuerySystemTime reports (host FILETIME here).
+ *
+ * Not covered: waiting on a timer object. Guest KeWaitForSingleObject treats
+ * the object pointer as a host handle for every object type. Signal state is
+ * kept right for a later fix. */
+
+#define KTIMER_SIZE      40
+#define MAX_GUEST_TIMERS 64
+
+typedef struct {
+    uint32_t  va;          /* 0 = free slot */
+    ULONGLONG due_ms;      /* host GetTickCount64() deadline */
+    uint32_t  period_ms;
+    uint32_t  dpc;
+} guest_timer;
+
+static guest_timer      g_timers[MAX_GUEST_TIMERS];
+static CRITICAL_SECTION g_timer_lock;
+static HANDLE           g_timer_wake;
+static INIT_ONCE        g_timer_once = INIT_ONCE_STATIC_INIT;
+static volatile LONG    g_timer_fired;
+
+static DWORD WINAPI guest_timer_thread(LPVOID unused);
+
+static BOOL CALLBACK guest_timer_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    HANDLE h;
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_timer_lock);
+    g_timer_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
+    h = CreateThread(NULL, 0, guest_timer_thread, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+    else fprintf(stderr, "  [KERNEL] timers: could not start the timer thread\n");
+    return TRUE;
+}
+
+static void guest_timer_ensure(void)
+{
+    InitOnceExecuteOnce(&g_timer_once, guest_timer_init, NULL, NULL);
+}
+
+/* Index of va's slot, or -1. Caller holds g_timer_lock. */
+static int guest_timer_find(uint32_t va)
+{
+    int i;
+    for (i = 0; i < MAX_GUEST_TIMERS; i++)
+        if (g_timers[i].va == va) return i;
+    return -1;
+}
+
+/* Disarm; returns whether it was armed. Caller holds g_timer_lock. */
+static int guest_timer_remove(uint32_t va)
+{
+    int i = guest_timer_find(va);
+    BRIDGE_MEM8(va + 3) = 0;   /* Header.Inserted */
+    if (i < 0) return 0;
+    g_timers[i].va = 0;
+    return 1;
+}
+
+static DWORD WINAPI guest_timer_thread(LPVOID unused)
+{
+    int slot = xbox_worker_stack_alloc();
+    uint32_t stack_top;
+    (void)unused;
+    if (slot < 0) {
+        fprintf(stderr, "  [KERNEL] timers: no worker stack slice; guest timers will not fire\n");
+        return 0;
+    }
+    stack_top = XBOX_WORKER_STACK_TOP(slot);
+    xbox_init_fake_tib();
+    fprintf(stderr, "  [KERNEL] timers: service thread %lu armed\n", GetCurrentThreadId());
+    fflush(stderr);
+
+    ULONGLONG report = GetTickCount64() + 5000;
+    for (;;) {
+        ULONGLONG now = GetTickCount64(), next = now + 1000;
+        uint32_t dpc = 0, va = 0;
+        int i;
+
+        if (now >= report) {
+            int armed = 0;
+            EnterCriticalSection(&g_timer_lock);
+            for (i = 0; i < MAX_GUEST_TIMERS; i++) armed += g_timers[i].va != 0;
+            LeaveCriticalSection(&g_timer_lock);
+            fprintf(stderr, "  [KERNEL] timers: %ld fired, %d armed\n",
+                    (long)InterlockedExchange(&g_timer_fired, 0), armed);
+            report = now + 5000;
+        }
+
+        EnterCriticalSection(&g_timer_lock);
+        for (i = 0; i < MAX_GUEST_TIMERS; i++) {
+            guest_timer *t = &g_timers[i];
+            if (!t->va) continue;
+            if (t->due_ms <= now) {
+                /* Expired: signal it, take its DPC, re-arm or retire it. One
+                 * per pass, so the table is never held across guest code. */
+                va = t->va;
+                dpc = t->dpc;
+                BRIDGE_MEM32(va + 4) = 1;   /* Header.SignalState */
+                if (t->period_ms) {
+                    t->due_ms = now + t->period_ms;
+                } else {
+                    t->va = 0;
+                    BRIDGE_MEM8(va + 3) = 0;
+                }
+                break;
+            }
+            if (t->due_ms < next) next = t->due_ms;
+        }
+        LeaveCriticalSection(&g_timer_lock);
+
+        if (va) {
+            InterlockedIncrement(&g_timer_fired);
+            if (dpc) {
+                /* DPC arguments for a timer DPC: SystemArgument1/2 carry the
+                 * expiry time on NT; DSOUND's routine does not read them. */
+                g_esp = stack_top;
+                g_seh_ebp = g_esp;
+                run_dpc(dpc, 0, 0);
+            }
+            continue;   /* look again at once: several may be due */
+        }
+        WaitForSingleObject(g_timer_wake, (DWORD)(next - now));
+    }
+}
+
+/* VOID KeInitializeTimerEx(PKTIMER Timer, TIMER_TYPE Type) */
 static void bridge_KeInitializeTimerEx(void)
 {
     uint32_t timer_va = STACK_ARG(0);
     uint32_t type = STACK_ARG(1);
 
-    /* Zero the structure (40 bytes) */
-    memset(XBOX_TO_NATIVE(timer_va), 0, 40);
+    guest_timer_ensure();
+    EnterCriticalSection(&g_timer_lock);
+    guest_timer_remove(timer_va);   /* re-initialised while armed */
+    LeaveCriticalSection(&g_timer_lock);
 
-    /* Set Type (0x08 = TimerNotificationObject, 0x09 = TimerSynchronizationObject) */
-    BRIDGE_MEM16(timer_va + 0) = (uint16_t)(0x08 + (type & 1));
+    memset(XBOX_TO_NATIVE(timer_va), 0, KTIMER_SIZE);
+    BRIDGE_MEM8(timer_va + 0) = (uint8_t)(0x08 + (type & 1));
+    BRIDGE_MEM8(timer_va + 2) = KTIMER_SIZE / 4;
+    BRIDGE_MEM32(timer_va + 8)  = timer_va + 8;    /* empty WaitListHead */
+    BRIDGE_MEM32(timer_va + 12) = timer_va + 8;
     g_eax = 0;
 }
 
-/* ── KeSetTimer / KeSetTimerEx (ordinal 149/150) ──────────
- * BOOLEAN KeSetTimer(PKTIMER Timer, LARGE_INTEGER DueTime, PKDPC Dpc)
- *
- * Sets a timer. We don't actually start timers - just record the state.
- * Returns FALSE (timer was not already set).
- */
-static void bridge_KeSetTimer(void)
+/* BOOLEAN KeSetTimer(PKTIMER Timer, LARGE_INTEGER DueTime, PKDPC Dpc)
+ * BOOLEAN KeSetTimerEx(PKTIMER Timer, LARGE_INTEGER DueTime, LONG Period, PKDPC Dpc)
+ * TRUE if the timer was already armed. */
+static void bridge_set_timer(int ex)
 {
-    /* Timer functionality is not needed for basic execution.
-     * Return FALSE = timer was not previously set. */
-    g_eax = 0;
+    uint32_t timer_va = STACK_ARG(0);
+    int64_t  due = (int64_t)((uint64_t)STACK_ARG(1) | ((uint64_t)STACK_ARG(2) << 32));
+    uint32_t period = ex ? STACK_ARG(3) : 0;
+    uint32_t dpc = STACK_ARG(ex ? 4 : 3);
+    ULONGLONG now = GetTickCount64(), delay_ms;
+    int was, i;
+
+    if (due < 0) {
+        delay_ms = (ULONGLONG)(-due) / 10000;
+    } else {
+        FILETIME ft;
+        int64_t sys;
+        GetSystemTimeAsFileTime(&ft);
+        sys = (int64_t)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+        delay_ms = due > sys ? (ULONGLONG)(due - sys) / 10000 : 0;
+    }
+
+    guest_timer_ensure();
+    EnterCriticalSection(&g_timer_lock);
+    was = guest_timer_remove(timer_va);
+    i = guest_timer_find(0);
+    if (i >= 0) {
+        g_timers[i].va = timer_va;
+        g_timers[i].due_ms = now + delay_ms;
+        g_timers[i].period_ms = period;
+        g_timers[i].dpc = dpc;
+        BRIDGE_MEM8(timer_va + 3) = 1;   /* Header.Inserted */
+    }
+    BRIDGE_MEM32(timer_va + 4) = 0;      /* Header.SignalState */
+    BRIDGE_MEM32(timer_va + 16) = (uint32_t)due;
+    BRIDGE_MEM32(timer_va + 20) = (uint32_t)((uint64_t)due >> 32);
+    BRIDGE_MEM32(timer_va + 32) = dpc;
+    BRIDGE_MEM32(timer_va + 36) = period;
+    LeaveCriticalSection(&g_timer_lock);
+
+    {
+        static volatile LONG logged;
+        if (InterlockedIncrement(&logged) <= 40)
+            fprintf(stderr, "  [KERNEL] KeSetTimer%s timer=0x%08X due=%lld (%s, %llu ms) "
+                    "period=%u dpc=0x%08X routine=0x%08X ret=0x%08X%s\n", ex ? "Ex" : "",
+                    timer_va, (long long)due, due < 0 ? "relative" : "absolute",
+                    (unsigned long long)delay_ms, period, dpc,
+                    dpc ? BRIDGE_MEM32(dpc + 12) : 0, BRIDGE_MEM32(g_esp - 4),
+                    was ? " (re-armed)" : "");
+    }
+    if (i < 0) {
+        static volatile LONG warned;
+        if (!InterlockedExchange(&warned, 1))
+            fprintf(stderr, "  [KERNEL] timers: more than %d armed; timer 0x%08X dropped\n",
+                    MAX_GUEST_TIMERS, timer_va);
+    }
+    SetEvent(g_timer_wake);
+    g_eax = (uint32_t)was;
 }
+
+static void bridge_KeSetTimer(void)   { bridge_set_timer(0); }
+static void bridge_KeSetTimerEx(void) { bridge_set_timer(1); }
 
 /* ── ExQueryPoolBlockSize (ordinal 24) ────────────────────
  * ULONG ExQueryPoolBlockSize(PVOID PoolBlock)
@@ -3216,11 +3418,17 @@ static void bridge_IoCreateDevice(void)
     g_eax = 0;  /* STATUS_SUCCESS */
 }
 
-/* ── KeCancelTimer (ordinal 97, 1 arg) */
+/* ── KeCancelTimer (ordinal 97, 1 arg)
+ * BOOLEAN KeCancelTimer(PKTIMER Timer): TRUE if it was armed. This passed the
+ * guest KTIMER to the host timer API, which reads it as a host struct with
+ * 64-bit pointers; guest timers live in the table above now. */
 static void bridge_KeCancelTimer(void)
 {
-    g_eax = (uint32_t)xbox_KeCancelTimer(
-        (PXBOX_KTIMER)XBOX_TO_NATIVE(STACK_ARG(0)));
+    uint32_t timer_va = STACK_ARG(0);
+    guest_timer_ensure();
+    EnterCriticalSection(&g_timer_lock);
+    g_eax = (uint32_t)guest_timer_remove(timer_va);
+    LeaveCriticalSection(&g_timer_lock);
 }
 
 /* ── KeDisconnectInterrupt (ordinal 100, 1 arg) */
@@ -3744,7 +3952,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 127: return bridge_KeQueryPerformanceFrequency;
     case 128: return bridge_KeQuerySystemTime;
     case 149: return bridge_KeSetTimer;
-    case 150: return bridge_KeSetTimer;  /* KeSetTimerEx */
+    case 150: return bridge_KeSetTimerEx;
 
     /* DPC / Timer init */
     case 107: return bridge_KeInitializeDpc;
@@ -3886,7 +4094,10 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
      * allocate in GUEST memory with DeviceExtension at +0x18; see it for the
      * 368-byte wild memset the unbridged path caused on every boot. */
     case  65: return bridge_IoCreateDevice;
-    /* case  97: bridge_KeCancelTimer */
+    /* KeCancelTimer (97): its old body handed the guest KTIMER to the host
+     * timer code as a host struct, so it stayed unregistered. It now works on
+     * the guest timer table (see KeSetTimer); task 6bca0891. */
+    case  97: return bridge_KeCancelTimer;
     /* case 100: bridge_KeDisconnectInterrupt */
     /* KeSetBasePriorityThread (143): bridge and its 8-byte arg entry both
      * already existed. Two stack args, no out-parameter, nothing wider than 4
