@@ -71,9 +71,20 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
  * Filter helpers
  * ============================================================ */
 
+/* Per-voice resampler state (see voice_resample). hist holds four input
+ * samples around the read position, which lies between hist[1] and hist[2],
+ * frac of the way across. */
+typedef struct {
+    float hist[4][2];
+    double frac;
+    bool primed;
+} VoiceResampler;
+static VoiceResampler g_voice_src[MCPX_HW_MAX_VOICES];
+
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
+    g_voice_src[v].primed = false;
     memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
     hrtf_filter_clear_history(&d->vp.filters[v].hrtf);
     if (d->vp.filters[v].resampler) {
@@ -1042,26 +1053,103 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
  * resample. This gives us functional audio at the cost of quality.
  * ============================================================ */
 
-static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
-                          int requested_num, float rate)
+/* Fetch up to n input samples; stops early when the voice ends or a stream
+ * runs dry. Returns the number fetched, and sets *starved when a stream had
+ * nothing at all. */
+static int voice_fetch(MCPXAPUState *d, uint16_t v, float out[][2], int n, bool *starved)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
-    int sample_count = 0;
-    while (sample_count < requested_num) {
+    int got = 0;
+    *starved = false;
+    while (got < n) {
         int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                     NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
         if (!active) break;
-
-        int count = voice_get_samples(d, v, &samples[sample_count],
-                                      requested_num - sample_count);
+        int count = voice_get_samples(d, v, &out[got], n - got);
         if (count < 0) break;
-        if (count == 0) return -1;
-        sample_count += count;
+        if (count == 0) { *starved = true; break; }
+        got += count;
     }
-    (void)rate; /* Ignored until we add proper resampling */
-    return sample_count;
+    return got;
+}
+
+/* Turn a voice's samples into requested_num output samples at 48 kHz.
+ *
+ * rate is output samples per input sample (from the voice's pitch: 1.0 at
+ * 48 kHz, 2.0 for a 24 kHz sound, about 7.9 for one at 6 kHz). This used to
+ * ignore rate and copy input to output one for one, so every voice played at
+ * 48 kHz: a 6 kHz ambient loop of 2.2 s became a 280 ms chipmunk loop, voices
+ * were pitched up, and streams were drained faster than they are fed.
+ * HeroLab Xbox Recompiler task 6bca0891.
+ *
+ * xemu does this with libsamplerate. This is cubic (Catmull-Rom)
+ * interpolation over the voice's own input samples, with the read position
+ * kept per voice between frames. A voice at 48 kHz takes the exact copy path.
+ * The input needed for this frame is counted first and fetched in one go,
+ * because fetching advances the voice's play position (CBO), which the game
+ * reads. */
+static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
+                          int requested_num, float rate)
+{
+    enum { MAX_STEP = 256 };   /* pitch is a signed 16-bit octave value: 2^8 */
+    static float in[NUM_SAMPLES_PER_FRAME * MAX_STEP + 4][2];
+    VoiceResampler *r = &g_voice_src[v];
+    double step = rate > 0.0f ? 1.0 / rate : 1.0;
+    bool starved;
+
+    if (step > 0.999999 && step < 1.000001) {
+        int got = voice_fetch(d, v, samples, requested_num, &starved);
+        r->primed = false;
+        return (got == 0 && starved) ? -1 : got;
+    }
+    if (step > MAX_STEP) step = MAX_STEP;
+
+    if (!r->primed) {
+        /* Start exactly on the first input sample, silence before it. */
+        float first[3][2] = {{0}};
+        int got = voice_fetch(d, v, first, 3, &starved);
+        if (got == 0) return starved ? -1 : 0;
+        memset(r->hist[0], 0, sizeof r->hist[0]);
+        memcpy(r->hist[1], first[0], sizeof first[0]);
+        memcpy(r->hist[2], first[1], sizeof first[1]);
+        memcpy(r->hist[3], first[2], sizeof first[2]);
+        r->frac = 0.0;
+        r->primed = true;
+    }
+
+    /* How many input samples this frame consumes. */
+    int need = 0;
+    {
+        double f = r->frac;
+        for (int i = 0; i < requested_num; i++) {
+            f += step;
+            int adv = (int)f;
+            need += adv;
+            f -= adv;
+        }
+    }
+    int got = need ? voice_fetch(d, v, in, need, &starved) : 0;
+    if (got < need)
+        memset(in[got], 0, sizeof in[0] * (size_t)(need - got));
+
+    int k = 0;
+    for (int i = 0; i < requested_num; i++) {
+        float t = (float)r->frac, t2 = t * t, t3 = t2 * t;
+        for (int c = 0; c < 2; c++) {
+            float p0 = r->hist[0][c], p1 = r->hist[1][c];
+            float p2 = r->hist[2][c], p3 = r->hist[3][c];
+            samples[i][c] = 0.5f * (2.0f * p1 + (p2 - p0) * t +
+                                    (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 +
+                                    (3.0f * (p1 - p2) + p3 - p0) * t3);
+        }
+        r->frac += step;
+        int adv = (int)r->frac;
+        r->frac -= adv;
+        while (adv-- > 0) {
+            memmove(r->hist[0], r->hist[1], sizeof r->hist[0] * 3);
+            memcpy(r->hist[3], in[k++], sizeof in[0]);
+        }
+    }
+    return requested_num;
 }
 
 /* ============================================================
