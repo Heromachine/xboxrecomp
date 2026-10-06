@@ -17,6 +17,9 @@
  */
 
 #include "kernel.h"
+#ifdef _WIN32
+#include <mmsystem.h>   /* timeBeginPeriod */
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -388,6 +391,19 @@ void xbox_kernel_init(void)
 {
     ULONG resolved = 0;
     ULONG unresolved = 0;
+
+#ifdef _WIN32
+    /* 1 ms system timer for the life of the process. Windows otherwise ticks
+     * at 15.6 ms, and every short wait here rounds up to it: the APU frame
+     * thread paces 5.3 ms slots with millisecond waits and does not catch up
+     * when it overruns, so on native Windows it delivered 28-33k of the
+     * 48,000 samples a second (slow, low, crackling audio on HeroGame;
+     * Breakdown 0.1.0-rc3). Wine already sleeps to ~1 ms, which is why the
+     * same build sounded right there. It also tightens the vblank clock and
+     * KeDelayExecutionThread. Released by the OS when the process ends. */
+    if (timeBeginPeriod(1) != TIMERR_NOERROR)
+        fprintf(stderr, "[KERNEL] timeBeginPeriod(1) failed; waits keep the default timer resolution\n");
+#endif
 
     /* Initialize logging */
     InitializeCriticalSection(&g_log_cs);
