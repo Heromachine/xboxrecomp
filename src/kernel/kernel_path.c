@@ -97,8 +97,14 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         GetCurrentDirectoryW(MAX_PATH, s_game_dir);
     }
 
+    /* XBOXRECOMP_SAVE_DIR: where the player chose to keep saves (a launcher
+     * option). Read wide, so a folder name outside the ANSI code page works. */
+    const wchar_t *env_save = _wgetenv(L"XBOXRECOMP_SAVE_DIR");
+
     if (save_dir) {
         MultiByteToWideChar(CP_UTF8, 0, save_dir, -1, s_save_dir, MAX_PATH);
+    } else if (env_save && *env_save) {
+        wcsncpy_s(s_save_dir, MAX_PATH, env_save, _TRUNCATE);
     } else {
         if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, save_base))) {
             swprintf_s(s_save_dir, MAX_PATH, L"%s\\xboxrecomp", save_base);
@@ -405,6 +411,12 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         if (!getcwd(cwd, sizeof(cwd)))
             snprintf(cwd, sizeof(cwd), ".");
         snprintf(s_game_dir, sizeof(s_game_dir), "%s/Burnout 3 Takedown", cwd);
+    }
+
+    if (!save_dir) {
+        const char *env_save = getenv("XBOXRECOMP_SAVE_DIR");   /* as on Windows */
+        if (env_save && *env_save)
+            save_dir = env_save;
     }
 
     if (save_dir) {

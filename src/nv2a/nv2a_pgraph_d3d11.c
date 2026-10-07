@@ -479,6 +479,8 @@ static float u2f(uint32_t u) {
  *   XBOXRECOMP_DBG_NOGLOW=<offset>    skip additive (SRC_ALPHA/ONE), depth-off draws whose stage-1
  *                                     texture is at <offset> (Breakdown's lamp glow: mask 0x021CC000)
  *   XBOXRECOMP_DBG_LIGHTS=<inputs>    in a [SURF] trace, that program's light block c96..c159
+ *   XBOXRECOMP_DBG_NOGAMMA=1          show the frame without the title's gamma ramp
+ *   XBOXRECOMP_DBG_BRIGHTNESS=<0..100> override the player's brightness (XBOXRECOMP_BRIGHTNESS)
  * (XBOXRECOMP_DBG_FOGF=<f> lives in d3d8_vsh.c: force the fog factor.) */
 static struct {
     long skiptex;
@@ -494,7 +496,8 @@ static struct {
     long constdiff;     /* XBOXRECOMP_DBG_CONSTDIFF=<inputs>: in a [SURF] trace, the vertex
                          * constants that changed since the last draw with those inputs */
     int nogamma;        /* XBOXRECOMP_DBG_NOGAMMA=1: show the frame without the title's gamma ramp */
-} g_dbg = { -1, 0, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, -1, 0 };
+    long brightness;    /* XBOXRECOMP_DBG_BRIGHTNESS=<0..100>: override the player's brightness */
+} g_dbg = { -1, 0, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, -1, 0, -1 };
 
 /* XBOXRECOMP_DBG_FILE=<path>: the same switches, re-read about once a second
  * from that file while the game runs ("NOLIGHTPASS=1", one per line, names
@@ -535,6 +538,7 @@ static void dbg_init(void)
     g_dbg.nofog = dbg_get("XBOXRECOMP_DBG_NOFOG") != NULL;
     g_dbg.noglow = (e = dbg_get("XBOXRECOMP_DBG_NOGLOW")) ? strtol(e, NULL, 0) : -1;
     g_dbg.nogamma = dbg_get("XBOXRECOMP_DBG_NOGAMMA") != NULL;
+    g_dbg.brightness = (e = dbg_get("XBOXRECOMP_DBG_BRIGHTNESS")) ? strtol(e, NULL, 0) : -1;
     g_dbg.lights = (e = dbg_get("XBOXRECOMP_DBG_LIGHTS")) ? strtol(e, NULL, 0) : -1;
     g_dbg.nomasked = dbg_get("XBOXRECOMP_DBG_NOMASKED") != NULL;
     g_dbg.nodepth = dbg_get("XBOXRECOMP_DBG_NODEPTH") != NULL;
@@ -2462,6 +2466,33 @@ out:
     return ok;
 }
 
+/* The player's brightness, applied after the title's ramp: 0 (the default)
+ * is the original image, 100 lifts the darks most (out = in^(1/(1+b/100))).
+ * XBOXRECOMP_BRIGHTNESS=<0..100> comes from the launcher's Options; the
+ * switch file's BRIGHTNESS=<n> overrides it live, for tuning. */
+static const uint8_t *brightness_curve(void)
+{
+    static uint8_t curve[256];
+    static long built = -2, env = -2;
+    long b;
+    int i;
+    if (env == -2) {
+        const char *e = getenv("XBOXRECOMP_BRIGHTNESS");
+        env = e && *e ? strtol(e, NULL, 10) : 0;
+    }
+    b = g_dbg.brightness >= 0 ? g_dbg.brightness : env;
+    if (b < 0) b = 0;
+    if (b > 100) b = 100;
+    if (b != built) {
+        double g = 1.0 + b / 100.0;
+        for (i = 0; i < 256; i++)
+            curve[i] = (uint8_t)(255.0 * pow(i / 255.0, 1.0 / g) + 0.5);
+        built = b;
+        fprintf(stderr, "[GAMMA] brightness %ld\n", b);
+    }
+    return curve;
+}
+
 static int gamma_is_neutral(const uint8_t *pal)
 {
     int i;
@@ -2519,8 +2550,15 @@ static void present_surface(void)
     box.back = 1;
     {
         const uint8_t *pal = nv2a_get_dac_palette();
-        if (!pal || gamma_is_neutral(pal) || g_dbg.nogamma ||
-            !present_gamma(s, bb_rtv, pal, box.right, box.bottom))
+        uint8_t lut[256*3];
+        int i;
+        if (pal) {
+            const uint8_t *boost = brightness_curve();
+            for (i = 0; i < 256*3; i++)
+                lut[i] = boost[g_dbg.nogamma ? (uint8_t)(i / 3) : pal[i]];
+        }
+        if (!pal || gamma_is_neutral(lut) ||
+            !present_gamma(s, bb_rtv, lut, box.right, box.bottom))
             ID3D11DeviceContext_CopySubresourceRegion(ctx, bb, 0, 0, 0, 0,
                                                       (ID3D11Resource *)s->tex, 0, &box);
     }
