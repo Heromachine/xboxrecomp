@@ -475,9 +475,13 @@ static float u2f(uint32_t u) {
  *   XBOXRECOMP_DBG_POST=1|2           skip the additive bloom composite / the final screen composite
  *   XBOXRECOMP_DBG_TEXPPM=1           write tex_<offset>_<w>x<h>.ppm for decoded uploads >= 128 wide
  *   XBOXRECOMP_DBG_ONLYINPUTS=<mask>  draw only programs whose vertex inputs equal <mask>
+ *   XBOXRECOMP_DBG_NOFOG=1            fog off (the fog factor reads as 1)
+ *   XBOXRECOMP_DBG_LIGHTS=<inputs>    in a [SURF] trace, that program's light block c96..c159
  * (XBOXRECOMP_DBG_FOGF=<f> lives in d3d8_vsh.c: force the fog factor.) */
 static struct {
     long skiptex;
+    int nofog;
+    long lights;
     int nolightpass, nomasked, nodepth, smallnodepth, eqle, shinv, shflip, pshout, post, texppm;
     long onlyinputs;
     uint32_t skipvsh;   /* XBOXRECOMP_DBG_SKIPVSH=<hash>: drop that program's draws */
@@ -486,7 +490,7 @@ static struct {
                          * surface (as sampled) to zdump-<addr>-<tick>.pgm beside the switch file */
     long constdiff;     /* XBOXRECOMP_DBG_CONSTDIFF=<inputs>: in a [SURF] trace, the vertex
                          * constants that changed since the last draw with those inputs */
-} g_dbg = { -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, -1 };
+} g_dbg = { -1, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, -1 };
 
 /* XBOXRECOMP_DBG_FILE=<path>: the same switches, re-read about once a second
  * from that file while the game runs ("NOLIGHTPASS=1", one per line, names
@@ -524,6 +528,8 @@ static void dbg_init(void)
     const char *e;
     g_dbg.skiptex = (e = dbg_get("XBOXRECOMP_DBG_SKIPTEX")) ? strtol(e, NULL, 0) : -1;
     g_dbg.nolightpass = dbg_get("XBOXRECOMP_DBG_NOLIGHTPASS") != NULL;
+    g_dbg.nofog = dbg_get("XBOXRECOMP_DBG_NOFOG") != NULL;
+    g_dbg.lights = (e = dbg_get("XBOXRECOMP_DBG_LIGHTS")) ? strtol(e, NULL, 0) : -1;
     g_dbg.nomasked = dbg_get("XBOXRECOMP_DBG_NOMASKED") != NULL;
     g_dbg.nodepth = dbg_get("XBOXRECOMP_DBG_NODEPTH") != NULL;
     g_dbg.smallnodepth = dbg_get("XBOXRECOMP_DBG_SMALLNODEPTH") != NULL;
@@ -2036,7 +2042,7 @@ static int bind_targets(int clearing, uint32_t clear_flags)
         d3d8_states_set_scissor(TRUE);
     }
     d3d8_vsh_set_surface((float)w, (float)h, surface_zmax());
-    d3d8_vsh_set_fog(g_pg.fog_enable, g_pg.fog_mode, g_pg.fog_param[0], g_pg.fog_param[1]);
+    d3d8_vsh_set_fog(g_pg.fog_enable && !g_dbg.nofog, g_pg.fog_mode, g_pg.fog_param[0], g_pg.fog_param[1]);
     return 1;
 }
 
@@ -3321,6 +3327,10 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
         fprintf(stderr, " clip=%g..%g ctl0=%08X shf=%u prog=%05X ctl=%X",
                 u2f(g_pg.clip_min), u2f(g_pg.clip_max), g_pg.control0,
                 g_pg.psh.shadow_func, g_pg.psh.stage_program, g_pg.psh.control);
+        for (int st = 0; st < (int)(g_pg.psh.control & 0xF) && st < 8; st++)
+            fprintf(stderr, " cmb%d=%08X/%08X,%08X/%08X", st, g_pg.psh.color_icw[st],
+                    g_pg.psh.color_ocw[st], g_pg.psh.alpha_icw[st], g_pg.psh.alpha_ocw[st]);
+        fprintf(stderr, " fin=%08X/%08X", g_pg.psh.specfog_cw0, g_pg.psh.specfog_cw1);
         if (g_pg.psh.stage_program == 0x21 || g_pg.surf_color_offset == 0x021CA000) {
             fprintf(stderr, " F0=%08X,%08X,%08X,%08X,%08X,%08X F1=%08X,%08X,%08X,%08X,%08X,%08X",
                     g_pg.psh.factor0[0], g_pg.psh.factor0[1], g_pg.psh.factor0[2],
@@ -3333,6 +3343,12 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
             for (unsigned r = 0; r < sizeof(regs) / sizeof(regs[0]); r++) {
                 const float *cc = d3d8_vsh_get_constant(regs[r]);
                 fprintf(stderr, " c%d=(%.3g,%.3g,%.3g,%.3g)", regs[r], cc[0], cc[1], cc[2], cc[3]);
+            }
+        }
+        if (g_dbg.lights >= 0 && g_pg.vsh.inputs_read == (uint16_t)g_dbg.lights) {
+            for (int r = 96; r < 160; r++) {
+                const float *cc = d3d8_vsh_get_constant(r);
+                fprintf(stderr, " L%d=(%.4g,%.4g,%.4g,%.4g)", r, cc[0], cc[1], cc[2], cc[3]);
             }
         }
         if (num_verts > 2 && g_pg.vattr[4].count) {
