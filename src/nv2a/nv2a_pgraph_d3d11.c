@@ -2892,14 +2892,30 @@ static void submit_array_elements(const uint32_t *elements, uint32_t n)
     LARGE_INTEGER start, after_gather, end;
     int profile = pgraph_profile_on();
 
-    if (n == 0 || stride_bytes == 0)
+    if (n == 0 || stride_bytes == 0) {
+        static unsigned dropped;
+        if (n && (dropped++ < 20 || dropped % 2000 == 0)) {
+            fprintf(stderr, "[PGRAPH-D3D11] array draw dropped (#%u): no vertex layout, %u verts, "
+                    "c=0x%08X z=0x%08X vsh_mode=%d inputs=0x%04X fmts:", dropped, n,
+                    g_pg.surf_color_offset, g_pg.surf_zeta_offset, g_pg.vsh.transform_mode,
+                    g_pg.vsh.inputs_read);
+            for (int a = 0; a < 16; a++)
+                if (g_pg.vattr[a].count)
+                    fprintf(stderr, " v%d=%u/%u", a, g_pg.vattr[a].format, g_pg.vattr[a].count);
+            fputc('\n', stderr);
+        }
         return;
+    }
     if (!scratch_grow(&packed, &packed_cap, (size_t)n * stride_bytes))
         return;
     if (profile) QueryPerformanceCounter(&start);
     if (nv2a_vtx_gather(g_pg.vattr, elements, n, vtx_guest_span, NULL,
                         byte_offset, stride_bytes, packed) != 0) {
         g_pg.stats.array_gather_failures++;
+        if (g_pg.stats.array_gather_failures <= 20 || g_pg.stats.array_gather_failures % 2000 == 0)
+            fprintf(stderr, "[PGRAPH-D3D11] array draw dropped (#%u): vertex gather failed, %u verts, "
+                    "c=0x%08X z=0x%08X\n", g_pg.stats.array_gather_failures, n,
+                    g_pg.surf_color_offset, g_pg.surf_zeta_offset);
         return;
     }
     if (profile) QueryPerformanceCounter(&after_gather);
@@ -2980,7 +2996,8 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
     /* Render into the surfaces the title selected; nothing selected (a
      * colour-masked pass with depth off) draws nothing, so skip the work. */
     if (!bind_targets(0, 0)) {
-        if (surftrace_on())
+        static unsigned skipped;
+        if (surftrace_on() || skipped++ < 20 || skipped % 5000 == 0)
             fprintf(stderr, "[SURF] f=%u SKIP no target: verts=%u c=0x%08X z=0x%08X fmt=0x%X "
                     "cmask=%08X depth=%d/%04X/%d stencil=%d inputs=0x%04X\n",
                     g_pg.stats.frames, num_verts, g_pg.surf_color_offset, g_pg.surf_zeta_offset,
@@ -4335,4 +4352,88 @@ void pgraph_d3d11_set_chyron_scroll(uint32_t pixels)
 void pgraph_d3d11_get_stats(PgraphD3D11Stats *out)
 {
     if (out) *out = g_pg.stats;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * Occlusion queries (NV097 ZPASS_PIXEL_CNT reports)
+ *
+ * The title enables counting (SET_ZPASS_PIXEL_COUNT_ENABLE), draws, and asks
+ * for a report (GET_REPORT) holding the samples that passed the depth and
+ * stencil tests since the last CLEAR_REPORT_VALUE. Breakdown decides from
+ * them whether to draw character shadow casters; with no reports it read 0
+ * ("not visible") and the character shadow maps stayed empty, so backlit
+ * faces never darkened (HeroLab 8d7df175).
+ *
+ * One D3D11 occlusion query runs while counting is enabled; collect() ends
+ * it, reads it (blocking -- the title is waiting on the report anyway) and
+ * restarts it if counting is still on. xemu queues a query per draw and
+ * resolves them asynchronously; the totals are the same.
+ * ══════════════════════════════════════════════════════════════════════ */
+
+static ID3D11Query *g_zpass_query;
+static int g_zpass_enabled;
+
+static uint32_t zpass_end_and_read(void)
+{
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    UINT64 samples = 0;
+    if (!g_zpass_query || !ctx)
+        return 0;
+    ID3D11DeviceContext_End(ctx, (ID3D11Asynchronous *)g_zpass_query);
+    while (ID3D11DeviceContext_GetData(ctx, (ID3D11Asynchronous *)g_zpass_query,
+                                       &samples, sizeof(samples), 0) == S_FALSE)
+        ;
+    ID3D11Query_Release(g_zpass_query);
+    g_zpass_query = NULL;
+    return samples > 0xFFFFFFFFull ? 0xFFFFFFFFu : (uint32_t)samples;
+}
+
+static void zpass_begin(void)
+{
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    D3D11_QUERY_DESC qd = { D3D11_QUERY_OCCLUSION, 0 };
+    if (g_zpass_query || !ctx)
+        return;
+    if (FAILED(ID3D11Device_CreateQuery(d3d8_GetD3D11Device(), &qd, &g_zpass_query))) {
+        g_zpass_query = NULL;
+        return;
+    }
+    ID3D11DeviceContext_Begin(ctx, (ID3D11Asynchronous *)g_zpass_query);
+}
+
+static uint32_t g_zpass_pending;   /* counted by queries ended before a collect */
+
+void pgraph_d3d11_zpass_enable(int enable)
+{
+    pgraph_d3d11_flush();
+    if (enable && !g_zpass_enabled)
+        zpass_begin();
+    else if (!enable && g_zpass_enabled)
+        g_zpass_pending += zpass_end_and_read();
+    g_zpass_enabled = enable;
+}
+
+uint32_t pgraph_d3d11_zpass_collect(void)
+{
+    uint32_t n;
+    pgraph_d3d11_flush();
+    n = g_zpass_pending;
+    g_zpass_pending = 0;
+    if (g_zpass_query) {
+        n += zpass_end_and_read();
+        if (g_zpass_enabled)
+            zpass_begin();
+    }
+    return n;
+}
+
+void pgraph_d3d11_zpass_clear(void)
+{
+    pgraph_d3d11_flush();
+    g_zpass_pending = 0;
+    if (g_zpass_query) {
+        zpass_end_and_read();
+        if (g_zpass_enabled)
+            zpass_begin();
+    }
 }

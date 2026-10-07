@@ -38,6 +38,13 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param);
 /* Flush any pending draw commands (call at end of frame). */
 void pgraph_d3d11_flush(void);
 
+/* Occlusion (ZPASS_PIXEL_CNT) counting for NV097 reports: enable/disable
+ * counting, take the samples counted since the last collect (synchronously),
+ * and drop any in-flight count. See nv2a_core.c GET_REPORT. */
+void pgraph_d3d11_zpass_enable(int enable);
+uint32_t pgraph_d3d11_zpass_collect(void);
+void pgraph_d3d11_zpass_clear(void);
+
 /* Set chyron scroll: pass frame counter to animate, 0 to disable.
  * Applies horizontal scroll offset to vertices in the chyron Y band. */
 void pgraph_d3d11_set_chyron_scroll(uint32_t frame);

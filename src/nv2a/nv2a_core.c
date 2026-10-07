@@ -642,6 +642,15 @@ static int g_pgraph_in_begin = 0;
  * NV097_SET_CONTEXT_DMA_SEMAPHORE 0x01A4, NV097_SET_SEMAPHORE_OFFSET 0x1D6C,
  * NV097_BACK_END_WRITE_SEMAPHORE_RELEASE 0x1D70. */
 #define M_SET_CONTEXT_DMA_SEMAPHORE 0x01A4
+/* Occlusion-query reports: NV097_SET_CONTEXT_DMA_REPORT 0x01A8,
+ * NV097_CLEAR_REPORT_VALUE 0x17C8, NV097_SET_ZPASS_PIXEL_COUNT_ENABLE 0x17CC,
+ * NV097_GET_REPORT 0x17D0 (nv2a_regs.h). */
+#define M_SET_CONTEXT_DMA_REPORT       0x01A8
+#define M_CLEAR_REPORT_VALUE           0x17C8
+#define M_SET_ZPASS_PIXEL_COUNT_ENABLE 0x17CC
+#define M_GET_REPORT                   0x17D0
+static uint32_t g_dma_report;     /* report DMA object handle */
+static uint32_t g_zpass_result;   /* samples since CLEAR_REPORT_VALUE */
 #define M_SET_SEMAPHORE_OFFSET      0x1D6C
 #define M_BACK_END_WRITE_SEMAPHORE_RELEASE 0x1D70
 
@@ -737,6 +746,50 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
      * flushing the translator's batched draws, so the release cannot be
      * observed before the work it accounts for.
      */
+    /* Occlusion-query reports (xemu pgraph.c CLEAR_REPORT_VALUE /
+     * SET_ZPASS_PIXEL_COUNT_ENABLE / GET_REPORT, report layout from
+     * pgraph_write_zpass_pixel_cnt_report: u64 timestamp, u32 count, u32 done
+     * at the report DMA object + offset). Unhandled before, so every report
+     * the title polled read whatever was in memory -- see
+     * pgraph_d3d11_zpass_collect(). */
+    if (method == M_SET_CONTEXT_DMA_REPORT) {
+        g_dma_report = param;
+        d->pgraph.regs[method / 4] = param;
+        return;
+    }
+    if (method == M_CLEAR_REPORT_VALUE) {
+        pgraph_d3d11_zpass_clear();
+        g_zpass_result = 0;
+        return;
+    }
+    if (method == M_SET_ZPASS_PIXEL_COUNT_ENABLE) {
+        pgraph_d3d11_zpass_enable(param != 0);
+        return;
+    }
+    if (method == M_GET_REPORT) {
+        hwaddr len = 0;
+        uint8_t *rep;
+        uint32_t offset = param & 0x00FFFFFF;
+        static unsigned logged;
+
+        g_zpass_result += pgraph_d3d11_zpass_collect();
+        { uint32_t inst = nv_ramht_instance(d, g_dma_report);
+          rep = inst ? (uint8_t *)nv_dma_map(d, inst, &len) : NULL; }
+        if (rep && offset + 16 <= len) {
+            uint64_t ts = 0x0011223344556677ull;   /* xemu's placeholder */
+            uint8_t *p = rep + offset;
+            int i;
+            for (i = 0; i < 8; i++) p[i] = (uint8_t)(ts >> (8 * i));
+            for (i = 0; i < 4; i++) p[8 + i] = (uint8_t)(g_zpass_result >> (8 * i));
+            for (i = 0; i < 4; i++) p[12 + i] = 0;
+        }
+        if (logged < 40 || (logged % 5000) == 0)
+            fprintf(stderr, "[REPORT] GET_REPORT type %u offset 0x%06X -> %u samples%s\n",
+                    param >> 24, offset, g_zpass_result,
+                    rep ? "" : " (report DMA object did not resolve)");
+        logged++;
+        return;
+    }
     if (method == M_SET_CONTEXT_DMA_SEMAPHORE) {
         d->pgraph.dma_semaphore = param;
         d->pgraph.regs[method / 4] = param;
