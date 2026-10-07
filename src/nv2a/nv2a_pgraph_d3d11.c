@@ -2979,8 +2979,15 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
         return;
     /* Render into the surfaces the title selected; nothing selected (a
      * colour-masked pass with depth off) draws nothing, so skip the work. */
-    if (!bind_targets(0, 0))
+    if (!bind_targets(0, 0)) {
+        if (surftrace_on())
+            fprintf(stderr, "[SURF] f=%u SKIP no target: verts=%u c=0x%08X z=0x%08X fmt=0x%X "
+                    "cmask=%08X depth=%d/%04X/%d stencil=%d inputs=0x%04X\n",
+                    g_pg.stats.frames, num_verts, g_pg.surf_color_offset, g_pg.surf_zeta_offset,
+                    g_pg.surf_format, g_pg.color_mask, g_pg.depth_test, g_pg.depth_func,
+                    g_pg.depth_mask, g_pg.stencil_test, g_pg.vsh.inputs_read);
         return;
+    }
 
     /* ── Choose the vertex pipeline for this draw ──
      *
@@ -3325,11 +3332,13 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
             fprintf(stderr, " d2=%u/%u n=(%.3f,%.3f,%.3f) rawn=%02X%02X%02X%02X", g_pg.vattr[2].format,
                     g_pg.vattr[2].count, n4[0], n4[1], n4[2], q[0], q[1], q[2], q[3]);
         }
-        fprintf(stderr, " d3=%u/%u iv3=(%.2f,%.2f,%.2f,%.2f) d4=%u/%u",
+        fprintf(stderr, " d3=%u/%u iv3=(%.2f,%.2f,%.2f,%.2f) d4=%u/%u iv4=(%.3f,%.3f,%.3f,%.3f)",
                 g_pg.vattr[3].format, g_pg.vattr[3].count,
                 g_pg.inline_value[3][0], g_pg.inline_value[3][1],
                 g_pg.inline_value[3][2], g_pg.inline_value[3][3],
-                g_pg.vattr[4].format, g_pg.vattr[4].count);
+                g_pg.vattr[4].format, g_pg.vattr[4].count,
+                g_pg.inline_value[4][0], g_pg.inline_value[4][1],
+                g_pg.inline_value[4][2], g_pg.inline_value[4][3]);
         if (g_pg.vattr[3].count && num_verts > 0) {
             const uint8_t *q = base + byte_offset[3];
             fprintf(stderr, " raw3=%02X%02X%02X%02X", q[0], q[1], q[2], q[3]);
