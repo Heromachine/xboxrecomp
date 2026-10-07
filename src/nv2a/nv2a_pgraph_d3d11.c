@@ -370,6 +370,7 @@ static struct {
                                     * parsing, not avoiding recompiles. */
         int      program_shadow_length;
         uint32_t shader_handle;    /* current d3d8_vsh handle, 0 = none yet */
+        uint32_t prog_hash;        /* VshProgCacheEntry.hash of the program in use */
         uint16_t inputs_read;      /* v# bitmask of shader_handle's program,
                                      * from d3d8_vsh_parse(); drives how the
                                      * draw-time vertex buffer is packed */
@@ -446,6 +447,7 @@ typedef struct {
     uint32_t handle;       /* 0 = empty */
     uint16_t inputs_read;
     uint64_t last_used;
+    uint32_t hash;         /* FNV-1a of the microcode: a stable name for it */
 } VshProgCacheEntry;
 static VshProgCacheEntry g_vsh_prog_cache[VSH_PROG_CACHE_SIZE];
 static uint64_t g_vsh_prog_tick;
@@ -478,23 +480,73 @@ static struct {
     long skiptex;
     int nolightpass, nomasked, nodepth, smallnodepth, eqle, shinv, shflip, pshout, post, texppm;
     long onlyinputs;
-} g_dbg = { -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1 };
+    uint32_t skipvsh;   /* XBOXRECOMP_DBG_SKIPVSH=<hash>: drop that program's draws */
+    int listvsh;        /* XBOXRECOMP_DBG_LISTVSH=1: [VSHLIST] programs drawn, ~1/s */
+} g_dbg = { -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0 };
+
+/* XBOXRECOMP_DBG_FILE=<path>: the same switches, re-read about once a second
+ * from that file while the game runs ("NOLIGHTPASS=1", one per line, names
+ * without the XBOXRECOMP_DBG_ prefix), so a rendering fault can be toggled
+ * on and off with the camera parked on it. A name missing from the file
+ * falls back to the environment. */
+static const char *g_dbg_file;
+static char g_dbg_file_text[2048];
+
+static const char *dbg_get(const char *name)
+{
+    if (g_dbg_file && !strncmp(name, "XBOXRECOMP_DBG_", 15)) {
+        const char *key = name + 15, *p = g_dbg_file_text;
+        size_t n = strlen(key);
+        while ((p = strstr(p, key)) != NULL) {
+            if ((p == g_dbg_file_text || p[-1] == '\n') && p[n] == '=') {
+                static char val[64];
+                size_t k = 0;
+                p += n + 1;
+                while (p[k] && p[k] != '\n' && p[k] != '\r' && k < sizeof val - 1) {
+                    val[k] = p[k];
+                    k++;
+                }
+                val[k] = 0;
+                return (k == 0 || !strcmp(val, "0")) ? NULL : val;
+            }
+            p += n;
+        }
+    }
+    return getenv(name);
+}
 
 static void dbg_init(void)
 {
     const char *e;
-    g_dbg.skiptex = (e = getenv("XBOXRECOMP_DBG_SKIPTEX")) ? strtol(e, NULL, 0) : -1;
-    g_dbg.nolightpass = getenv("XBOXRECOMP_DBG_NOLIGHTPASS") != NULL;
-    g_dbg.nomasked = getenv("XBOXRECOMP_DBG_NOMASKED") != NULL;
-    g_dbg.nodepth = getenv("XBOXRECOMP_DBG_NODEPTH") != NULL;
-    g_dbg.smallnodepth = getenv("XBOXRECOMP_DBG_SMALLNODEPTH") != NULL;
-    g_dbg.eqle = getenv("XBOXRECOMP_DBG_EQLE") != NULL;
-    g_dbg.shinv = getenv("XBOXRECOMP_DBG_SHINV") != NULL;
-    g_dbg.shflip = (e = getenv("XBOXRECOMP_DBG_SHFLIP")) ? atoi(e) : 0;
-    g_dbg.pshout = (e = getenv("XBOXRECOMP_DBG_PSHOUT")) ? atoi(e) : 0;
-    g_dbg.post = (e = getenv("XBOXRECOMP_DBG_POST")) ? atoi(e) : 0;
-    g_dbg.texppm = getenv("XBOXRECOMP_DBG_TEXPPM") != NULL;
-    g_dbg.onlyinputs = (e = getenv("XBOXRECOMP_DBG_ONLYINPUTS")) ? strtol(e, NULL, 0) : -1;
+    g_dbg.skiptex = (e = dbg_get("XBOXRECOMP_DBG_SKIPTEX")) ? strtol(e, NULL, 0) : -1;
+    g_dbg.nolightpass = dbg_get("XBOXRECOMP_DBG_NOLIGHTPASS") != NULL;
+    g_dbg.nomasked = dbg_get("XBOXRECOMP_DBG_NOMASKED") != NULL;
+    g_dbg.nodepth = dbg_get("XBOXRECOMP_DBG_NODEPTH") != NULL;
+    g_dbg.smallnodepth = dbg_get("XBOXRECOMP_DBG_SMALLNODEPTH") != NULL;
+    g_dbg.eqle = dbg_get("XBOXRECOMP_DBG_EQLE") != NULL;
+    g_dbg.shinv = dbg_get("XBOXRECOMP_DBG_SHINV") != NULL;
+    g_dbg.shflip = (e = dbg_get("XBOXRECOMP_DBG_SHFLIP")) ? atoi(e) : 0;
+    g_dbg.pshout = (e = dbg_get("XBOXRECOMP_DBG_PSHOUT")) ? atoi(e) : 0;
+    g_dbg.post = (e = dbg_get("XBOXRECOMP_DBG_POST")) ? atoi(e) : 0;
+    g_dbg.texppm = dbg_get("XBOXRECOMP_DBG_TEXPPM") != NULL;
+    g_dbg.onlyinputs = (e = dbg_get("XBOXRECOMP_DBG_ONLYINPUTS")) ? strtol(e, NULL, 0) : -1;
+    g_dbg.skipvsh = (e = dbg_get("XBOXRECOMP_DBG_SKIPVSH")) ? (uint32_t)strtoul(e, NULL, 0) : 0;
+    g_dbg.listvsh = dbg_get("XBOXRECOMP_DBG_LISTVSH") != NULL;
+}
+
+static void dbg_reload(void)
+{
+    static uint32_t last;
+    FILE *f;
+    size_t n;
+    if (!g_dbg_file || g_pg.stats.frames - last < 60)
+        return;
+    last = g_pg.stats.frames;
+    f = fopen(g_dbg_file, "r");
+    n = f ? fread(g_dbg_file_text, 1, sizeof g_dbg_file_text - 1, f) : 0;
+    if (f) fclose(f);
+    g_dbg_file_text[n] = 0;
+    dbg_init();
 }
 
 /* XBOXRECOMP_SURFTRACE=<frame>: log every render-target switch, clear and
@@ -551,6 +603,7 @@ void pgraph_d3d11_init(void)
     g_pg.stencil_op_fail = g_pg.stencil_op_zfail = g_pg.stencil_op_zpass =
         NV097_SET_STENCIL_OP_V_KEEP;
     g_pg.blend_equation = NV097_SET_BLEND_EQUATION_V_FUNC_ADD;
+    g_dbg_file = getenv("XBOXRECOMP_DBG_FILE");
     dbg_init();
     g_pg.initialized = 1;
 
@@ -2280,6 +2333,38 @@ static TexCacheEntry *resolve_surface_texture(int stage)
     if (si < 0)
         return NULL;
     s = &g_surf[si];
+
+    /* XBOXRECOMP_SURFTEX_LOG=1: one line per distinct (texture, surface)
+     * pairing, saying which texture reads were answered with a rendering
+     * instead of guest memory -- and how old that rendering was. */
+    {
+        static int surftex_log = -1;
+        if (surftex_log < 0) {
+            const char *e = getenv("XBOXRECOMP_SURFTEX_LOG");
+            surftex_log = e && e[0] == '1';
+        }
+        if (surftex_log) {
+            static struct { uint32_t off, saddr, fmt; } seen[512];
+            static int nseen;
+            int k, dup = 0;
+            for (k = 0; k < nseen; k++)
+                if (seen[k].off == offset && seen[k].saddr == s->d.addr && seen[k].fmt == fmt) {
+                    dup = 1;
+                    break;
+                }
+            if (!dup && nseen < 512) {
+                seen[nseen].off = offset;
+                seen[nseen].saddr = s->d.addr;
+                seen[nseen].fmt = fmt;
+                nseen++;
+                fprintf(stderr, "[SURFTEX] frame %u stage %d tex 0x%08X color 0x%02X %ux%u %s "
+                        "-> %s surface 0x%08X %ux%u at (%u,%u), last drawn frame %u\n",
+                        g_pg.stats.frames, stage, offset, color, tw, th,
+                        linear ? "linear" : "swizzled", s->is_color ? "colour" : "zeta",
+                        s->d.addr, s->d.width, s->d.height, x, y, s->last_frame);
+            }
+        }
+    }
     /* D3D11 copies depth only as a whole resource. */
     if (depth && (x || y || tw != s->d.width || th != s->d.height)) {
         tw = s->d.width;
@@ -2886,6 +2971,12 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
                     victim->length = n;
                     victim->handle = new_handle;
                     victim->inputs_read = parsed.inputs_read;
+                    {
+                        uint32_t h = 2166136261u;
+                        const uint8_t *pb = (const uint8_t *)victim->program;
+                        for (size_t k = 0; k < bytes; k++) { h ^= pb[k]; h *= 16777619u; }
+                        victim->hash = h;
+                    }
                     hit = victim;
                     g_pg.stats.vsh_rebuilds++;
                     fprintf(stderr, "[PGRAPH-D3D11] VSH: rebuilt shader handle=0x%lX "
@@ -2903,11 +2994,43 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
                 g_pg.vsh.program_shadow_length = n;
                 g_pg.vsh.shader_handle = hit->handle;
                 g_pg.vsh.inputs_read = hit->inputs_read;
+                g_pg.vsh.prog_hash = hit->hash;
             }
         }
         use_vsh = (g_pg.vsh.shader_handle != 0);
     }
 
+    if (use_vsh && (g_dbg.skipvsh || g_dbg.listvsh)) {
+        static struct { uint32_t hash; uint16_t inputs; unsigned draws; } seen[64];
+        static int nseen;
+        static uint32_t cur_frame, listed_frame;
+        if (g_dbg.listvsh) {
+            int k;
+            if (g_pg.stats.frames != cur_frame) {
+                /* First draw of a new frame: print the last one, ~1/s. */
+                if (cur_frame - listed_frame >= 60) {
+                    listed_frame = cur_frame;
+                    for (k = 0; k < nseen; k++)
+                        fprintf(stderr, "[VSHLIST] frame %u program 0x%08X inputs 0x%04X draws %u\n",
+                                cur_frame, seen[k].hash, seen[k].inputs, seen[k].draws);
+                }
+                cur_frame = g_pg.stats.frames;
+                nseen = 0;
+            }
+            for (k = 0; k < nseen && seen[k].hash != g_pg.vsh.prog_hash; k++)
+                ;
+            if (k == nseen && nseen < 64) {
+                seen[k].hash = g_pg.vsh.prog_hash;
+                seen[k].inputs = g_pg.vsh.inputs_read;
+                seen[k].draws = 0;
+                nseen++;
+            }
+            if (k < nseen)
+                seen[k].draws++;
+        }
+        if (g_dbg.skipvsh && g_pg.vsh.prog_hash == g_dbg.skipvsh)
+            return;
+    }
     if (g_dbg.onlyinputs >= 0 && (!use_vsh || g_pg.vsh.inputs_read != (uint16_t)g_dbg.onlyinputs))
         return;
 
@@ -4049,6 +4172,7 @@ void pgraph_d3d11_flush(void)
     if (profile) QueryPerformanceCounter(&before_copy);
     present_surface();
     g_pg.stats.frames++;
+    dbg_reload();
     if (profile) {
         QueryPerformanceCounter(&end);
         flush_ticks += end.QuadPart - start.QuadPart;
