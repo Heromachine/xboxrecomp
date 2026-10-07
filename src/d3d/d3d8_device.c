@@ -259,6 +259,20 @@ static HRESULT d3d11_create_device_and_swap_chain(
         return hr;
     }
 
+    /* Alt+Enter belongs to the host window (a launcher may use it for its own
+     * borderless full screen). DXGI's default would switch the display mode
+     * under a swap chain that was never set up for it. IID spelled out here so
+     * nothing needs dxguid. */
+    {
+        static const GUID iid_factory =
+            { 0x7b7166ec, 0x21c7, 0x44ae, { 0xb2, 0x1a, 0xc9, 0xae, 0x32, 0x1a, 0xe3, 0x69 } };
+        IDXGIFactory *factory = NULL;
+        if (SUCCEEDED(IDXGISwapChain_GetParent(state->swap_chain, &iid_factory, (void **)&factory))) {
+            IDXGIFactory_MakeWindowAssociation(factory, pp->hDeviceWindow, DXGI_MWA_NO_ALT_ENTER);
+            IDXGIFactory_Release(factory);
+        }
+    }
+
     state->hwnd = pp->hDeviceWindow;
     state->width = scd.BufferDesc.Width;
     state->height = scd.BufferDesc.Height;
