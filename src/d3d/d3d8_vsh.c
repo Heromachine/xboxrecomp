@@ -441,11 +441,14 @@ void d3d8_vsh_parse(const DWORD *microcode, int num_insns,
  * HLSL Code Generator
  * ================================================================ */
 
-/* String buffer helper */
+/* String buffer helper. An append that does not fit sets overflow rather
+ * than failing outright; the generator then refuses the program, since a
+ * truncated shader must never reach the compiler. */
 typedef struct {
     char *buf;
     int   pos;
     int   size;
+    int   overflow;
 } StrBuf;
 
 static void sb_init(StrBuf *sb, char *buf, int size)
@@ -453,6 +456,7 @@ static void sb_init(StrBuf *sb, char *buf, int size)
     sb->buf  = buf;
     sb->pos  = 0;
     sb->size = size;
+    sb->overflow = 0;
     if (size > 0) buf[0] = '\0';
 }
 
@@ -460,15 +464,20 @@ static void sb_append(StrBuf *sb, const char *fmt, ...)
 {
     va_list ap;
     int remaining;
-    if (sb->pos >= sb->size - 1) return;
+    if (sb->pos >= sb->size - 1) {
+        sb->overflow = 1;
+        return;
+    }
     remaining = sb->size - sb->pos;
     va_start(ap, fmt);
     int n = vsnprintf(sb->buf + sb->pos, remaining, fmt, ap);
     va_end(ap);
     if (n > 0 && n < remaining)
         sb->pos += n;
-    else if (n >= remaining)
+    else if (n >= remaining) {
         sb->pos = sb->size - 1;
+        sb->overflow = 1;
+    }
 }
 
 /* Component name table */
@@ -802,6 +811,8 @@ static void emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
         return;
     }
 
+    if (expr.overflow)
+        sb->overflow = 1;
     emit_dest_assign(sb, inst->mac.outputs, expr_buf);
 }
 
@@ -891,6 +902,8 @@ static void emit_ilu_op(StrBuf *sb, const NV2AVshInstruction *inst)
         return;
     }
 
+    if (expr.overflow)
+        sb->overflow = 1;
     emit_dest_assign(sb, inst->ilu.outputs, expr_buf);
 }
 
@@ -1140,7 +1153,7 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "    return o;\n"
         "}\n");
 
-    return sb.pos;
+    return sb.overflow ? -1 : sb.pos;
 }
 
 /* ================================================================
@@ -1323,7 +1336,12 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
                                       uint32_t hash)
 {
     NV2AVshProgram program;
-    char hlsl_buf[16384];  /* 16KB should be enough for any VS */
+    /* The largest of Breakdown's programs (136 instructions, skinned)
+     * generate over 16 KB since MUL/MAD go through nv2a_mul; at 16 KB they
+     * were cut off mid-line and every draw of them was lost (invisible
+     * enemies). Static, as nv2a_psh's source buffer is: too big for a
+     * thread's stack. */
+    static char hlsl_buf[65536];
     int hlsl_len;
     ID3DBlob *code = NULL, *errors = NULL;
     HRESULT hr;
@@ -1335,7 +1353,8 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
     /* Generate HLSL */
     hlsl_len = d3d8_vsh_generate_hlsl(&program, hlsl_buf, sizeof(hlsl_buf));
     if (hlsl_len <= 0) {
-        fprintf(stderr, "D3D8 VSH: HLSL generation failed\n");
+        fprintf(stderr, "D3D8 VSH: HLSL generation failed (%d insns; over %u bytes?)\n",
+                num_insns, (unsigned)sizeof(hlsl_buf));
         return NULL;
     }
 
