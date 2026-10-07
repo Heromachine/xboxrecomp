@@ -482,7 +482,11 @@ static struct {
     long onlyinputs;
     uint32_t skipvsh;   /* XBOXRECOMP_DBG_SKIPVSH=<hash>: drop that program's draws */
     int listvsh;        /* XBOXRECOMP_DBG_LISTVSH=1: [VSHLIST] programs drawn, ~1/s */
-} g_dbg = { -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0 };
+    uint32_t dumpz;     /* XBOXRECOMP_DBG_DUMPZ=<addr>: during a live trace, write that depth
+                         * surface (as sampled) to zdump-<addr>-<tick>.pgm beside the switch file */
+    long constdiff;     /* XBOXRECOMP_DBG_CONSTDIFF=<inputs>: in a [SURF] trace, the vertex
+                         * constants that changed since the last draw with those inputs */
+} g_dbg = { -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, -1 };
 
 /* XBOXRECOMP_DBG_FILE=<path>: the same switches, re-read about once a second
  * from that file while the game runs ("NOLIGHTPASS=1", one per line, names
@@ -532,11 +536,19 @@ static void dbg_init(void)
     g_dbg.onlyinputs = (e = dbg_get("XBOXRECOMP_DBG_ONLYINPUTS")) ? strtol(e, NULL, 0) : -1;
     g_dbg.skipvsh = (e = dbg_get("XBOXRECOMP_DBG_SKIPVSH")) ? (uint32_t)strtoul(e, NULL, 0) : 0;
     g_dbg.listvsh = dbg_get("XBOXRECOMP_DBG_LISTVSH") != NULL;
+    g_dbg.constdiff = (e = dbg_get("XBOXRECOMP_DBG_CONSTDIFF")) ? strtol(e, NULL, 0) : -1;
+    g_dbg.dumpz = (e = dbg_get("XBOXRECOMP_DBG_DUMPZ")) ? (uint32_t)strtoul(e, NULL, 0) : 0;
 }
+
+/* TRACE=<token> in the switch file: each new token traces the next 30
+ * frame ticks with the [SURF] trace, as XBOXRECOMP_SURFTRACE=<frame> does
+ * for one. */
+static uint32_t g_trace_frame = 0xFFFFFFFFu;
 
 static void dbg_reload(void)
 {
     static uint32_t last;
+    static char trace_token[64];
     FILE *f;
     size_t n;
     if (!g_dbg_file || g_pg.stats.frames - last < 60)
@@ -547,6 +559,14 @@ static void dbg_reload(void)
     if (f) fclose(f);
     g_dbg_file_text[n] = 0;
     dbg_init();
+    {
+        const char *t = dbg_get("XBOXRECOMP_DBG_TRACE");
+        if (t && strcmp(t, trace_token) != 0) {
+            snprintf(trace_token, sizeof trace_token, "%s", t);
+            g_trace_frame = g_pg.stats.frames + 1;
+            fprintf(stderr, "[SURF] live trace requested (token %s): frame %u\n", t, g_trace_frame);
+        }
+    }
 }
 
 /* XBOXRECOMP_SURFTRACE=<frame>: log every render-target switch, clear and
@@ -561,6 +581,10 @@ static int surftrace_on(void)
         want = e ? strtol(e, NULL, 0) : -1;
         every = ev ? strtol(ev, NULL, 0) : 0;
     }
+    /* g_pg.stats.frames ticks several times per displayed frame, so a live
+     * trace covers 30 ticks: at least one whole frame. */
+    if ((uint32_t)f >= g_trace_frame && (uint32_t)f - g_trace_frame < 30)
+        return 1;
     if (want < 0)
         return 0;
     return f == want || (every > 0 && f > want && (f - want) % every == 0);
@@ -605,6 +629,9 @@ void pgraph_d3d11_init(void)
     g_pg.blend_equation = NV097_SET_BLEND_EQUATION_V_FUNC_ADD;
     g_dbg_file = getenv("XBOXRECOMP_DBG_FILE");
     dbg_init();
+    /* Samplers come from the title's TEXADDRESS/TEXFILTER/border registers
+     * (get_stage_sampler); the D3D8 layer must not rebuild them per draw. */
+    d3d8_states_set_samplers_external(TRUE);
     g_pg.initialized = 1;
 
     fprintf(stderr, "[PGRAPH-D3D11] Translator initialized\n");
@@ -2298,6 +2325,62 @@ static void present_surface(void)
 
 /* A texture stage whose offset lies inside a surface: a copy of that
  * rectangle, refreshed when the surface has been drawn into since. */
+/* DUMPZ: one depth view to an 8-bit PGM, scaled between its nearest and
+ * farthest texels so a silhouette shows, once per trace. Written next to the
+ * XBOXRECOMP_DBG_FILE switch file. */
+static int surftrace_on(void);
+static void dump_depth_view(SurfView *v, uint32_t addr)
+{
+    static uint32_t dumped_at = 0xFFFFFFFFu;
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    ID3D11Texture2D *staging = NULL;
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_MAPPED_SUBRESOURCE m;
+    char path[600];
+    const char *slash;
+    FILE *f;
+    uint32_t x, y, lo = 0xFFFFFF, hi = 0;
+
+    if (g_trace_frame == dumped_at || !g_dbg_file)
+        return;
+    dumped_at = g_trace_frame;
+    ID3D11Texture2D_GetDesc(v->tex, &td);
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(ID3D11Device_CreateTexture2D(d3d8_GetD3D11Device(), &td, NULL, &staging)))
+        return;
+    ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)staging, (ID3D11Resource *)v->tex);
+    if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)staging, 0, D3D11_MAP_READ, 0, &m))) {
+        ID3D11Texture2D_Release(staging);
+        return;
+    }
+    for (y = 0; y < td.Height; y++)
+        for (x = 0; x < td.Width; x++) {
+            uint32_t d = ((const uint32_t *)((const uint8_t *)m.pData + y * m.RowPitch))[x] & 0xFFFFFF;
+            if (d < lo) lo = d;
+            if (d > hi) hi = d;
+        }
+    slash = strrchr(g_dbg_file, '\\');
+    if (!slash) slash = strrchr(g_dbg_file, '/');
+    snprintf(path, sizeof path, "%.*szdump-%08X-%u.pgm", slash ? (int)(slash - g_dbg_file + 1) : 0,
+             g_dbg_file, addr, g_trace_frame);
+    f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P5\n%u %u\n255\n", td.Width, td.Height);
+        for (y = 0; y < td.Height; y++)
+            for (x = 0; x < td.Width; x++) {
+                uint32_t d = ((const uint32_t *)((const uint8_t *)m.pData + y * m.RowPitch))[x] & 0xFFFFFF;
+                fputc(hi > lo ? (int)((uint64_t)(d - lo) * 255 / (hi - lo)) : 128, f);
+            }
+        fclose(f);
+    }
+    fprintf(stderr, "[SURF] DUMPZ 0x%08X %ux%u depth %06X..%06X -> %s\n", addr, td.Width, td.Height,
+            lo, hi, f ? path : "(write failed)");
+    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)staging, 0);
+    ID3D11Texture2D_Release(staging);
+}
+
 static TexCacheEntry *resolve_surface_texture(int stage)
 {
     ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
@@ -2432,6 +2515,8 @@ static TexCacheEntry *resolve_surface_texture(int stage)
         if (depth) {
             ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)v->tex,
                                              (ID3D11Resource *)s->tex);
+            if (g_dbg.dumpz && s->d.addr == g_dbg.dumpz && surftrace_on())
+                dump_depth_view(v, s->d.addr);
         } else {
             D3D11_BOX box = { x, y, 0, x + tw, y + th, 1 };
             ID3D11DeviceContext_CopySubresourceRegion(ctx, (ID3D11Resource *)v->tex,
@@ -3253,6 +3338,36 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
             if (g_pg.tex[s].enabled)
                 fprintf(stderr, " a%d=%X f%d=%X b%d=%08X c0_%d=%08X", s, g_pg.tex[s].address, s,
                         g_pg.tex[s].filter, s, g_pg.tex[s].border_color, s, g_pg.tex[s].control0);
+        }
+        if (use_vsh && g_dbg.constdiff >= 0 && g_pg.vsh.inputs_read == (uint16_t)g_dbg.constdiff) {
+            static float prev[NV2A_VS_MAX_CONSTANTS][4];
+            static int have_prev;
+            int changed = 0;
+            fprintf(stderr, " prog=0x%08X cdiff:", g_pg.vsh.prog_hash);
+            for (int r = 0; r < NV2A_VS_MAX_CONSTANTS; r++) {
+                const float *cc = d3d8_vsh_get_constant(r);
+                if (!have_prev || memcmp(prev[r], cc, sizeof(prev[r])) != 0) {
+                    if (have_prev && changed < 24)
+                        fprintf(stderr, " c%d=(%.4g,%.4g,%.4g,%.4g)", r, cc[0], cc[1], cc[2], cc[3]);
+                    changed++;
+                    memcpy(prev[r], cc, sizeof(prev[r]));
+                }
+            }
+            fprintf(stderr, " [%d changed%s]", changed, have_prev ? "" : ", first");
+            if (!have_prev) {
+                /* Once per trace: the light/texgen block, c96..c127. */
+                for (int r = 96; r < 128; r++) {
+                    const float *cc = d3d8_vsh_get_constant(r);
+                    fprintf(stderr, " C%d=(%.6g,%.6g,%.6g,%.6g)", r, cc[0], cc[1], cc[2], cc[3]);
+                }
+            }
+            have_prev = 1;
+            /* And this draw's first vertices' v0 (position). */
+            for (uint32_t vi = 0; vi < num_verts && vi < 4; vi++) {
+                float pv[4] = {0, 0, 0, 1};
+                decode_attr_floats(base + vi * stride_bytes, byte_offset, 0, pv);
+                fprintf(stderr, " V%u=(%.6g,%.6g,%.6g,%.6g)", vi, pv[0], pv[1], pv[2], pv[3]);
+            }
         }
         for (int s = 0; s < 4; s++) {
             if (g_pg.tex[s].enabled)
