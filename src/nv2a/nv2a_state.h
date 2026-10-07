@@ -237,7 +237,11 @@ DEFINE_PROTO(pfb)
 DEFINE_PROTO(pgraph)
 DEFINE_PROTO(pcrtc)
 DEFINE_PROTO(pramdac)
+DEFINE_PROTO(prmdio)
 #undef DEFINE_PROTO
+
+/* The DAC palette (gamma ramp), 256 R,G,B entries. */
+const uint8_t *nv2a_get_dac_palette(void);
 
 /* Stub read/write for blocks we haven't implemented yet */
 uint64_t nv2a_stub_read(void *opaque, hwaddr addr, unsigned int size);

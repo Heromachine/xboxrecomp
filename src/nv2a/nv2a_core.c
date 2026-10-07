@@ -565,6 +565,62 @@ void pramdac_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 }
 
 /* ============================================================
+ * PRMDIO - VGA DAC palette, which the Xbox uses as the gamma ramp
+ * (from xemu prmdio.c)
+ *
+ * D3DDevice_SetGammaRamp writes 256 R,G,B entries here (sub_001C423A in
+ * Breakdown); every pixel goes through the table on its way to the TV.
+ * This block used to be a stub, so the ramp was dropped and the image was
+ * always shown with the neutral curve. present_surface() applies it.
+ * ============================================================ */
+
+uint64_t prmdio_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    NV2AState *d = (NV2AState *)opaque;
+    (void)size;
+    if (addr == NV_USER_DAC_WRITE_MODE_ADDRESS)
+        return d->puserdac.write_mode_address / 3;
+    return 0;
+}
+
+void prmdio_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
+{
+    NV2AState *d = (NV2AState *)opaque;
+    (void)size;
+    switch (addr) {
+    case NV_USER_DAC_WRITE_MODE_ADDRESS:
+        d->puserdac.write_mode_address = (val & 0xff) * 3;
+        break;
+    case NV_USER_DAC_PALETTE_DATA:
+        d->puserdac.palette[d->puserdac.write_mode_address++ % (256*3)] = (uint8_t)val;
+        if (d->puserdac.write_mode_address % (256*3) == 0) {
+            /* A full table landed: log it once per change. */
+            static uint8_t last[256*3];
+            static int logged;
+            const uint8_t *p = d->puserdac.palette;
+            if (!logged || memcmp(last, p, sizeof(last))) {
+                memcpy(last, p, sizeof(last));
+                logged = 1;
+                fprintf(stderr, "[GAMMA] ramp (R G B) 0:%u %u %u  32:%u %u %u  "
+                        "64:%u %u %u  128:%u %u %u  192:%u %u %u  255:%u %u %u\n",
+                        p[0], p[1], p[2], p[96], p[97], p[98],
+                        p[192], p[193], p[194], p[384], p[385], p[386],
+                        p[576], p[577], p[578], p[765], p[766], p[767]);
+                fflush(stderr);
+            }
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+const uint8_t *nv2a_get_dac_palette(void)
+{
+    return g_nv2a ? g_nv2a->puserdac.palette : NULL;
+}
+
+/* ============================================================
  * PVIDEO - video overlay (stub)
  * ============================================================ */
 
@@ -1624,7 +1680,7 @@ const NV2ABlockInfo blocktable[NV_NUM_BLOCKS] = {
     ENTRY(PCRTC,    pcrtc,    0x600000, 0x001000),
     STUB_ENTRY(PRMCIO,        0x601000, 0x001000),
     ENTRY(PRAMDAC,  pramdac,  0x680000, 0x001000),
-    STUB_ENTRY(PRMDIO,        0x681000, 0x001000),
+    ENTRY(PRMDIO,   prmdio,   0x681000, 0x001000),
     /* NV_PRAMIN = 19 */
     { .name = NULL },
     /* NV_USER = 20 */
@@ -1773,6 +1829,13 @@ NV2AState *nv2a_init_standalone(uint8_t *vram_ptr, uint32_t vram_size,
     /* Default PLL: 233 MHz core clock (Xbox default) */
     d->pramdac.core_clock_coeff = 0x00011C01; /* n=0x1C, m=1, p=0 */
     d->pramdac.core_clock_freq = NV2A_CRYSTAL_FREQ * 0x1C; /* ~233 MHz */
+
+    /* Neutral gamma ramp until the title sets one (xemu nv2a.c). */
+    for (int i = 0; i < 256; i++) {
+        d->puserdac.palette[i*3]   = (uint8_t)i;
+        d->puserdac.palette[i*3+1] = (uint8_t)i;
+        d->puserdac.palette[i*3+2] = (uint8_t)i;
+    }
 
     /* Default timer divisors */
     d->ptimer.numerator = 1;

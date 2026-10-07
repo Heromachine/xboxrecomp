@@ -476,12 +476,15 @@ static float u2f(uint32_t u) {
  *   XBOXRECOMP_DBG_TEXPPM=1           write tex_<offset>_<w>x<h>.ppm for decoded uploads >= 128 wide
  *   XBOXRECOMP_DBG_ONLYINPUTS=<mask>  draw only programs whose vertex inputs equal <mask>
  *   XBOXRECOMP_DBG_NOFOG=1            fog off (the fog factor reads as 1)
+ *   XBOXRECOMP_DBG_NOGLOW=<offset>    skip additive (SRC_ALPHA/ONE), depth-off draws whose stage-1
+ *                                     texture is at <offset> (Breakdown's lamp glow: mask 0x021CC000)
  *   XBOXRECOMP_DBG_LIGHTS=<inputs>    in a [SURF] trace, that program's light block c96..c159
  * (XBOXRECOMP_DBG_FOGF=<f> lives in d3d8_vsh.c: force the fog factor.) */
 static struct {
     long skiptex;
     int nofog;
     long lights;
+    long noglow;
     int nolightpass, nomasked, nodepth, smallnodepth, eqle, shinv, shflip, pshout, post, texppm;
     long onlyinputs;
     uint32_t skipvsh;   /* XBOXRECOMP_DBG_SKIPVSH=<hash>: drop that program's draws */
@@ -490,7 +493,8 @@ static struct {
                          * surface (as sampled) to zdump-<addr>-<tick>.pgm beside the switch file */
     long constdiff;     /* XBOXRECOMP_DBG_CONSTDIFF=<inputs>: in a [SURF] trace, the vertex
                          * constants that changed since the last draw with those inputs */
-} g_dbg = { -1, 0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, -1 };
+    int nogamma;        /* XBOXRECOMP_DBG_NOGAMMA=1: show the frame without the title's gamma ramp */
+} g_dbg = { -1, 0, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, -1, 0 };
 
 /* XBOXRECOMP_DBG_FILE=<path>: the same switches, re-read about once a second
  * from that file while the game runs ("NOLIGHTPASS=1", one per line, names
@@ -529,6 +533,8 @@ static void dbg_init(void)
     g_dbg.skiptex = (e = dbg_get("XBOXRECOMP_DBG_SKIPTEX")) ? strtol(e, NULL, 0) : -1;
     g_dbg.nolightpass = dbg_get("XBOXRECOMP_DBG_NOLIGHTPASS") != NULL;
     g_dbg.nofog = dbg_get("XBOXRECOMP_DBG_NOFOG") != NULL;
+    g_dbg.noglow = (e = dbg_get("XBOXRECOMP_DBG_NOGLOW")) ? strtol(e, NULL, 0) : -1;
+    g_dbg.nogamma = dbg_get("XBOXRECOMP_DBG_NOGAMMA") != NULL;
     g_dbg.lights = (e = dbg_get("XBOXRECOMP_DBG_LIGHTS")) ? strtol(e, NULL, 0) : -1;
     g_dbg.nomasked = dbg_get("XBOXRECOMP_DBG_NOMASKED") != NULL;
     g_dbg.nodepth = dbg_get("XBOXRECOMP_DBG_NODEPTH") != NULL;
@@ -2278,6 +2284,193 @@ static void clear_surface(uint32_t param)
     }
 }
 
+/* Gamma ramp at scan-out. The NV2A sends every pixel through the DAC palette
+ * (PRMDIO) on its way to the TV, and titles set it with SetGammaRamp; xemu
+ * does the same in its display shader (ui/xui/gl-helpers.cc). With the
+ * neutral ramp this pass is skipped and the frame is copied as before. */
+static const char k_gamma_hlsl[] =
+    "Texture2D<float4> frame : register(t0);\n"
+    "Texture2D<float4> ramp  : register(t1);\n"
+    "float4 vs_main(uint id : SV_VertexID) : SV_POSITION {\n"
+    "    float2 t = float2((id & 1) ? 1.0 : 0.0, (id & 2) ? 1.0 : 0.0);\n"
+    "    return float4(t.x * 2.0 - 1.0, 1.0 - t.y * 2.0, 0.0, 1.0);\n"
+    "}\n"
+    "float4 ps_main(float4 pos : SV_POSITION) : SV_TARGET {\n"
+    "    float4 c = frame.Load(int3(pos.xy, 0));\n"
+    "    uint3 i = (uint3)(saturate(c.rgb) * 255.0 + 0.5);\n"
+    "    return float4(ramp.Load(int3(i.r, 0, 0)).r, ramp.Load(int3(i.g, 0, 0)).g,\n"
+    "                  ramp.Load(int3(i.b, 0, 0)).b, c.a);\n"
+    "}\n";
+
+static ID3D11VertexShader *g_gamma_vs;
+static ID3D11PixelShader *g_gamma_ps;
+static ID3D11Texture2D *g_gamma_tex;       /* 256x1, the ramp */
+static ID3D11ShaderResourceView *g_gamma_srv;
+static uint8_t g_gamma_cur[256*3];
+static int g_gamma_failed;
+
+static int gamma_init(void)
+{
+    ID3D11Device *dev = d3d8_GetD3D11Device();
+    ID3DBlob *code = NULL, *err = NULL;
+    D3D11_TEXTURE2D_DESC td;
+    HRESULT hr;
+
+    if (g_gamma_vs && g_gamma_ps && g_gamma_srv)
+        return 1;
+    if (g_gamma_failed || !dev)
+        return 0;
+    g_gamma_failed = 1;   /* cleared on success */
+    hr = D3DCompile(k_gamma_hlsl, sizeof(k_gamma_hlsl) - 1, "nv2a_gamma", NULL, NULL,
+                    "vs_main", "vs_5_0", 0, 0, &code, &err);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[PGRAPH-D3D11] gamma VS compile failed: %s\n",
+                err ? (char *)ID3D10Blob_GetBufferPointer(err) : "?");
+        if (err) ID3D10Blob_Release(err);
+        return 0;
+    }
+    ID3D11Device_CreateVertexShader(dev, ID3D10Blob_GetBufferPointer(code),
+                                    ID3D10Blob_GetBufferSize(code), NULL, &g_gamma_vs);
+    ID3D10Blob_Release(code);
+    hr = D3DCompile(k_gamma_hlsl, sizeof(k_gamma_hlsl) - 1, "nv2a_gamma", NULL, NULL,
+                    "ps_main", "ps_5_0", 0, 0, &code, &err);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[PGRAPH-D3D11] gamma PS compile failed: %s\n",
+                err ? (char *)ID3D10Blob_GetBufferPointer(err) : "?");
+        if (err) ID3D10Blob_Release(err);
+        return 0;
+    }
+    ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(code),
+                                   ID3D10Blob_GetBufferSize(code), NULL, &g_gamma_ps);
+    ID3D10Blob_Release(code);
+    memset(&td, 0, sizeof(td));
+    td.Width = 256;
+    td.Height = 1;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &g_gamma_tex)) ||
+        FAILED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)g_gamma_tex,
+                                                     NULL, &g_gamma_srv)))
+        return 0;
+    memset(g_gamma_cur, 0, sizeof(g_gamma_cur));   /* forces the first upload */
+    g_gamma_failed = 0;
+    return g_gamma_vs && g_gamma_ps;
+}
+
+/* Draw the frame surface through the ramp into the back buffer. Returns 0
+ * when it could not, so the caller falls back to the plain copy. */
+static int present_gamma(Surface *s, ID3D11RenderTargetView *bb_rtv,
+                         const uint8_t *pal, UINT w, UINT h)
+{
+    ID3D11Device *dev = d3d8_GetD3D11Device();
+    ID3D11DeviceContext *ctx = d3d8_GetD3D11Context();
+    static ID3D11Texture2D *srv_tex;          /* surface the view below is of */
+    static ID3D11ShaderResourceView *frame_srv;
+    ID3D11ShaderResourceView *srvs[2], *null_srv[2] = { NULL, NULL };
+    ID3D11BlendState *bs = NULL;
+    ID3D11DepthStencilState *ds = NULL;
+    ID3D11RasterizerState *rs = NULL;
+    D3D11_BLEND_DESC bd;
+    D3D11_DEPTH_STENCIL_DESC dsd;
+    D3D11_RASTERIZER_DESC rd;
+    D3D11_VIEWPORT vp;
+    float blend_factor[4] = { 1, 1, 1, 1 };
+    int ok = 0;
+
+    if (!gamma_init())
+        return 0;
+    if (memcmp(g_gamma_cur, pal, sizeof(g_gamma_cur))) {
+        uint8_t rgba[256*4];
+        int i;
+        for (i = 0; i < 256; i++) {
+            rgba[i*4]   = pal[i*3];
+            rgba[i*4+1] = pal[i*3+1];
+            rgba[i*4+2] = pal[i*3+2];
+            rgba[i*4+3] = 255;
+        }
+        ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)g_gamma_tex, 0,
+                                              NULL, rgba, sizeof(rgba), 0);
+        memcpy(g_gamma_cur, pal, sizeof(g_gamma_cur));
+    }
+    /* The view holds a reference, so the surface texture cannot be freed
+     * and its address reused while it is cached here. */
+    if (srv_tex != s->tex) {
+        if (frame_srv) ID3D11ShaderResourceView_Release(frame_srv);
+        frame_srv = NULL;
+        srv_tex = NULL;
+        if (FAILED(ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)s->tex,
+                                                         NULL, &frame_srv)))
+            return 0;
+        srv_tex = s->tex;
+    }
+
+    memset(&bd, 0, sizeof(bd));
+    bd.RenderTarget[0].SrcBlend = bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlend = bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+    bd.RenderTarget[0].BlendOp = bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    memset(&dsd, 0, sizeof(dsd));
+    dsd.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    memset(&rd, 0, sizeof(rd));
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    if (FAILED(ID3D11Device_CreateBlendState(dev, &bd, &bs)) ||
+        FAILED(ID3D11Device_CreateDepthStencilState(dev, &dsd, &ds)) ||
+        FAILED(ID3D11Device_CreateRasterizerState(dev, &rd, &rs)))
+        goto out;
+
+    vp.TopLeftX = 0.0f;
+    vp.TopLeftY = 0.0f;
+    vp.Width = (float)w;
+    vp.Height = (float)h;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 2, null_srv);
+    ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &bb_rtv, NULL);
+    ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
+    ID3D11DeviceContext_OMSetBlendState(ctx, bs, blend_factor, 0xFFFFFFFF);
+    ID3D11DeviceContext_OMSetDepthStencilState(ctx, ds, 0);
+    ID3D11DeviceContext_RSSetState(ctx, rs);
+    ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    ID3D11DeviceContext_VSSetShader(ctx, g_gamma_vs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(ctx, g_gamma_ps, NULL, 0);
+    srvs[0] = frame_srv;
+    srvs[1] = g_gamma_srv;
+    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 2, srvs);
+    ID3D11DeviceContext_Draw(ctx, 4, 0);
+    ok = 1;
+
+    /* Put back what the next draw does not re-apply on its own: the frame's
+     * render targets (bind_targets caches them), the pixel shader (as
+     * clear_quad does), and the texture slots used here. */
+    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 2, null_srv);
+    {
+        ID3D11PixelShader *null_ps = NULL;
+        ID3D11DeviceContext_PSSetShader(ctx, null_ps, NULL, 0);
+    }
+    ID3D11DeviceContext_OMSetRenderTargets(ctx, 0, NULL, NULL);
+    g_bound_color = g_bound_zeta = -2;
+out:
+    if (bs) ID3D11BlendState_Release(bs);
+    if (ds) ID3D11DepthStencilState_Release(ds);
+    if (rs) ID3D11RasterizerState_Release(rs);
+    return ok;
+}
+
+static int gamma_is_neutral(const uint8_t *pal)
+{
+    int i;
+    for (i = 0; i < 256; i++)
+        if (pal[i*3] != i || pal[i*3+1] != i || pal[i*3+2] != i)
+            return 0;
+    return 1;
+}
+
 /* Copy the frame surface to the swap chain's back buffer. Called at the
  * flip, before the frame dump and Present read it. */
 static void present_surface(void)
@@ -2324,8 +2517,13 @@ static void present_surface(void)
     box.right = s->d.width < bw ? s->d.width : bw;
     box.bottom = s->d.height < bh ? s->d.height : bh;
     box.back = 1;
-    ID3D11DeviceContext_CopySubresourceRegion(ctx, bb, 0, 0, 0, 0,
-                                              (ID3D11Resource *)s->tex, 0, &box);
+    {
+        const uint8_t *pal = nv2a_get_dac_palette();
+        if (!pal || gamma_is_neutral(pal) || g_dbg.nogamma ||
+            !present_gamma(s, bb_rtv, pal, box.right, box.bottom))
+            ID3D11DeviceContext_CopySubresourceRegion(ctx, bb, 0, 0, 0, 0,
+                                                      (ID3D11Resource *)s->tex, 0, &box);
+    }
     ID3D11Resource_Release(bb);
 }
 
@@ -2992,6 +3190,10 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
     if (g_dbg.nolightpass && g_pg.blend_enable && g_pg.blend_sfactor == 0 && g_pg.blend_dfactor == 0x0301)
         return;
     if (g_dbg.nomasked && g_pg.color_mask == 0 && g_pg.surf_color_offset != 0)
+        return;
+    if (g_dbg.noglow >= 0 && g_pg.blend_enable && g_pg.blend_sfactor == 0x0302 &&
+        g_pg.blend_dfactor == 0x0001 && !g_pg.depth_test && g_pg.tex[1].enabled &&
+        g_pg.tex[1].offset == (uint32_t)g_dbg.noglow)
         return;
     if (g_dbg.post == 1 && g_pg.blend_enable && g_pg.blend_sfactor == 1 && g_pg.blend_dfactor == 1 &&
         g_pg.tex[0].enabled && g_pg.tex[0].offset == 0x021CA000 && g_pg.surf_color_offset != 0x021CA000)
