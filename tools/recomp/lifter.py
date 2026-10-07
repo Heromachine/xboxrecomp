@@ -1960,10 +1960,33 @@ class Lifter:
                 f"    if ({stop_condition}) break;",
                 f"}} /* {m} */",
             ]
-        if "cmpsw" in m or "cmpsd" in m:
-            return [f"/* {m} - string compare, ecx iterations */"]
-        if "scasw" in m or "scasd" in m:
-            return [f"/* {m} - string scan, ecx iterations */"]
+        # Word/dword forms, same shape as the byte forms above. These used to
+        # be emitted as a bare comment, so the je/jne after them tested
+        # whatever set the flags before (Breakdown's SetGammaRamp: "xor ebx,
+        # ebx; repe cmpsd; je unchanged" always took je, dropping every ramp).
+        for op, size, mem in (("cmpsw", 2, "MEM16"), ("cmpsd", 4, "MEM32")):
+            if op in m:
+                continue_on_equal = "repne" not in m and "repnz" not in m
+                stop_condition = "!_flags" if continue_on_equal else "_flags"
+                return [
+                    "while (ecx != 0) {",
+                    f"    _flags = ({mem}(esi) == {mem}(edi));",
+                    f"    esi += RECOMP_DF_STEP({size}); edi += RECOMP_DF_STEP({size}); ecx--;",
+                    f"    if ({stop_condition}) break;",
+                    f"}} /* {m} */",
+                ]
+        for op, size, mem, val in (("scasw", 2, "MEM16", "LO16(eax)"),
+                                   ("scasd", 4, "MEM32", "eax")):
+            if op in m:
+                continue_on_equal = "repne" not in m and "repnz" not in m
+                stop_condition = "!_flags" if continue_on_equal else "_flags"
+                return [
+                    "while (ecx != 0) {",
+                    f"    _flags = ({val} == {mem}(edi));",
+                    f"    edi += RECOMP_DF_STEP({size}); ecx--;",
+                    f"    if ({stop_condition}) break;",
+                    f"}} /* {m} */",
+                ]
         return [f"/* {m} */"]
 
     def _lift_string_op(self, insn, m):
@@ -3039,14 +3062,14 @@ def lift_basic_block(lifter, bb, flag_state=None, cond_overrides=None,
             pass  # SETcc doesn't set flags
         elif curr.mnemonic.startswith("rep"):
             # rep movsb/movsd = data copy, preserves flags
-            # repe cmpsb/repne scasb = comparison, sets flags
+            # repe cmps*/repne scas* (b/w/d) = comparison, sets flags
             rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
             raw_m = curr.mnemonic
-            if "cmpsb" in raw_m or "scasb" in raw_m:
+            if "cmps" in raw_m or "scas" in raw_m:
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
                 from_incoming = False
-            elif "cmpsb" in rest or "scasb" in rest:
+            elif "cmps" in rest or "scas" in rest:
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
                 from_incoming = False
