@@ -680,10 +680,10 @@ static void emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
         break;
 
     case NV2A_VSH_MAC_MUL:
-        /* dst = A * B */
-        sb_append(&expr, "(");
+        /* dst = A * B, with the hardware's exact zero (nv2a_mul) */
+        sb_append(&expr, "nv2a_mul(");
         emit_source(&expr, &inst->mac.inputs[0], 0);
-        sb_append(&expr, " * ");
+        sb_append(&expr, ", ");
         emit_source(&expr, &inst->mac.inputs[1], 0);
         sb_append(&expr, ")");
         break;
@@ -699,12 +699,12 @@ static void emit_mac_op(StrBuf *sb, const NV2AVshInstruction *inst)
         break;
 
     case NV2A_VSH_MAC_MAD:
-        /* dst = A * B + C */
-        sb_append(&expr, "(");
+        /* dst = A * B + C, the product as MUL's */
+        sb_append(&expr, "(nv2a_mul(");
         emit_source(&expr, &inst->mac.inputs[0], 0);
-        sb_append(&expr, " * ");
+        sb_append(&expr, ", ");
         emit_source(&expr, &inst->mac.inputs[1], 0);
-        sb_append(&expr, " + ");
+        sb_append(&expr, ") + ");
         emit_source(&expr, &inst->mac.inputs[2], 0);
         sb_append(&expr, ")");
         break;
@@ -944,6 +944,25 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "Texture2D<float4> cRel : register(t0);  /* c[] again, for c[a0+n] */\n"
         "\n", NV2A_VS_MAX_CONSTANTS);
 
+    /* The vertex unit's multiply gives exactly 0 when either factor is 0,
+     * infinity and NaN included (xemu vsh-prog.c _MUL/_MAD, per component).
+     * HLSL gives NaN for 0 * inf, and a NaN lighting term draws black: in
+     * Breakdown, walls went black whenever a muzzle flash or an energy orb
+     * added a light (one more light term evaluating 0 * inf), and stayed
+     * black in some rooms. NaN is tested on the bits: Wine's HLSL compiler
+     * has no isnan(). This alone; an earlier attempt that also changed
+     * the output registers' initial values was reverted (tiled credits). */
+    sb_append(&sb,
+        "float4 nv2a_nan_to_one(float4 v) {\n"
+        "    bool4 nan = (asuint(v) & 0x7FFFFFFF) > 0x7F800000;\n"
+        "    return nan ? 1.0 : v;\n"
+        "}\n"
+        "float4 nv2a_mul(float4 a, float4 b) {\n"
+        "    float4 z = sign(nv2a_nan_to_one(a)) * sign(nv2a_nan_to_one(b));\n"
+        "    float4 r = a * b;\n"
+        "    return (z == 0.0) ? 0.0 : r;\n"
+        "}\n\n");
+
     /* Input structure - only declare used inputs */
     sb_append(&sb, "struct VS_IN {\n");
     for (i = 0; i < NV2A_VS_MAX_INPUTS; i++) {
@@ -1106,8 +1125,10 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
         "    /* Write outputs */\n"
         "    VS_OUT o;\n"
         "    o.oPos = oPos;\n"
-        "    o.oD0  = saturate(oD0);\n"  /* Colors clamped to [0,1] */
-        "    o.oD1  = saturate(oD1);\n"
+        /* Colours: NaN becomes 1, then [0,1] (xemu vsh.c NaNToOne + clamp;
+         * saturate alone turns NaN into 0, black). */
+        "    o.oD0  = saturate(nv2a_nan_to_one(oD0));\n"
+        "    o.oD1  = saturate(nv2a_nan_to_one(oD1));\n"
         "    o.oT0  = oT0;\n"
         "    o.oT1  = oT1;\n"
         "    o.oT2  = oT2;\n"
