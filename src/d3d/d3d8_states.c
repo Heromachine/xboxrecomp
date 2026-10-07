@@ -335,6 +335,13 @@ void d3d8_states_shutdown(void)
     g_last_raster_hash = 0;
 }
 
+static BOOL g_samplers_external;
+
+void d3d8_states_set_samplers_external(BOOL external)
+{
+    g_samplers_external = external;
+}
+
 void d3d8_states_apply(void)
 {
     const DWORD *rs = d3d8_GetRenderStates();
@@ -354,8 +361,14 @@ void d3d8_states_apply(void)
     if (g_raster_state)
         ID3D11DeviceContext_RSSetState(ctx, g_raster_state);
 
-    /* Apply samplers for all 4 texture stages */
-    {
+    /* Apply samplers for all 4 texture stages -- unless the caller owns
+     * them. The NV2A translator binds samplers built from the title's own
+     * registers before each draw, and rebuilding them here from D3D8 stage
+     * state (never set by it, so WRAP) replaced every one: Breakdown's
+     * player shadow map, sampled BORDER, repeated across the floor in a
+     * grid of copies, and every texture ignored its clamp/border mode and
+     * filter. */
+    if (!g_samplers_external) {
         DWORD s;
         for (s = 0; s < 4; s++)
             d3d8_states_apply_sampler(s);

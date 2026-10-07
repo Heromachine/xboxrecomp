@@ -164,6 +164,11 @@ void    d3d8_states_set_scissor(BOOL enable);
 
 /* Create sampler state from TSS and apply to slot */
 void    d3d8_states_apply_sampler(DWORD stage);
+/* TRUE: the caller binds pixel-stage samplers itself (the NV2A translator,
+ * from the title's own address/filter/border registers), so
+ * d3d8_states_apply() leaves them alone instead of rebuilding them from
+ * D3D8 texture-stage state, which defaults to WRAP. */
+void    d3d8_states_set_samplers_external(BOOL external);
 
 #endif /* _WIN32 -- end of D3D11 backend section */
 
