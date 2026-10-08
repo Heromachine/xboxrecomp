@@ -1268,7 +1268,7 @@ static void tex_yuv422_to_bgra(const uint8_t *line, unsigned ix, int chroma_firs
 
 /* How a stage's texture is laid out in guest memory, worked out on each bind
  * from the format, image-rect, pitch and palette registers. */
-enum { TEXK_A8R8G8B8_LINEAR, TEXK_YUV, TEXK_S3TC, TEXK_I8 };
+enum { TEXK_A8R8G8B8_LINEAR, TEXK_YUV, TEXK_S3TC, TEXK_I8, TEXK_SZ_A8R8G8B8, TEXK_SZ_A8 };
 
 typedef struct {
     int kind;
@@ -1287,6 +1287,8 @@ static const char *tex_kind_name(const TexSource *ts)
     switch (ts->kind) {
     case TEXK_YUV:  return ts->chroma_first ? "UYVY->BGRA" : "YUY2->BGRA";
     case TEXK_I8:   return "I8->BGRA";
+    case TEXK_SZ_A8R8G8B8: return "SZ_A8R8G8B8->BGRA";
+    case TEXK_SZ_A8: return "SZ_A8->BGRA";
     case TEXK_S3TC:
         return ts->color == NV2A_TEXCONV_L_DXT1_A1R5G5B5 ? "DXT1->BGRA"
              : ts->color == NV2A_TEXCONV_L_DXT23_A8R8G8B8 ? "DXT3->BGRA"
@@ -1377,6 +1379,12 @@ static int tex_describe(int stage, TexSource *ts)
         break;
     }
 
+    /* Swizzled A8R8G8B8 and A8 (Burnout, 2026-10-08): the race binds both on
+     * every frame, and with neither decoded the shiny road read zero from
+     * its stage 3 (black road), while the skybox and the wheels lost their
+     * textures. */
+    case NV2A_TEXCONV_SZ_A8R8G8B8:
+    case NV2A_TEXCONV_SZ_A8:
     case NV2A_TEXCONV_SZ_I8_A8R8G8B8:
     case NV2A_TEXCONV_L_DXT1_A1R5G5B5:
     case NV2A_TEXCONV_L_DXT23_A8R8G8B8:
@@ -1411,6 +1419,12 @@ static int tex_describe(int stage, TexSource *ts)
                 }
                 return -1;
             }
+        } else if (ts->color == NV2A_TEXCONV_SZ_A8R8G8B8) {
+            ts->kind = TEXK_SZ_A8R8G8B8;   /* B,G,R,A in memory, as BGRA */
+            ts->src_len = (size_t)ts->width * ts->height * 4;
+        } else if (ts->color == NV2A_TEXCONV_SZ_A8) {
+            ts->kind = TEXK_SZ_A8;
+            ts->src_len = (size_t)ts->width * ts->height;
         } else {
             ts->kind = TEXK_S3TC;
             ts->src_len = nv2a_texconv_s3tc_level_size(ts->color, ts->width,
@@ -1457,6 +1471,12 @@ static void tex_decode_bgra(const TexSource *ts, uint8_t *out)
     case TEXK_I8:
         nv2a_texconv_decode_i8(ts->src, ts->width, ts->height, ts->palette,
                                ts->palette_entries, out);
+        break;
+    case TEXK_SZ_A8R8G8B8:
+        nv2a_texconv_unswizzle_2d(ts->src, ts->width, ts->height, 4, out);
+        break;
+    case TEXK_SZ_A8:
+        nv2a_texconv_decode_a8(ts->src, ts->width, ts->height, out);
         break;
     default:
         break;
@@ -1586,7 +1606,8 @@ static int tex_entry_create(TexCacheEntry *entry, const TexSource *ts, int stage
     entry->height = (float)ts->height;
     /* Linear formats are sampled with texel-space UVs (see this section's
      * comment); everything else already arrives in [0,1]. */
-    entry->normalized = ts->kind == TEXK_S3TC || ts->kind == TEXK_I8;
+    entry->normalized = ts->kind == TEXK_S3TC || ts->kind == TEXK_I8 ||
+                        ts->kind == TEXK_SZ_A8R8G8B8 || ts->kind == TEXK_SZ_A8;
     return 0;
 }
 

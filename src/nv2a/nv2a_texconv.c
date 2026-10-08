@@ -221,3 +221,19 @@ void nv2a_texconv_decode_i8(const uint8_t *indices, unsigned width,
             memset(p, 0, 4);
     }
 }
+
+void nv2a_texconv_decode_a8(const uint8_t *src, unsigned width,
+                            unsigned height, uint8_t *bgra)
+{
+    size_t i, n = (size_t)width * height;
+
+    /* As decode_i8: unswizzle into the first n bytes, then expand from the
+     * end backwards so each alpha is read before its texel overwrites it. */
+    nv2a_texconv_unswizzle_2d(src, width, height, 1, bgra);
+    for (i = n; i-- > 0;) {
+        uint8_t a = bgra[i];
+        uint8_t *p = bgra + i * 4;
+        p[0] = p[1] = p[2] = 0xFF;
+        p[3] = a;
+    }
+}

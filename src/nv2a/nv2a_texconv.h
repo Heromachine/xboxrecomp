@@ -13,7 +13,9 @@
 #include <stdint.h>
 
 /* NV097_SET_TEXTURE_FORMAT_COLOR codes this file decodes. */
+#define NV2A_TEXCONV_SZ_A8R8G8B8      0x06
 #define NV2A_TEXCONV_SZ_I8_A8R8G8B8   0x0B
+#define NV2A_TEXCONV_SZ_A8            0x19
 #define NV2A_TEXCONV_L_DXT1_A1R5G5B5  0x0C
 #define NV2A_TEXCONV_L_DXT23_A8R8G8B8 0x0E
 #define NV2A_TEXCONV_L_DXT45_A8R8G8B8 0x0F
@@ -43,5 +45,11 @@ void nv2a_texconv_unswizzle_2d(const uint8_t *src, unsigned width,
 void nv2a_texconv_decode_i8(const uint8_t *indices, unsigned width,
                             unsigned height, const uint8_t *palette,
                             unsigned palette_entries, uint8_t *bgra);
+
+/* Decode a swizzled SZ_A8 texture: unswizzle the 8-bit texels and expand
+ * each to white with that alpha, (1, 1, 1, A), as xemu samples it
+ * (pgraph/gl/constants.h: GL_R8 swizzled ONE, ONE, ONE, RED). */
+void nv2a_texconv_decode_a8(const uint8_t *src, unsigned width,
+                            unsigned height, uint8_t *bgra);
 
 #endif /* NV2A_TEXCONV_H */
