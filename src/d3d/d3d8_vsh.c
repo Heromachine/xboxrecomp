@@ -1080,8 +1080,31 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
      * must be producing clip-space output some other way -- doesn't get
      * a transform applied that was never part of its own instructions.
      * Guarded against a zero VPSCL (no SET_VIEWPORT_SCALE seen yet) so an
-     * early draw divides by nothing rather than by zero. */
-    if (program->uses_viewport_ctx) {
+     * early draw divides by nothing rather than by zero.
+     *
+     * A program that does NOT read those registers still leaves oPos in
+     * screen space: NV2A has no viewport stage after the program, so every
+     * program's oPos is device space, and xemu (vsh-prog.c) maps all of them
+     * the same way ("games may also have vertex shaders that do not divide by
+     * w (such as 2D-graphics menus or overlays)"). The XDK's pass-through for
+     * pre-transformed XYZRHW vertices is one: oPos = v0 * c[0] + c[1]. Left
+     * unmapped, Burnout's full-screen 640x480 logo and menu quads landed in
+     * the top-right quarter of the window. Those programs get the
+     * surface-size mapping below; with no surface size known they are left
+     * alone, because they never used c[VPSCL]/c[VPOFF]. */
+    if (!program->uses_viewport_ctx) {
+        sb_append(&sb,
+            "    /* NV2A pixel space -> D3D11 clip space for a program that does\n"
+            "     * not use c[VPSCL]/c[VPOFF] (a 2D pass-through), as xemu does. */\n"
+            "    if (nv2aSurface.x > 0.0 && nv2aSurface.y > 0.0) {\n"
+            "        oPos.xy = float2((2.0 * oPos.x - nv2aSurface.x) / nv2aSurface.x,\n"
+            "                         (nv2aSurface.y - 2.0 * oPos.y) / nv2aSurface.y);\n"
+            "        if (nv2aSurface.z > 0.0) oPos.z = oPos.z / nv2aSurface.z;\n"
+            "        oPos.w = (oPos.w >= 0.0) ? clamp(oPos.w, 5.421011e-20, 1.8446744e19)\n"
+            "                                 : clamp(oPos.w, -1.8446744e19, -5.421011e-20);\n"
+            "        oPos.xyz *= oPos.w;\n"
+            "    }\n\n");
+    } else {
         sb_append(&sb,
             "    /* NV2A pixel space -> D3D11 clip space. With the render target's\n"
             "     * size known this is xemu's mapping, (2*xy - size) / size with y\n"
