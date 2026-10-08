@@ -134,6 +134,20 @@ class SsePackedLifterTest(unittest.TestCase):
             ["xmm0.f[0] = xmm0.f[0] * xmm1.f[0]; /* mulss */"],
         )
 
+    def test_non_temporal_stores_are_plain_sixteen_byte_stores(self):
+        # Burnout's XGraphics swizzle stores every output block this way; as a
+        # bare comment the cubemap faces it uploads were never written.
+        dst = Operand(type="mem", mem_base="edi", mem_index="eax",
+                      mem_scale=2, mem_disp=0x10, mem_size=16)
+        for m in ("movntps", "movntpd", "movntdq"):
+            lines = Lifter().lift_instruction(
+                _insn(m, "xmmword ptr [edi + eax*2 + 0x10], xmm4",
+                      [dst, _xmm("xmm4")]))
+            self.assertEqual(len(lines), 1, m)
+            self.assertTrue(lines[0].startswith("XMM_STORE("), lines)
+            self.assertIn("xmm4", lines[0])
+            self.assertNotIn("TODO", lines[0])
+
     def test_no_packed_mnemonic_falls_through_to_a_bare_comment(self):
         packed = [
             ("movaps", [_xmm("xmm0"), _mem("eax")]),

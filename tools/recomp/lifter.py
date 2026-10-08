@@ -299,6 +299,7 @@ _EFLAGS_PRESERVE = frozenset({
     "cmpltss", "cmpeqss", "cmpleps", "cmpneqss",
     # SSE packed float
     "movaps", "movups", "movlps", "movhps", "movlhps", "movhlps",
+    "movntps", "movntpd", "movntdq",
     "addps", "subps", "mulps", "divps",
     "minps", "maxps", "sqrtps", "rsqrtps", "rcpps",
     "shufps", "unpcklps", "unpckhps",
@@ -1056,6 +1057,7 @@ class Lifter:
         # ── SSE (scalar float) ──
         if m in ("movss", "movsd", "movaps", "movups", "movlps", "movhps",
                  "movlhps", "movhlps", "movapd", "movupd",
+                 "movntps", "movntpd", "movntdq",
                  "addss", "subss", "mulss", "divss", "sqrtss",
                  "addsd", "subsd", "mulsd", "divsd", "sqrtsd",
                  "minss", "maxss", "minsd", "maxsd",
@@ -2087,7 +2089,13 @@ class Lifter:
         # ── Moves ──
         # movaps/movups move all 16 bytes. Treating them like movss was the
         # defect that left every packed value 4 bytes wide.
-        if m in ("movaps", "movups", "movapd", "movupd"):
+        # movntps/movntpd/movntdq [mem], xmm are the same 16-byte store with a
+        # "non-temporal" cache hint, which means nothing here (as for movntq).
+        # They used to fall through to a bare comment, so the store never
+        # happened: Burnout's XGraphics swizzle (sub_0015626A, 16 sites) wrote
+        # nothing into the cubemap faces it was uploading.
+        if m in ("movaps", "movups", "movapd", "movupd",
+                 "movntps", "movntpd", "movntdq"):
             if nops >= 2:
                 src = _packed_read(ops[1])
                 if src is not None:
