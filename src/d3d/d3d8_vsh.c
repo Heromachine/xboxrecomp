@@ -1350,46 +1350,27 @@ static VshCacheEntry *cache_insert(uint32_t hash)
 }
 
 /**
- * Compile a vertex shader from microcode.
- *
- * Parses, generates HLSL, compiles, and caches the result.
- * Returns the cache entry (with compiled VS and blob).
+ * Compile generated HLSL into a cache entry under `hash` (shared by
+ * translated programs and the fixed-function generator). num_insns is only
+ * for the log line; 0 means fixed function.
  */
-static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
-                                      uint32_t hash)
+static VshCacheEntry *compile_from_hlsl(const char *hlsl, int hlsl_len,
+                                        uint32_t hash, uint16_t inputs_read,
+                                        int num_insns)
 {
-    NV2AVshProgram program;
-    /* The largest of Breakdown's programs (136 instructions, skinned)
-     * generate over 16 KB since MUL/MAD go through nv2a_mul; at 16 KB they
-     * were cut off mid-line and every draw of them was lost (invisible
-     * enemies). Static, as nv2a_psh's source buffer is: too big for a
-     * thread's stack. */
-    static char hlsl_buf[65536];
-    int hlsl_len;
     ID3DBlob *code = NULL, *errors = NULL;
     HRESULT hr;
     VshCacheEntry *entry;
 
-    /* Parse microcode */
-    d3d8_vsh_parse(microcode, num_insns, &program);
-
-    /* Generate HLSL */
-    hlsl_len = d3d8_vsh_generate_hlsl(&program, hlsl_buf, sizeof(hlsl_buf));
-    if (hlsl_len <= 0) {
-        fprintf(stderr, "D3D8 VSH: HLSL generation failed (%d insns; over %u bytes?)\n",
-                num_insns, (unsigned)sizeof(hlsl_buf));
-        return NULL;
-    }
-
     /* Compile HLSL to bytecode */
-    hr = D3DCompile(hlsl_buf, (SIZE_T)hlsl_len, "nv2a_vsh",
+    hr = D3DCompile(hlsl, (SIZE_T)hlsl_len, "nv2a_vsh",
                     NULL, NULL, "main", "vs_5_0",
                     D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
                     &code, &errors);
     if (FAILED(hr)) {
         fprintf(stderr, "D3D8 VSH: Compile failed: %s\n",
                 errors ? (char *)ID3D10Blob_GetBufferPointer(errors) : "unknown");
-        fprintf(stderr, "--- Generated HLSL ---\n%s\n--- End ---\n", hlsl_buf);
+        fprintf(stderr, "--- Generated HLSL ---\n%s\n--- End ---\n", hlsl);
         if (errors) ID3D10Blob_Release(errors);
         return NULL;
     }
@@ -1417,12 +1398,12 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
     }
 
     entry->vs_blob     = code;
-    entry->inputs_read = program.inputs_read;
-    entry->uses_rel    = strstr(hlsl_buf, "cRel.Load(") != NULL;
+    entry->inputs_read = inputs_read;
+    entry->uses_rel    = strstr(hlsl, "cRel.Load(") != NULL;
     entry->layout_count = 0;
 
     fprintf(stderr, "D3D8 VSH: Compiled shader (hash 0x%08X, %d insns, inputs 0x%04X)\n",
-            hash, program.length, program.inputs_read);
+            hash, num_insns, inputs_read);
 
     /* Opt-in instrument, same pattern as XBOXRECOMP_FRAMEDUMP: dump the
      * translated HLSL for every newly-compiled (cache-miss) shader when
@@ -1432,10 +1413,43 @@ static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
      * microcode, not per draw, so it is cheap to leave the check in. */
     if (getenv("XBOXRECOMP_VSHDUMP")) {
         fprintf(stderr, "--- D3D8 VSH HLSL (hash 0x%08X) ---\n%s\n--- End ---\n",
-                hash, hlsl_buf);
+                hash, hlsl);
     }
 
     return entry;
+}
+
+/**
+ * Compile a vertex shader from microcode.
+ *
+ * Parses, generates HLSL, compiles, and caches the result.
+ * Returns the cache entry (with compiled VS and blob).
+ */
+static VshCacheEntry *compile_shader(const DWORD *microcode, int num_insns,
+                                      uint32_t hash)
+{
+    NV2AVshProgram program;
+    /* The largest of Breakdown's programs (136 instructions, skinned)
+     * generate over 16 KB since MUL/MAD go through nv2a_mul; at 16 KB they
+     * were cut off mid-line and every draw of them was lost (invisible
+     * enemies). Static, as nv2a_psh's source buffer is: too big for a
+     * thread's stack. */
+    static char hlsl_buf[65536];
+    int hlsl_len;
+
+    /* Parse microcode */
+    d3d8_vsh_parse(microcode, num_insns, &program);
+
+    /* Generate HLSL */
+    hlsl_len = d3d8_vsh_generate_hlsl(&program, hlsl_buf, sizeof(hlsl_buf));
+    if (hlsl_len <= 0) {
+        fprintf(stderr, "D3D8 VSH: HLSL generation failed (%d insns; over %u bytes?)\n",
+                num_insns, (unsigned)sizeof(hlsl_buf));
+        return NULL;
+    }
+
+    return compile_from_hlsl(hlsl_buf, hlsl_len, hash, program.inputs_read,
+                             program.length);
 }
 
 /**
@@ -1687,43 +1701,12 @@ BOOL d3d8_vsh_is_programmable(DWORD handle)
     return (handle >= 0x10000) ? TRUE : FALSE;
 }
 
-BOOL d3d8_vsh_prepare_draw(DWORD handle)
+/** Bind a compiled entry: shader, input layout, constants, c[a0+n] mirror. */
+static BOOL bind_entry(ID3D11DeviceContext *ctx, VshCacheEntry *entry)
 {
-    ID3D11DeviceContext *ctx;
-    int slot;
-    NV2AVshSlot *vsh;
-    uint32_t hash;
-    VshCacheEntry *entry;
     ID3D11InputLayout *layout;
     D3D11_MAPPED_SUBRESOURCE mapped;
     HRESULT hr;
-
-    if (!d3d8_vsh_is_programmable(handle))
-        return FALSE;
-
-    ctx = d3d8_GetD3D11Context();
-    if (!ctx) return FALSE;
-
-    /* Resolve handle to shader slot */
-    slot = (int)(handle - 0x10000);
-    if (slot < 0 || slot >= NV2A_VS_MAX_SLOTS)
-        return FALSE;
-
-    vsh = &g_vsh_slots[slot];
-    if (!vsh->in_use)
-        return FALSE;
-
-    /* Hash the microcode to look up in cache */
-    hash = fnv1a_hash(vsh->microcode, (size_t)vsh->length * 4 * sizeof(DWORD));
-
-    /* Look up in cache */
-    entry = cache_lookup(hash);
-    if (!entry) {
-        /* Cache miss: parse, generate HLSL, compile */
-        entry = compile_shader(vsh->microcode, vsh->length, hash);
-        if (!entry)
-            return FALSE;
-    }
 
     /* Bind the vertex shader */
     ID3D11DeviceContext_VSSetShader(ctx, entry->vs, NULL, 0);
@@ -1764,4 +1747,334 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
     }
 
     return TRUE;
+}
+
+static NV2AVshFFState g_vsh_ff_current;
+
+void d3d8_vsh_set_ff_state(const NV2AVshFFState *ff)
+{
+    if (ff)
+        g_vsh_ff_current = *ff;
+}
+
+BOOL d3d8_vsh_prepare_ff_draw(const NV2AVshFFState *ff);
+
+BOOL d3d8_vsh_prepare_draw(DWORD handle)
+{
+    if (handle == NV2A_FF_HANDLE)
+        return d3d8_vsh_prepare_ff_draw(&g_vsh_ff_current);
+
+    ID3D11DeviceContext *ctx;
+    int slot;
+    NV2AVshSlot *vsh;
+    uint32_t hash;
+    VshCacheEntry *entry;
+
+    if (!d3d8_vsh_is_programmable(handle))
+        return FALSE;
+
+    ctx = d3d8_GetD3D11Context();
+    if (!ctx) return FALSE;
+
+    /* Resolve handle to shader slot */
+    slot = (int)(handle - 0x10000);
+    if (slot < 0 || slot >= NV2A_VS_MAX_SLOTS)
+        return FALSE;
+
+    vsh = &g_vsh_slots[slot];
+    if (!vsh->in_use)
+        return FALSE;
+
+    /* Hash the microcode to look up in cache */
+    hash = fnv1a_hash(vsh->microcode, (size_t)vsh->length * 4 * sizeof(DWORD));
+
+    /* Look up in cache */
+    entry = cache_lookup(hash);
+    if (!entry) {
+        /* Cache miss: parse, generate HLSL, compile */
+        entry = compile_shader(vsh->microcode, vsh->length, hash);
+        if (!entry)
+            return FALSE;
+    }
+
+    return bind_entry(ctx, entry);
+}
+
+/* ================================================================
+ * Fixed-function transform: a port of xemu hw/xbox/nv2a/pgraph/glsl/
+ * vsh-ff.c (pgraph_glsl_gen_vsh_ff). See d3d8_vsh.h.
+ *
+ * GLSL's mat4(c[b], c[b+1], c[b+2], c[b+3]) takes those constants as
+ * columns, so xemu's `v * M` is component j = dot(v, c[b + j]): that is
+ * nv2a_rowdot() below, used everywhere xemu multiplies by a matrix.
+ * ================================================================ */
+
+/* Skinning modes in SET_SKIN_MODE's order (xemu's SKINNING_* enum). */
+static void ff_skinning_params(int mode, int *mix, int *count)
+{
+    switch (mode) {
+    case 1: *mix = 1; *count = 2; break;   /* 2G: 1 weight, 2nd generated */
+    case 2: *mix = 0; *count = 2; break;   /* 2 weights, 2 matrices */
+    case 3: *mix = 1; *count = 3; break;   /* 3G */
+    case 4: *mix = 0; *count = 3; break;
+    case 5: *mix = 1; *count = 4; break;   /* 4G */
+    case 6: *mix = 0; *count = 4; break;
+    default: *mix = 0; *count = 0; break;  /* off */
+    }
+}
+
+/* xemu append_skinning_code(): `out` = input transformed by matrix set
+ * `base` (rows at base + 8n), blended by the vertex weights. */
+static void ff_emit_skinning(StrBuf *sb, int mix, int count, const char *type,
+                             const char *out, const char *in, int base,
+                             const char *swz)
+{
+    int i;
+    if (count == 0) {
+        sb_append(sb, "    %s %s = nv2a_rowdot(%s, %d).%s;\n", type, out, in, base, swz);
+        return;
+    }
+    sb_append(sb, "    %s %s = (%s)0.0;\n", type, out, type);
+    if (mix) {
+        /* The last weight is generated: 1 minus the others. */
+        sb_append(sb, "    {\n        float weight_i;\n        float weight_n = 1.0;\n");
+        for (i = 0; i < count; i++) {
+            if (i < count - 1)
+                sb_append(sb, "        weight_i = weight.%c;\n        weight_n -= weight_i;\n",
+                          "xyzw"[i]);
+            else
+                sb_append(sb, "        weight_i = weight_n;\n");
+            sb_append(sb, "        %s += nv2a_rowdot(%s, %d).%s * weight_i;\n",
+                      out, in, base + 8 * i, swz);
+        }
+        sb_append(sb, "    }\n");
+    } else {
+        for (i = 0; i < count; i++)
+            sb_append(sb, "    %s += nv2a_rowdot(%s, %d).%s * weight.%c;\n",
+                      out, in, base + 8 * i, swz, "xyzw"[i]);
+    }
+}
+
+int d3d8_vsh_generate_ff_hlsl(const NV2AVshFFState *ff, char *buf, int bufsize)
+{
+    StrBuf sb;
+    int i, j, mix, count;
+
+    sb_init(&sb, buf, bufsize);
+    sb_append(&sb,
+        "/* Auto-generated NV2A fixed-function vertex shader (xemu vsh-ff.c) */\n"
+        "\n"
+        "cbuffer VSH_Constants : register(b1) {\n"
+        "    float4 c[%d];\n"
+        "    float4 nv2aSurface;\n"
+        "    float4 nv2aFog;\n"
+        "};\n"
+        "float4 nv2a_rowdot(float4 v, int b) {\n"
+        "    return float4(dot(v, c[b]), dot(v, c[b + 1]), dot(v, c[b + 2]), dot(v, c[b + 3]));\n"
+        "}\n"
+        "float4 nv2a_nan_to_one(float4 v) {\n"
+        "    bool4 nan = (asuint(v) & 0x7FFFFFFF) > 0x7F800000;\n"
+        "    return nan ? 1.0 : v;\n"
+        "}\n\n", NV2A_VS_MAX_CONSTANTS);
+
+    sb_append(&sb, "struct VS_IN {\n");
+    for (i = 0; i < NV2A_VS_MAX_INPUTS; i++)
+        if (NV2A_FF_INPUTS & (1u << i))
+            sb_append(&sb, "    float4 v%d : ATTR%d;\n", i, i);
+    sb_append(&sb, "};\n\n");
+    sb_append(&sb,
+        "struct VS_OUT {\n"
+        "    float4 oPos : SV_POSITION;\n"
+        "    float4 oD0  : COLOR0;\n"
+        "    float4 oD1  : COLOR1;\n"
+        "    float4 oT0  : TEXCOORD0;\n"
+        "    float4 oT1  : TEXCOORD1;\n"
+        "    float4 oT2  : TEXCOORD2;\n"
+        "    float4 oT3  : TEXCOORD3;\n"
+        "    float  oFog : FOG;\n"
+        "    float  oPts : PSIZE;\n"
+        "    float4 oB0  : TEXCOORD4;\n"
+        "    float4 oB1  : TEXCOORD5;\n"
+        "};\n\n"
+        "VS_OUT main(VS_IN input) {\n"
+        "    float4 position     = input.v0;\n"
+        "    float4 weight       = input.v1;\n"
+        "    float3 normal       = input.v2.xyz;\n"
+        "    float4 diffuse      = input.v3;\n"
+        "    float4 specular     = input.v4;\n"
+        "    float  fogCoord     = input.v5.x;\n"
+        "    float4 backDiffuse  = input.v7;\n"
+        "    float4 backSpecular = input.v8;\n"
+        "    float4 texture0 = input.v9;\n"
+        "    float4 texture1 = input.v10;\n"
+        "    float4 texture2 = input.v11;\n"
+        "    float4 texture3 = input.v12;\n"
+        "    float4 oPos = float4(0,0,0,1), oD0 = float4(0,0,0,1), oD1 = float4(0,0,0,1);\n"
+        "    float4 oB0 = float4(0,0,0,1), oB1 = float4(0,0,0,1), oFog = float4(0,0,0,1);\n"
+        "    float4 oPts = float4(1,0,0,1);\n"
+        "    float4 oT0 = float4(0,0,0,1), oT1 = float4(0,0,0,1), oT2 = float4(0,0,0,1), oT3 = float4(0,0,0,1);\n\n");
+
+    ff_skinning_params(ff->skinning, &mix, &count);
+    sb_append(&sb, "    /* Skinning mode %d */\n", ff->skinning);
+    ff_emit_skinning(&sb, mix, count, "float4", "tPosition", "position",
+                     NV2A_XFCTX_MMAT0, "xyzw");
+    ff_emit_skinning(&sb, mix, count, "float3", "tNormal", "float4(normal, 0.0)",
+                     NV2A_XFCTX_IMMAT0, "xyz");
+    if (ff->normalization)
+        sb_append(&sb, "    tNormal = normalize(tNormal);\n");
+
+    for (i = 0; i < 4; i++) {
+        sb_append(&sb, "    /* Texgen for stage %d */\n", i);
+        for (j = 0; j < 4; j++) {
+            char comp = "xyzw"[j];
+            int plane = NV2A_XFCTX_TG0MAT + 8 * i + j;
+            switch (ff->texgen[i][j]) {
+            case 0x2400:   /* EYE_LINEAR */
+                sb_append(&sb, "    oT%d.%c = dot(c[%d], tPosition);\n", i, comp, plane);
+                break;
+            case 0x2401:   /* OBJECT_LINEAR */
+                sb_append(&sb, "    oT%d.%c = dot(c[%d], position);\n", i, comp, plane);
+                break;
+            case 0x2402:   /* SPHERE_MAP, S and T only */
+                if (j < 2)
+                    sb_append(&sb,
+                        "    { float3 u = normalize(tPosition.xyz);\n"
+                        "      float3 r = reflect(u, tNormal);\n"
+                        "      float invM = 1.0 / (2.0 * length(r + float3(0.0, 0.0, 1.0)));\n"
+                        "      oT%d.%c = r.%c * invM + 0.5; }\n", i, comp, comp);
+                break;
+            case 0x8512:   /* REFLECTION_MAP, S/T/R */
+                if (j < 3)
+                    sb_append(&sb,
+                        "    { float3 u = normalize(tPosition.xyz);\n"
+                        "      float3 r = reflect(u, tNormal);\n"
+                        "      oT%d.%c = r.%c; }\n", i, comp, comp);
+                break;
+            case 0x8511:   /* NORMAL_MAP, S/T/R */
+                if (j < 3)
+                    sb_append(&sb, "    oT%d.%c = tNormal.%c;\n", i, comp, comp);
+                break;
+            default:       /* DISABLE: the vertex's own coordinate */
+                sb_append(&sb, "    oT%d.%c = texture%d.%c;\n", i, comp, i, comp);
+                break;
+            }
+        }
+    }
+    for (i = 0; i < 4; i++)
+        if (ff->texmat_enable[i])
+            sb_append(&sb, "    oT%d = nv2a_rowdot(oT%d, %d);\n", i, i,
+                      NV2A_XFCTX_T0MAT + 8 * i);
+
+    /* Lighting not ported yet: colours pass through, as xemu with it off. */
+    sb_append(&sb,
+        "    oD0 = diffuse;\n"
+        "    oD1 = specular;\n"
+        "    oB0 = backDiffuse;\n"
+        "    oB1 = backSpecular;\n");
+    if (!ff->specular_enable)
+        sb_append(&sb, "    oD1 = float4(0.0, 0.0, 0.0, 1.0);\n"
+                       "    oB1 = float4(0.0, 0.0, 0.0, 1.0);\n");
+
+    /* Fog distance into oFog.x, for the shared fog-factor code below. */
+    if (ff->fog_enable) {
+        switch (ff->foggen) {
+        case 0: sb_append(&sb, "    oFog.x = saturate(specular.a);\n"); break;
+        case 1: sb_append(&sb, "    oFog.x = length(tPosition.xyz);\n"); break;
+        case 2: sb_append(&sb, "    oFog.x = dot(c[%d].xyz, tPosition.xyz) + c[%d].w;\n",
+                          NV2A_XFCTX_FOG, NV2A_XFCTX_FOG); break;
+        case 3: sb_append(&sb, "    oFog.x = abs(dot(c[%d].xyz, tPosition.xyz) + c[%d].w);\n",
+                          NV2A_XFCTX_FOG, NV2A_XFCTX_FOG); break;
+        default: sb_append(&sb, "    oFog.x = fogCoord;\n"); break;   /* FOG_X */
+        }
+    }
+
+    /* With skinning off the composite matrix already includes model-view. */
+    if (count == 0)
+        sb_append(&sb, "    tPosition = position;\n");
+
+    /* xemu's FF epilogue, in this file's D3D11 convention (the same mapping
+     * as the program epilogue): divide x/y by w, add the viewport offset,
+     * pixel -> clip by the target size with y down, z by the depth range,
+     * then x/y back times w so the rasterizer's divide restores them. */
+    sb_append(&sb,
+        "    oPos = nv2a_rowdot(tPosition, %d);\n"
+        "    oPos.w = (oPos.w >= 0.0) ? clamp(oPos.w, 5.421011e-20, 1.8446744e19)\n"
+        "                             : clamp(oPos.w, -1.8446744e19, -5.421011e-20);\n"
+        "    oPos.xy = oPos.xy / oPos.w + c[%d].xy;\n"
+        "    if (nv2aSurface.x > 0.0 && nv2aSurface.y > 0.0) {\n"
+        "        oPos.xy = float2((2.0 * oPos.x - nv2aSurface.x) / nv2aSurface.x,\n"
+        "                         (nv2aSurface.y - 2.0 * oPos.y) / nv2aSurface.y);\n"
+        "    }\n"
+        "    if (nv2aSurface.z > 0.0) oPos.z = oPos.z / nv2aSurface.z;\n"
+        "    oPos.xy *= oPos.w;\n\n",
+        NV2A_XFCTX_CMAT0, NV2A_XFCTX_VPOFF);
+
+    /* Fog factor and output writes: as the program path emits them. */
+    sb_append(&sb,
+        "    if (nv2aFog.x == 0.0) {\n"
+        "        oFog = float4(1.0, 1.0, 1.0, 1.0);\n"
+        "    } else {\n"
+        "        float fogDistance = oFog.x;\n"
+        "        int fogMode = (int)nv2aFog.y;\n"
+        "        float fogFactor;\n"
+        "        if (fogMode == 0 || fogMode == 4) {\n"
+        "            fogFactor = nv2aFog.z + fogDistance * nv2aFog.w - 1.0;\n"
+        "        } else if (fogMode == 1 || fogMode == 5) {\n"
+        "            fogFactor = nv2aFog.z + pow(2.0, fogDistance * nv2aFog.w * 16.0) - 1.5;\n"
+        "        } else {\n"
+        "            fogFactor = nv2aFog.z + pow(2.0, -fogDistance * fogDistance * nv2aFog.w * nv2aFog.w * 32.0) - 1.5;\n"
+        "        }\n"
+        "        if (fogMode >= 4) fogFactor = abs(fogFactor);\n"
+        "        if (nv2aSurface.w > 0.0) fogFactor = nv2aSurface.w;\n"
+        "        oFog = (float4)fogFactor;\n"
+        "    }\n"
+        "    VS_OUT o;\n"
+        "    o.oPos = oPos;\n"
+        "    o.oD0  = saturate(nv2a_nan_to_one(oD0));\n"
+        "    o.oD1  = saturate(nv2a_nan_to_one(oD1));\n"
+        "    o.oT0  = oT0;\n"
+        "    o.oT1  = oT1;\n"
+        "    o.oT2  = oT2;\n"
+        "    o.oT3  = oT3;\n"
+        "    o.oFog = oFog.x;\n"
+        "    o.oPts = oPts.x;\n"
+        "    o.oB0  = saturate(oB0);\n"
+        "    o.oB1  = saturate(oB1);\n"
+        "    return o;\n"
+        "}\n");
+    return sb.overflow ? -1 : sb.pos;
+}
+
+BOOL d3d8_vsh_prepare_ff_draw(const NV2AVshFFState *ff)
+{
+    static char hlsl_buf[32768];
+    ID3D11DeviceContext *ctx;
+    VshCacheEntry *entry;
+    uint32_t hash;
+
+    ctx = d3d8_GetD3D11Context();
+    if (!ctx || !ff)
+        return FALSE;
+    if (ff->lighting) {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "D3D8 VSH: fixed-function lighting is not ported yet; "
+                    "lit draws use their vertex colours\n");
+        }
+    }
+    /* Salted so a state can never alias a program's microcode hash. */
+    hash = fnv1a_hash(ff, sizeof(*ff)) ^ 0x46465348u;   /* "FFSH" */
+    entry = cache_lookup(hash);
+    if (!entry) {
+        int n = d3d8_vsh_generate_ff_hlsl(ff, hlsl_buf, sizeof(hlsl_buf));
+        if (n <= 0) {
+            fprintf(stderr, "D3D8 VSH: fixed-function HLSL generation failed\n");
+            return FALSE;
+        }
+        entry = compile_from_hlsl(hlsl_buf, n, hash, NV2A_FF_INPUTS, 0);
+        if (!entry)
+            return FALSE;
+    }
+    return bind_entry(ctx, entry);
 }

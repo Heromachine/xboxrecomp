@@ -391,6 +391,16 @@ static struct {
                                      * END that follows) misclassifies draws. */
     } vsh;
 
+    /* Fixed-function transform state (transform_mode 0), for the generated
+     * shader in d3d8_vsh.c (a port of xemu vsh-ff.c). The matrices are not
+     * here: their methods write the shared constant memory directly, at
+     * xemu's XFCTX slots -- see ff_method(). */
+    struct {
+        uint8_t  skin_mode, normalization, lighting, specular_enable, foggen;
+        uint8_t  texmat_enable[4];
+        uint16_t texgen[4][4];   /* SET_TEXGEN_S/T/R/Q per stage */
+    } ff;
+
     /* Texture state per stage (4 stages). Addresses per nv2a_regs.h --
      * the old control0 comment here said 0x1B08, which is actually
      * SET_TEXTURE_ADDRESS; SET_TEXTURE_CONTROL0 is 0x1B0C. The CODE
@@ -488,6 +498,7 @@ static struct {
     long lights;
     long noglow;
     int nolightpass, nomasked, nodepth, smallnodepth, eqle, shinv, shflip, pshout, post, texppm;
+    int noff;           /* NOFF: fixed-function draws use the old 2D fallback */
     long onlyinputs;
     uint32_t skipvsh;   /* XBOXRECOMP_DBG_SKIPVSH=<hash>: drop that program's draws */
     int listvsh;        /* XBOXRECOMP_DBG_LISTVSH=1: [VSHLIST] programs drawn, ~1/s */
@@ -556,6 +567,7 @@ static void dbg_init(void)
     g_dbg.listvsh = dbg_get("XBOXRECOMP_DBG_LISTVSH") != NULL;
     g_dbg.constdiff = (e = dbg_get("XBOXRECOMP_DBG_CONSTDIFF")) ? strtol(e, NULL, 0) : -1;
     g_dbg.dumpz = (e = dbg_get("XBOXRECOMP_DBG_DUMPZ")) ? (uint32_t)strtoul(e, NULL, 0) : 0;
+    g_dbg.noff = dbg_get("XBOXRECOMP_DBG_NOFF") != NULL;
 }
 
 /* TRACE=<token> in the switch file: each new token traces the next 30
@@ -849,6 +861,80 @@ static void vsh_program_write(uint32_t method, uint32_t param)
  * title had written the matrix at 6-9, a w of 0, and not one pixel on screen.
  * Programs that read only c[58]/c[59], the viewport pair mirrored at hardware
  * slots, never showed it. */
+/* One component of a fixed-function matrix row in the shared constant
+ * memory (xemu writes pg->vsh_constants[row][comp] the same way). */
+static void ff_const_component(int row, int comp, uint32_t param)
+{
+    float f4[4];
+    memcpy(f4, d3d8_vsh_get_constant(row), sizeof(f4));
+    f4[comp] = u2f(param);
+    d3d8_vsh_set_constant(row, f4, 1);
+}
+
+/* Fixed-function transform methods, ported from xemu pgraph.c (SET_*_MATRIX,
+ * SET_TEXGEN_*, SET_SKIN_MODE, ...). Returns 1 if `method` was one. Method
+ * numbers and ranges are nv2a_regs.h's; slot arithmetic is xemu's. */
+static int ff_method(uint32_t method, uint32_t param)
+{
+    uint32_t slot;
+
+    switch (method) {
+    case NV097_SET_SKIN_MODE:           g_pg.ff.skin_mode = (uint8_t)(param & 7); return 1;
+    case NV097_SET_NORMALIZATION_ENABLE: g_pg.ff.normalization = param ? 1 : 0; return 1;
+    case NV097_SET_LIGHTING_ENABLE:     g_pg.ff.lighting = param ? 1 : 0; return 1;
+    case NV097_SET_SPECULAR_ENABLE:     g_pg.ff.specular_enable = param ? 1 : 0; return 1;
+    default: break;
+    }
+    if (method >= NV097_SET_TEXGEN_S && method < NV097_SET_TEXGEN_S + 0x40) {
+        slot = method - NV097_SET_TEXGEN_S;         /* 16 bytes per stage: S T R Q */
+        g_pg.ff.texgen[slot / 16][(slot % 16) / 4] = (uint16_t)param;
+        return 1;
+    }
+    if (method >= NV097_SET_TEXTURE_MATRIX_ENABLE && method < NV097_SET_TEXTURE_MATRIX_ENABLE + 0x10) {
+        g_pg.ff.texmat_enable[(method - NV097_SET_TEXTURE_MATRIX_ENABLE) / 4] = param ? 1 : 0;
+        return 1;
+    }
+    if (method >= NV097_SET_PROJECTION_MATRIX && method < NV097_SET_PROJECTION_MATRIX + 0x40) {
+        slot = (method - NV097_SET_PROJECTION_MATRIX) / 4;
+        ff_const_component(NV2A_XFCTX_PMAT0 + slot / 4, slot % 4, param);
+        return 1;
+    }
+    if (method >= NV097_SET_MODEL_VIEW_MATRIX && method < NV097_SET_MODEL_VIEW_MATRIX + 0x100) {
+        slot = (method - NV097_SET_MODEL_VIEW_MATRIX) / 4;      /* 4 matrices */
+        ff_const_component(NV2A_XFCTX_MMAT0 + (slot / 16) * 8 + (slot % 16) / 4, slot % 4, param);
+        return 1;
+    }
+    if (method >= NV097_SET_INVERSE_MODEL_VIEW_MATRIX && method < NV097_SET_INVERSE_MODEL_VIEW_MATRIX + 0x100) {
+        slot = (method - NV097_SET_INVERSE_MODEL_VIEW_MATRIX) / 4;
+        ff_const_component(NV2A_XFCTX_IMMAT0 + (slot / 16) * 8 + (slot % 16) / 4, slot % 4, param);
+        return 1;
+    }
+    if (method >= NV097_SET_COMPOSITE_MATRIX && method < NV097_SET_COMPOSITE_MATRIX + 0x40) {
+        slot = (method - NV097_SET_COMPOSITE_MATRIX) / 4;
+        ff_const_component(NV2A_XFCTX_CMAT0 + slot / 4, slot % 4, param);
+        return 1;
+    }
+    if (method >= NV097_SET_TEXTURE_MATRIX && method < NV097_SET_TEXTURE_MATRIX + 0x100) {
+        slot = (method - NV097_SET_TEXTURE_MATRIX) / 4;         /* 4 stages */
+        ff_const_component(NV2A_XFCTX_T0MAT + (slot / 16) * 8 + (slot % 16) / 4, slot % 4, param);
+        return 1;
+    }
+    if (method >= NV097_SET_TEXGEN_PLANE_S && method < NV097_SET_TEXGEN_PLANE_S + 0x100) {
+        slot = (method - NV097_SET_TEXGEN_PLANE_S) / 4;
+        ff_const_component(NV2A_XFCTX_TG0MAT + (slot / 16) * 8 + (slot % 16) / 4, slot % 4, param);
+        return 1;
+    }
+    if (method >= NV097_SET_FOG_PLANE && method < NV097_SET_FOG_PLANE + 0x10) {
+        ff_const_component(NV2A_XFCTX_FOG, (int)((method - NV097_SET_FOG_PLANE) / 4), param);
+        return 1;
+    }
+    if (method >= NV097_SET_EYE_POSITION && method < NV097_SET_EYE_POSITION + 0x10) {
+        ff_const_component(NV2A_XFCTX_EYEP, (int)((method - NV097_SET_EYE_POSITION) / 4), param);
+        return 1;
+    }
+    return 0;
+}
+
 static void vsh_constant_write(uint32_t method, uint32_t param)
 {
     int slot = (int)((method - NV097_SET_TRANSFORM_CONSTANT) / 4);
@@ -3410,13 +3496,36 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
         if (g_dbg.skipvsh && g_pg.vsh.prog_hash == g_dbg.skipvsh)
             return;
     }
-    if (g_dbg.onlyinputs >= 0 && (!use_vsh || g_pg.vsh.inputs_read != (uint16_t)g_dbg.onlyinputs))
+    /* Fixed-function draws (transform mode 0) take this same path, with a
+     * shader generated from the fixed-function state (d3d8_vsh.c, a port of
+     * xemu vsh-ff.c) instead of the old 2D fallback, which drew their
+     * world-space positions as screen pixels: Burnout's sky dome, cliffs and
+     * car pieces. NOFF in the debug switch file restores the fallback. The
+     * per-draw trace prints vsh=2 for these. */
+    int use_ff = 0;
+    if (!use_vsh && g_pg.vsh.transform_mode == 0 && !g_dbg.noff) {
+        NV2AVshFFState ffs;
+        memset(&ffs, 0, sizeof(ffs));
+        ffs.skinning = g_pg.ff.skin_mode;
+        ffs.normalization = g_pg.ff.normalization;
+        ffs.lighting = g_pg.ff.lighting;
+        ffs.specular_enable = g_pg.ff.specular_enable;
+        ffs.fog_enable = g_pg.fog_enable && !g_dbg.nofog;
+        ffs.foggen = g_pg.ff.foggen;
+        memcpy(ffs.texmat_enable, g_pg.ff.texmat_enable, sizeof(ffs.texmat_enable));
+        memcpy(ffs.texgen, g_pg.ff.texgen, sizeof(ffs.texgen));
+        d3d8_vsh_set_ff_state(&ffs);
+        use_ff = use_vsh = 1;
+    }
+    uint16_t vin = use_ff ? NV2A_FF_INPUTS : g_pg.vsh.inputs_read;
+
+    if (g_dbg.onlyinputs >= 0 && (!use_vsh || vin != (uint16_t)g_dbg.onlyinputs))
         return;
 
     uint32_t vsh_dst_offset[16];
     uint32_t vsh_stride = 0;
     if (use_vsh) {
-        vsh_stride = compute_vsh_vertex_layout(g_pg.vsh.inputs_read, vsh_dst_offset);
+        vsh_stride = compute_vsh_vertex_layout(vin, vsh_dst_offset);
         if (vsh_stride == 0)
             use_vsh = 0;  /* Program declares no inputs we can supply -- fall back */
     }
@@ -3439,7 +3548,7 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
             return;
         #define CONVERT_VSH_VERT(dst_idx, src_idx) \
             convert_vsh_vertex(base + (size_t)(src_idx) * stride_bytes, byte_offset, \
-                                g_pg.vsh.inputs_read, \
+                                vin, \
                                 vsh_verts + (size_t)(dst_idx) * vsh_stride)
         if (is_quads) {
             uint32_t out_idx = 0;
@@ -3577,7 +3686,7 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
         fprintf(stderr, "[SURF] f=%u DRAW mode=%u verts=%u vsh=%d inputs=0x%04X c=0x%08X z=0x%08X "
                 "fmt=0x%X vp=(%.0f,%.0f s %.0f,%.0f) blend=%d %04X/%04X cmask=%08X "
                 "depth=%d/%04X/%d stencil=%d f=%04X ref=%u m=%02X wm=%02X ops=%04X/%04X/%04X",
-                g_pg.stats.frames, g_pg.draw_mode, num_verts, use_vsh, g_pg.vsh.inputs_read,
+                g_pg.stats.frames, g_pg.draw_mode, num_verts, use_ff ? 2 : use_vsh, vin,
                 g_pg.surf_color_offset, g_pg.surf_zeta_offset, g_pg.surf_format,
                 g_pg.vp_offset[0], g_pg.vp_offset[1], g_pg.vp_scale[0], g_pg.vp_scale[1],
                 g_pg.blend_enable, g_pg.blend_sfactor, g_pg.blend_dfactor,
@@ -3602,14 +3711,14 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
                     g_pg.psh.factor1[0], g_pg.psh.factor1[1], g_pg.psh.factor1[2],
                     g_pg.psh.factor1[3], g_pg.psh.factor1[4], g_pg.psh.factor1[5]);
         }
-        if (g_pg.vsh.inputs_read == 0x061D) {
+        if (vin == 0x061D) {
             static const int regs[] = { 96, 101, 106, 108, 109, 130, 131, 134, 135, 138, 139, 142, 143, 146, 147, 150, 151, 154, 155, 158, 159 };
             for (unsigned r = 0; r < sizeof(regs) / sizeof(regs[0]); r++) {
                 const float *cc = d3d8_vsh_get_constant(regs[r]);
                 fprintf(stderr, " c%d=(%.3g,%.3g,%.3g,%.3g)", regs[r], cc[0], cc[1], cc[2], cc[3]);
             }
         }
-        if (g_dbg.lights >= 0 && g_pg.vsh.inputs_read == (uint16_t)g_dbg.lights) {
+        if (g_dbg.lights >= 0 && vin == (uint16_t)g_dbg.lights) {
             for (int r = 96; r < 160; r++) {
                 const float *cc = d3d8_vsh_get_constant(r);
                 fprintf(stderr, " L%d=(%.4g,%.4g,%.4g,%.4g)", r, cc[0], cc[1], cc[2], cc[3]);
@@ -3645,7 +3754,7 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
                 fprintf(stderr, " a%d=%X f%d=%X b%d=%08X c0_%d=%08X", s, g_pg.tex[s].address, s,
                         g_pg.tex[s].filter, s, g_pg.tex[s].border_color, s, g_pg.tex[s].control0);
         }
-        if (use_vsh && g_dbg.constdiff >= 0 && g_pg.vsh.inputs_read == (uint16_t)g_dbg.constdiff) {
+        if (use_vsh && g_dbg.constdiff >= 0 && vin == (uint16_t)g_dbg.constdiff) {
             static float prev[NV2A_VS_MAX_CONSTANTS][4];
             static int have_prev;
             int changed = 0;
@@ -3721,7 +3830,7 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
          * makes dev_DrawPrimitiveUP()'s own d3d8_vsh_prepare_draw() call
          * (src/d3d/d3d8_device.c) bind this program -- see the comment
          * above where shader_handle is (re)built. */
-        dev->lpVtbl->SetVertexShader(dev, g_pg.vsh.shader_handle);
+        dev->lpVtbl->SetVertexShader(dev, use_ff ? NV2A_FF_HANDLE : g_pg.vsh.shader_handle);
     } else {
         /* Fixed-function fallback: pre-transformed 2D with texture. */
         dev->lpVtbl->SetVertexShader(dev, D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
@@ -4109,6 +4218,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
         }
         return 1;
     case NV097_SET_FOG_GEN_MODE:
+        g_pg.ff.foggen = (uint8_t)param;   /* fixed-function fog distance */
         return 1;
     case NV097_SET_FOG_PARAMS:
     case NV097_SET_FOG_PARAMS + 4:
@@ -4446,6 +4556,8 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
          * which is the actual reason Breakdown's geometry never reached the
          * screen: the vertex program and its constants never reached
          * d3d8_vsh at all. See vsh_program_write()/vsh_constant_write(). */
+        if (ff_method(method, param))
+            return 1;
         if (method >= NV097_SET_TRANSFORM_PROGRAM &&
             method <  NV097_SET_TRANSFORM_PROGRAM + 0x80) {
             vsh_program_write(method, param);

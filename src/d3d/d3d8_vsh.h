@@ -567,6 +567,67 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
 DXGI_FORMAT d3d8_vsh_default_input_format(int vreg);
 UINT d3d8_vsh_input_format_size(DXGI_FORMAT fmt);
 
+/* ================================================================
+ * Fixed-function transform (NV2A SET_TRANSFORM_EXECUTION_MODE MODE 0)
+ *
+ * A port of xemu's hw/xbox/nv2a/pgraph/glsl/vsh-ff.c. The matrices it reads
+ * live in the same 192-entry constant memory as vertex-program constants, at
+ * xemu's NV_IGRAPH_XF_XFCTX_* slots (the matrix methods write them there),
+ * so the generated shader reads c[] exactly as a translated program does,
+ * and shares its input/output structures and screen->clip epilogue.
+ *
+ * Lighting is NOT ported yet: with lighting enabled the shader passes the
+ * vertex colours through (as xemu does with lighting off) and logs once.
+ * ================================================================ */
+
+/* xemu's XFCTX slots: absolute indices into the 192 constants. */
+#define NV2A_XFCTX_CMAT0   0x00   /* composite matrix (4 rows) */
+#define NV2A_XFCTX_PMAT0   0x04   /* projection */
+#define NV2A_XFCTX_MMAT0   0x08   /* model-view n at MMAT0 + 8n */
+#define NV2A_XFCTX_IMMAT0  0x0C   /* inverse model-view n at IMMAT0 + 8n */
+#define NV2A_XFCTX_EYEP    0x38
+#define NV2A_XFCTX_FOG     0x39   /* fog plane */
+#define NV2A_XFCTX_VPOFF   0x3B
+#define NV2A_XFCTX_TG0MAT  0x40   /* texgen planes for stage n at TG0MAT + 8n */
+#define NV2A_XFCTX_T0MAT   0x44   /* texture matrix for stage n at T0MAT + 8n */
+
+typedef struct {
+    uint8_t  skinning;        /* SET_SKIN_MODE value, 0..6 (xemu's order) */
+    uint8_t  normalization;   /* SET_NORMALIZATION_ENABLE */
+    uint8_t  lighting;        /* SET_LIGHTING_ENABLE (not yet ported) */
+    uint8_t  specular_enable; /* SET_SPECULAR_ENABLE */
+    uint8_t  fog_enable;      /* SET_FOG_ENABLE */
+    uint8_t  foggen;          /* SET_FOG_GEN_MODE value */
+    uint8_t  texmat_enable[4];/* SET_TEXTURE_MATRIX_ENABLE[stage] */
+    uint16_t texgen[4][4];    /* SET_TEXGEN_S/T/R/Q[stage] method values */
+} NV2AVshFFState;
+
+/* The attributes every fixed-function shader reads: position, weight,
+ * normal, diffuse, specular, fog coord, back diffuse/specular, texture
+ * 0-3 (v0-v5, v7-v12). Pack vertices with this mask; an attribute the draw
+ * does not supply arrives as its current inline value, as on hardware. */
+#define NV2A_FF_INPUTS 0x1FBF
+
+/**
+ * Generate the HLSL for one fixed-function state. Returns the length written,
+ * or -1 if it did not fit.
+ */
+int d3d8_vsh_generate_ff_hlsl(const NV2AVshFFState *ff, char *buf, int bufsize);
+
+/**
+ * Prepare a fixed-function draw: compile (cached by state) and bind the
+ * generated shader, its input layout (NV2A_FF_INPUTS), and the constants.
+ * TRUE when bound; FALSE means the caller keeps its fallback.
+ */
+BOOL d3d8_vsh_prepare_ff_draw(const NV2AVshFFState *ff);
+
+/* A vertex-shader handle (SetVertexShader / d3d8_vsh_prepare_draw) that
+ * means "the generated fixed-function shader for the state last given to
+ * d3d8_vsh_set_ff_state()". Above 0xFFFF, so d3d8_vsh_is_programmable()
+ * treats it as a shader handle; beyond any slot index. */
+#define NV2A_FF_HANDLE 0x7FFF0000u
+void d3d8_vsh_set_ff_state(const NV2AVshFFState *ff);
+
 #ifdef __cplusplus
 }
 #endif
