@@ -535,17 +535,21 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # ── and/or/xor: result-based, CF=0, OF=0 ──
     if flag_setter in ("and", "or", "xor"):
         if jcc in ("je", "jz"):
-            return f"({lhs} == 0)", desc
+            return "(_fa == 0)", desc
         if jcc in ("jne", "jnz"):
-            return f"({lhs} != 0)", desc
+            return "(_fa != 0)", desc
         if jcc in ("js", "jl"):
-            return f"({_sf_value} < 0)", desc
+            return "(_fas < 0)", desc
         if jcc in ("jns", "jge"):
-            return f"({_sf_value} >= 0)", desc
+            return "(_fas >= 0)", desc
         if jcc == "jle":
-            return f"({_sf_value} <= 0)", desc
+            return "(_fas <= 0)", desc
         if jcc == "jg":
-            return f"({_sf_value} > 0)", desc
+            return "(_fas > 0)", desc
+        if jcc == "jp":
+            return "RECOMP_PARITY8(_fa)", desc
+        if jcc == "jnp":
+            return "(!RECOMP_PARITY8(_fa))", desc
         if jcc in ("jb", "jnae", "jbe", "jna"):
             return "0", desc  # CF=0 after and/or/xor
         if jcc in ("jae", "jnb", "ja", "jnbe"):
@@ -1326,7 +1330,10 @@ class Lifter:
         src = _fmt_operand_read(ops[1])
         # XOR reg, reg → zero
         if m == "xor" and ops[0].type == "reg" and ops[1].type == "reg" and ops[0].reg == ops[1].reg:
-            return [_fmt_operand_write(ops[0], "0") + " /* xor self */"]
+            out = [_fmt_operand_write(ops[0], "0") + " /* xor self */"]
+            if self.needs_flags:
+                out.extend(self._snapshot_logic_result(ops[0], m))
+            return out
         expr = f"{dst} {c_op} {src}"
         out = []
         if self.needs_cf:
@@ -1339,7 +1346,22 @@ class Lifter:
             else:
                 out.append("_cf = 0; /* logical op clears CF */")
         out.append(_fmt_operand_write(ops[0], expr))
+        if m in ("and", "or", "xor") and self.needs_flags:
+            out.extend(self._snapshot_logic_result(ops[0], m))
         return out
+
+    def _snapshot_logic_result(self, dst, mnemonic):
+        """Keep ZF/SF/PF from a logical op when later MOVs reuse its register."""
+        size = _operand_width(dst)
+        if size not in self._SNAP_MASK:
+            size = 4
+        value = _fmt_operand_read(dst)
+        mask = self._SNAP_MASK[size]
+        sx = self._SNAP_SX[size]
+        return [
+            f"_fa = (uint32_t)({value}) & {mask};",
+            f"_fas = (int32_t){sx}(_fa); /* {mnemonic} result flags */",
+        ]
 
     def _lift_inc_dec(self, insn, ops, m):
         if len(ops) < 1:

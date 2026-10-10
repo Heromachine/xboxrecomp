@@ -718,7 +718,11 @@ class FunctionTranslator:
         # interrupt drain routine -- otherwise never declares _fa at all and
         # fails to compile. xadd is deliberately NOT here: its predicate tests
         # the destination, which legitimately holds the sum afterwards.
-        if any(insn.mnemonic in ("cmp", "test", "cmpxchg") for insn in instructions):
+        # Logical ops also snapshot their result when a later branch consumes
+        # ZF/SF/PF after MOV or LEA has reused the destination register.
+        if (any(insn.mnemonic in ("cmp", "test", "cmpxchg") for insn in instructions)
+                or (has_conditionals and any(
+                    insn.mnemonic in ("and", "or", "xor") for insn in instructions))):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")
             lines.append("    (void)_fa; (void)_fb; (void)_fas; (void)_fbs;")
