@@ -153,8 +153,20 @@ void xbox_ProtectMirrorsForDebug(void);
 
 /** Base VA for kernel data exports (XboxHardwareInfo, XboxKrnlVersion, etc.)
  *  These are kernel exports that are DATA, not functions. The game reads
- *  their thunk entries and dereferences them to access the data. */
+ *  their thunk entries and dereferences them to access the data.
+ *
+ *  This, the thread objects after it and the stack region (XBOX_STACK_BASE)
+ *  must all sit above the title's image (XBE base + SizeOfImage, BSS
+ *  included). The defaults fit images ending below 0x00740000 (Breakdown ends
+ *  near 0x00460D58). A larger title overrides both from its CMakeLists, before
+ *  add_subdirectory(xboxrecomp): Burnout's image runs to 0x008C7140, so with
+ *  the defaults KeTickCount was one of its own BSS variables -- it read 0, its
+ *  music fade never advanced and the music stayed silent, while the tick
+ *  writer and worker stacks scribbled on its data (HeroLab Burnout task
+ *  78a6032f). xbox_MemoryLayoutInit() reports an overlap at startup. */
+#ifndef XBOX_KERNEL_DATA_BASE
 #define XBOX_KERNEL_DATA_BASE   0x00740000
+#endif
 #define XBOX_KERNEL_DATA_SIZE   4096   /* 4 KB - plenty for all data exports */
 
 /* Offsets within the kernel data area */
@@ -266,8 +278,15 @@ typedef union RecompXmm {
 
 #define XBOX_STACK_SIZE     (8 * 1024 * 1024)
 
-/** Base VA of the stack area (above last XBE section). */
+/** Base VA of the stack area (above last XBE section and the thread objects;
+ *  see XBOX_KERNEL_DATA_BASE for overriding both). */
+#ifndef XBOX_STACK_BASE
 #define XBOX_STACK_BASE     0x00780000
+#endif
+
+#if (XBOX_THREAD_OBJ_END) > (XBOX_STACK_BASE)
+#error "XBOX_KERNEL_DATA_BASE + kernel data + thread objects must end at or below XBOX_STACK_BASE"
+#endif
 
 /** Initial ESP value (top of stack, 16-byte aligned). */
 #define XBOX_STACK_TOP      (XBOX_STACK_BASE + XBOX_STACK_SIZE - 16)

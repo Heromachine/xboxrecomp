@@ -89,6 +89,8 @@ static void *g_nv2a_memory = NULL;
 static void *g_mcpx_memory = NULL;
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
+static HANDLE g_tick_thread = NULL;
+static volatile LONG g_tick_stop = 0;
 
 /*
  * NV2A busy-bit acknowledgement.
@@ -262,16 +264,33 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             }
         }
 
-        /* Advance KeTickCount. It was written once at init and left frozen,
-         * which silently breaks every timeout that polls it: Halo's DHCP setup
-         * waits on a tick deadline that never arrives and spins forever bringing
-         * up XNet. A live clock is also just the truth -- KeTickCount ticks on
-         * hardware whether or not anyone is asleep. GetTickCount() shares the
-         * millisecond unit, so the rate matches. */
+        Sleep(0);  /* yield; the waiter is spinning on another core */
+    }
+    return 0;
+}
+
+/*
+ * Advance KeTickCount for the whole run. It was written once at init and left
+ * frozen, which silently breaks every timeout that polls it: Halo's DHCP setup
+ * waits on a tick deadline that never arrives and spins forever bringing up
+ * XNet. A live clock is also just the truth -- KeTickCount ticks on hardware
+ * whether or not anyone is asleep. GetTickCount() shares the millisecond unit,
+ * so the rate matches.
+ *
+ * This used to be done by the NV2A ack thread, which stops as soon as the NV2A
+ * or APU aperture traps -- early in boot -- so the clock froze again for the
+ * rest of the run. Burnout fades its music in with KeTickCount / 1000.0f; with
+ * the clock frozen at the fade's start time the volume stayed at 0 and the
+ * music was silent (HeroLab Burnout task 78a6032f). It only writes guest RAM,
+ * never an aperture, so it has no reason to stop when the apertures trap.
+ */
+static DWORD WINAPI tick_thread(LPVOID param)
+{
+    (void)param;
+    while (!InterlockedCompareExchange(&g_tick_stop, 0, 0)) {
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
-
-        Sleep(0);  /* yield; the waiter is spinning on another core */
+        Sleep(1);
     }
     return 0;
 }
@@ -581,6 +600,28 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         memcpy(XBOX_VA(XBOX_BASE_ADDRESS), xbe, header_size);
         fprintf(stderr, "  XBE header: %u bytes at %p (Xbox VA 0x%08X)\n",
                 header_size, XBOX_VA(XBOX_BASE_ADDRESS), XBOX_BASE_ADDRESS);
+
+        /* The kernel data exports, thread objects and guest stacks are placed
+         * at fixed VAs that must lie above the whole image, BSS included. If
+         * they do not, the title and the runtime share memory and neither
+         * notices: see XBOX_KERNEL_DATA_BASE in xbox_memory_layout.h. */
+        if (header_size >= 0x110) {
+            uint32_t base = *(const uint32_t *)(xbe + 0x0104);
+            uint32_t size = *(const uint32_t *)(xbe + 0x010C);
+            uint32_t end = base + size;
+            if (end > XBOX_KERNEL_DATA_BASE) {
+                fprintf(stderr,
+                        "[LAYOUT] ERROR: the XBE image ends at 0x%08X, above "
+                        "XBOX_KERNEL_DATA_BASE 0x%08X: kernel data, thread objects "
+                        "and stacks overlap the title's own data. Define "
+                        "XBOX_KERNEL_DATA_BASE and XBOX_STACK_BASE above the image "
+                        "before add_subdirectory(xboxrecomp).\n",
+                        end, XBOX_KERNEL_DATA_BASE);
+            } else {
+                fprintf(stderr, "  XBE image ends at 0x%08X; kernel data 0x%08X, "
+                        "stacks 0x%08X\n", end, XBOX_KERNEL_DATA_BASE, XBOX_STACK_BASE);
+            }
+        }
 
         /*
          * Relax the certificate's AllowedMediaTypes, the way a modchip BIOS
@@ -935,6 +976,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         xbox_Nv2aAckStart();
     }
 
+    g_tick_stop = 0;
+    g_tick_thread = CreateThread(NULL, 0, tick_thread, NULL, 0, NULL);
+    if (!g_tick_thread)
+        fprintf(stderr, "  WARNING: KeTickCount thread failed (error %lu); "
+                "the tick count will not advance\n", GetLastError());
+
     /*
      * Allocate a page at Xbox kernel address space (0x80010000).
      *
@@ -1149,6 +1196,12 @@ void xbox_MemoryLayoutShutdown(void)
         WaitForSingleObject(g_nv2a_ack_thread, 1000);
         CloseHandle(g_nv2a_ack_thread);
         g_nv2a_ack_thread = NULL;
+    }
+    if (g_tick_thread) {
+        InterlockedExchange(&g_tick_stop, 1);
+        WaitForSingleObject(g_tick_thread, 1000);
+        CloseHandle(g_tick_thread);
+        g_tick_thread = NULL;
     }
     if (g_nv2a_memory) {
         VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
