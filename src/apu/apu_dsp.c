@@ -8,7 +8,8 @@
  * For initial audio, we bypass the DSP entirely:
  * - VP mixbins are passed directly to the EP output
  * - GP effects processing is skipped
- * - The EP just copies mixbin 0/1 (front L/R) to the monitor buffer
+ * - The EP writes a stereo downmix of the speaker and 3D bins (0-9) to the
+ *   monitor buffer; see mcpx_apu_dsp_frame
  *
  * This gives us basic voice playback without effects. The DSP can be
  * connected later for reverb, EQ, and other processing.
@@ -92,11 +93,38 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
         }
     }
 
+    /* Stereo downmix. On hardware DSOUND's GP program mixes the bins down
+     * to the output; with the DSP stubbed, a title that routes sound
+     * anywhere but bins 0/1 was silent. Burnout plays its 5.1 music on bins
+     * 0-5 and every 3D sound (engines, traffic, crashes) on the crosstalk
+     * bins 6-9, so all of that was dropped (HeroLab Burnout task 78a6032f).
+     * Bin meanings are the XDK's DSMIXBIN_* values: 0 FL, 1 FR, 2 centre,
+     * 3 LFE, 4 BL, 5 BR, 6-9 XTLK FL/FR/BL/BR, 10 I3DL2 reverb send.
+     * Centre and rear go in at -3 dB, the usual stereo downmix. LFE is left
+     * out, as a stereo downmix does, and so is the I3DL2 send: it feeds a
+     * reverb, and adding it dry would double those sounds.
+     * XBOXRECOMP_APU_DOWNMIX=0 keeps the old bins-0/1-only output. */
+    static int downmix = -1;
+    if (downmix < 0) {
+        const char *e = getenv("XBOXRECOMP_APU_DOWNMIX");
+        downmix = !(e && e[0] == '0');
+        fprintf(stderr, "[APU] output: %s\n", downmix
+                ? "stereo downmix of speaker and 3D bins 0-9"
+                : "mixbins 0/1 only (XBOXRECOMP_APU_DOWNMIX=0)");
+    }
+
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
+        const float k = 0.70710678f;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* Clamp to [-1, 1] range */
             float left = mixbins[0][i];
             float right = mixbins[1][i];
+            if (downmix) {
+                left  += k * mixbins[2][i] + k * mixbins[4][i]
+                       + mixbins[6][i] + k * mixbins[8][i];
+                right += k * mixbins[2][i] + k * mixbins[5][i]
+                       + mixbins[7][i] + k * mixbins[9][i];
+            }
             if (left > 1.0f) left = 1.0f;
             if (left < -1.0f) left = -1.0f;
             if (right > 1.0f) right = 1.0f;
