@@ -164,10 +164,24 @@ int nv2a_vtx_gather(const NV2AVtxAttr attrs[NV2A_VTX_ATTRS],
         if (!src)
             return -1;
 
-        for (uint32_t i = 0; i < n; i++) {
-            const uint8_t *p = a->stride ? src + (size_t)elements[i] * a->stride : src;
-            memcpy(dst + (size_t)i * dst_stride + dst_offset[slot], p, bytes);
+        /* One loop per common attribute size, so each copy has a constant
+         * length and compiles to a move instead of a call into the CRT: the
+         * variable-length memcpy here was ~11% of a Burnout race (HeroLab
+         * Burnout task 7b994f01). */
+        uint8_t *d = dst + dst_offset[slot];
+        size_t stride = a->stride;
+        #define GATHER(LEN) \
+            for (uint32_t i = 0; i < n; i++) \
+                memcpy(d + (size_t)i * dst_stride, \
+                       stride ? src + (size_t)elements[i] * stride : src, LEN)
+        switch (bytes) {
+        case 4:  GATHER(4);  break;
+        case 8:  GATHER(8);  break;
+        case 12: GATHER(12); break;
+        case 16: GATHER(16); break;
+        default: GATHER(bytes); break;
         }
+        #undef GATHER
     }
     return 0;
 }

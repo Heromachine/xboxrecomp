@@ -1044,6 +1044,97 @@ static void convert_vsh_vertex(const uint8_t *src_vb, const uint32_t src_offset[
     }
 }
 
+/* Per-draw plan for convert_vsh_vertex(): the same result, decided once per
+ * draw instead of once per vertex and attribute. The profile of a Burnout
+ * race put ~54% of the game thread in per-vertex decoding and the variable
+ * sized memcpy it made per attribute (HeroLab Burnout task 7b994f01).
+ * Every destination slot is float4 (d3d8_vsh_default_input_format). */
+enum {
+    VSH_SLOT_CONST,     /* not in the stream: the inline value */
+    VSH_SLOT_F,         /* float components, rest (0,0,0,1) */
+    VSH_SLOT_UB_BGRA,   /* UB_D3D x4: bytes B,G,R,A seen as R,G,B,A */
+    VSH_SLOT_GENERIC,   /* anything else: decode_attr_floats() */
+};
+typedef struct {
+    uint8_t kind, count;
+    uint32_t src_off;
+    float k[4];          /* CONST value, or the (0,0,0,1) defaults */
+} VshSlotPlan;
+
+static int build_vsh_plan(const uint32_t src_offset[16], uint16_t inputs_read,
+                          VshSlotPlan plan[16], int slot_of[16])
+{
+    int n = 0;
+    for (int i = 0; i < 16; i++) {
+        if (!(inputs_read & (1u << i)))
+            continue;
+        VshSlotPlan *p = &plan[n];
+        uint32_t count = g_pg.vattr[i].count;
+        uint32_t format = g_pg.vattr[i].format;
+        slot_of[n] = i;
+        p->count = (uint8_t)count;
+        p->src_off = count ? src_offset[i] : 0;
+        if (count == 0) {
+            p->kind = VSH_SLOT_CONST;
+            memcpy(p->k, g_pg.inline_value[i], sizeof(p->k));
+        } else {
+            p->k[0] = p->k[1] = p->k[2] = 0.0f;
+            p->k[3] = 1.0f;
+            uint32_t size = g_pg.vattr[i].size ? g_pg.vattr[i].size : 4;
+            if (format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F && size == 4)
+                p->kind = VSH_SLOT_F;
+            else if (format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_D3D &&
+                     count == 4 && size == 1)
+                p->kind = VSH_SLOT_UB_BGRA;
+            else
+                p->kind = VSH_SLOT_GENERIC;
+        }
+        n++;
+    }
+    return n;
+}
+
+static inline void convert_vsh_vertex_planned(const uint8_t *src_vb,
+                                              const uint32_t src_offset[16],
+                                              const VshSlotPlan *plan,
+                                              const int *slot_of, int n,
+                                              uint8_t *dst)
+{
+    for (int j = 0; j < n; j++, dst += 16) {
+        const VshSlotPlan *p = &plan[j];
+        float v[4];
+        switch (p->kind) {
+        case VSH_SLOT_CONST:
+            memcpy(dst, p->k, 16);
+            break;
+        case VSH_SLOT_F:
+            memcpy(v, p->k, 16);
+            switch (p->count) {   /* constant sizes, so these inline */
+            case 1:  memcpy(v, src_vb + p->src_off, 4);  break;
+            case 2:  memcpy(v, src_vb + p->src_off, 8);  break;
+            case 3:  memcpy(v, src_vb + p->src_off, 12); break;
+            default: memcpy(v, src_vb + p->src_off, 16); break;
+            }
+            memcpy(dst, v, 16);
+            break;
+        case VSH_SLOT_UB_BGRA: {
+            const uint8_t *b = src_vb + p->src_off;
+            v[0] = b[2] / 255.0f;
+            v[1] = b[1] / 255.0f;
+            v[2] = b[0] / 255.0f;
+            v[3] = b[3] / 255.0f;
+            memcpy(dst, v, 16);
+            break;
+        }
+        default:
+            memcpy(v, g_pg.inline_value[slot_of[j]], 16);
+            decode_attr_floats(src_vb, src_offset, slot_of[j], v);
+            memcpy(dst, v, 16);
+            break;
+        }
+    }
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * Texture upload + pixel shader (VSH draw path only)
  *
@@ -3546,10 +3637,26 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
                                             (size_t)out_vert_count * vsh_stride);
         if (!vsh_verts)
             return;
-        #define CONVERT_VSH_VERT(dst_idx, src_idx) \
-            convert_vsh_vertex(base + (size_t)(src_idx) * stride_bytes, byte_offset, \
-                                vin, \
-                                vsh_verts + (size_t)(dst_idx) * vsh_stride)
+        /* XBOXRECOMP_VTX_FAST=0 converts with the original per-vertex
+         * convert_vsh_vertex(), for comparison. The planned path matched it
+         * byte for byte over 230 million Burnout vertices. */
+        VshSlotPlan plan[16];
+        int slot_of[16];
+        int plan_n = build_vsh_plan(byte_offset, vin, plan, slot_of);
+        static int fast = -1;
+        if (fast < 0) {
+            const char *e = getenv("XBOXRECOMP_VTX_FAST");
+            fast = !(e && e[0] == '0');
+        }
+        #define CONVERT_VSH_VERT(dst_idx, src_idx) do { \
+            if (fast) \
+                convert_vsh_vertex_planned(base + (size_t)(src_idx) * stride_bytes, \
+                                           byte_offset, plan, slot_of, plan_n, \
+                                           vsh_verts + (size_t)(dst_idx) * vsh_stride); \
+            else \
+                convert_vsh_vertex(base + (size_t)(src_idx) * stride_bytes, byte_offset, \
+                                   vin, vsh_verts + (size_t)(dst_idx) * vsh_stride); \
+            } while (0)
         if (is_quads) {
             uint32_t out_idx = 0;
             for (uint32_t q = 0; q < num_quads; q++) {
