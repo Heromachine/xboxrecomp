@@ -1669,6 +1669,26 @@ static uint64_t tex_hash_bytes(const uint8_t *p, size_t n, uint64_t h)
     size_t i = 0;
 
     h ^= (uint64_t)n * 0x9E3779B97F4A7C15ull;
+    /* Four independent lanes, 32 bytes a step: one chain of dependent
+     * multiplies kept the CPU waiting on each one, and this hash was ~7% of
+     * the GPU thread in a Burnout race (HeroLab Burnout task 7b994f01).
+     * Every byte still feeds the result. */
+    if (n >= 32) {
+        uint64_t a = h, b = h ^ 0x9E3779B97F4A7C15ull,
+                 c = h ^ 0xC2B2AE3D27D4EB4Full, e = h ^ 0x165667B19E3779F9ull;
+        for (; i + 32 <= n; i += 32) {
+            uint64_t v0, v1, v2, v3;
+            memcpy(&v0, p + i, 8);
+            memcpy(&v1, p + i + 8, 8);
+            memcpy(&v2, p + i + 16, 8);
+            memcpy(&v3, p + i + 24, 8);
+            a = (a ^ v0) * 0x100000001B3ull; a ^= a >> 32;
+            b = (b ^ v1) * 0x100000001B3ull; b ^= b >> 32;
+            c = (c ^ v2) * 0x100000001B3ull; c ^= c >> 32;
+            e = (e ^ v3) * 0x100000001B3ull; e ^= e >> 32;
+        }
+        h = ((a * 31 + b) * 31 + c) * 31 + e;
+    }
     for (; i + 8 <= n; i += 8) {
         uint64_t v;
         memcpy(&v, p + i, 8);
@@ -1849,10 +1869,22 @@ static TexCacheEntry *resolve_texture_stage(int stage)
         return NULL;
 
     key = tex_cache_key(stage);
+    /* Key -> slot hint, checked before the scan. The cache is searched for
+     * every stage of every draw, and scanning all 512 slots each time was
+     * ~13% of the GPU thread in a Burnout race (HeroLab Burnout task
+     * 7b994f01). The hint is only a guess; the slot's key is verified. */
+    static int16_t hint[4096];
+    i = hint[key & 4095];
+    if (i >= 0 && i < TEX_CACHE_SIZE && g_tex_cache[i].in_use &&
+        g_tex_cache[i].key == key)
+        goto found;
     for (i = 0; i < TEX_CACHE_SIZE; i++) {
         entry = &g_tex_cache[i];
         if (!entry->in_use || entry->key != key)
             continue;
+        hint[key & 4095] = (int16_t)i;
+    found:
+        entry = &g_tex_cache[i];
         entry->last_use = ++g_tex_use_clock;
         if (entry->checked_frame != g_pg.stats.frames) {
             entry->checked_frame = g_pg.stats.frames;
@@ -1890,6 +1922,7 @@ static TexCacheEntry *resolve_texture_stage(int stage)
     }
     entry->key = key;
     entry->in_use = 1;
+    hint[key & 4095] = (int16_t)slot;
     entry->last_use = ++g_tex_use_clock;
     entry->checked_frame = g_pg.stats.frames;
     entry->content_hash = ts.kind == TEXK_YUV ? 0 : tex_content_hash(&ts);
