@@ -20,6 +20,17 @@
 #include <string.h>
 #include <stdlib.h>   /* getenv/strtol, for the frame dump below */
 
+/* Ask hybrid-graphics laptops for the discrete GPU. NVIDIA Optimus and AMD
+ * switchable-graphics drivers look for these two exports in the process's
+ * .exe and run it on the dedicated GPU instead of the integrated one; a
+ * machine with a single GPU ignores them. They must be exported from the
+ * executable itself, which this file always is part of. On a GTX 1050
+ * laptop the integrated GPU cost ~20% of frames at 2x resolution (HeroLab
+ * Burnout task 3eb9cd26). Under Wine they have no effect: Linux selects the
+ * GPU with the driver's PRIME offload environment instead. */
+__declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+
 /* ================================================================
  * Internal device state
  * ================================================================ */
