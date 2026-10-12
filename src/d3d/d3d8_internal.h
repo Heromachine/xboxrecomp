@@ -41,6 +41,7 @@ ID3D11RenderTargetView *d3d8_GetDefaultRTV(void);
 HWND                 d3d8_GetHWND(void);
 UINT                 d3d8_GetBackbufferWidth(void);
 UINT                 d3d8_GetBackbufferHeight(void);
+UINT                 d3d8_GetResScale(void);
 
 /* Current render state array accessor */
 const DWORD         *d3d8_GetRenderStates(void);

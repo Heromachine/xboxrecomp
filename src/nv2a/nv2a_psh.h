@@ -60,6 +60,8 @@ typedef struct {
     float depth_scale;     /* 1 / depth range top, for w-buffered depth */
     float depth_offset;    /* SET_POLYGON_OFFSET_BIAS, depth units */
     float depth_factor;    /* SET_POLYGON_OFFSET_SCALE_FACTOR */
+    float tex_scale[4];    /* D3D11 texels per guest texel, per stage: the
+                            * resolution scale for a rendered surface, else 1 */
 } NV2APshConstants;
 
 /* NV097 texture colour codes that address texels by pitch (xemu's

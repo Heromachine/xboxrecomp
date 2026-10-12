@@ -185,6 +185,25 @@ ID3D11DeviceContext *d3d8_GetD3D11Context(void) { return g_device_state.d3d11_co
 IDXGISwapChain      *d3d8_GetSwapChain(void) { return g_device_state.swap_chain; }
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void) { return g_device_state.default_rtv; }
 HWND                 d3d8_GetHWND(void) { return g_device_state.hwnd; }
+/* XBOXRECOMP_RES_SCALE=<1..4>: render every target, and the swap chain, at
+ * this multiple of the guest's size. Everything that talks to the guest --
+ * surface sizes, viewports in guest pixels, d3d8_GetBackbufferWidth() --
+ * stays in guest units; only the D3D11 objects and the viewports set on
+ * them are scaled. */
+UINT d3d8_GetResScale(void)
+{
+    static int scale = -1;
+    if (scale < 0) {
+        const char *e = getenv("XBOXRECOMP_RES_SCALE");
+        scale = e && *e ? atoi(e) : 1;
+        if (scale < 1) scale = 1;
+        if (scale > 4) scale = 4;
+        if (scale > 1)
+            fprintf(stderr, "D3D8: rendering at %dx the guest resolution\n", scale);
+    }
+    return (UINT)scale;
+}
+
 UINT                 d3d8_GetBackbufferWidth(void) { return g_device_state.width; }
 UINT                 d3d8_GetBackbufferHeight(void) { return g_device_state.height; }
 const DWORD         *d3d8_GetRenderStates(void) { return g_device_state.render_states; }
@@ -228,8 +247,8 @@ static HRESULT d3d11_create_device_and_swap_chain(
 
     memset(&scd, 0, sizeof(scd));
     scd.BufferCount = pp->BackBufferCount ? pp->BackBufferCount : 1;
-    scd.BufferDesc.Width = pp->BackBufferWidth ? pp->BackBufferWidth : 640;
-    scd.BufferDesc.Height = pp->BackBufferHeight ? pp->BackBufferHeight : 480;
+    scd.BufferDesc.Width = (pp->BackBufferWidth ? pp->BackBufferWidth : 640) * d3d8_GetResScale();
+    scd.BufferDesc.Height = (pp->BackBufferHeight ? pp->BackBufferHeight : 480) * d3d8_GetResScale();
     scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     scd.BufferDesc.RefreshRate.Numerator = 60;
     scd.BufferDesc.RefreshRate.Denominator = 1;
@@ -274,8 +293,33 @@ static HRESULT d3d11_create_device_and_swap_chain(
     }
 
     state->hwnd = pp->hDeviceWindow;
-    state->width = scd.BufferDesc.Width;
-    state->height = scd.BufferDesc.Height;
+    state->width = scd.BufferDesc.Width / d3d8_GetResScale();
+    state->height = scd.BufferDesc.Height / d3d8_GetResScale();
+
+    /* At a scale above 1, open the window at the scaled size too (within the
+     * desktop work area), so the extra pixels reach the screen instead of
+     * being stretched back down into a guest-sized window. The top-level
+     * window is sized; a launcher that keeps the swap chain in a child
+     * window centres it on WM_SIZE. */
+    if (d3d8_GetResScale() > 1 && pp->hDeviceWindow) {
+        HWND root = GetAncestor(pp->hDeviceWindow, GA_ROOT);
+        RECT wa, r = { 0, 0, (LONG)scd.BufferDesc.Width, (LONG)scd.BufferDesc.Height };
+        LONG style = GetWindowLongA(root, GWL_STYLE), exstyle = GetWindowLongA(root, GWL_EXSTYLE);
+        if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0)) {
+            LONG maxw = wa.right - wa.left, maxh = wa.bottom - wa.top;
+            AdjustWindowRectEx(&r, (DWORD)style, FALSE, (DWORD)exstyle);
+            if (r.right - r.left > maxw || r.bottom - r.top > maxh) {
+                /* Too big: the largest 4:3-preserving client that fits. */
+                LONG cw = (LONG)scd.BufferDesc.Width, ch = (LONG)scd.BufferDesc.Height;
+                LONG fw = maxw - ((r.right - r.left) - cw), fh = maxh - ((r.bottom - r.top) - ch);
+                if (fw * ch > fh * cw) fw = fh * cw / ch; else fh = fw * ch / cw;
+                r.left = 0; r.top = 0; r.right = fw; r.bottom = fh;
+                AdjustWindowRectEx(&r, (DWORD)style, FALSE, (DWORD)exstyle);
+            }
+        }
+        SetWindowPos(root, NULL, 0, 0, r.right - r.left, r.bottom - r.top,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
 
     return S_OK;
 }
@@ -300,8 +344,8 @@ static HRESULT d3d11_create_render_targets(D3D8DeviceState *state)
 
     /* Create depth stencil */
     memset(&depth_desc, 0, sizeof(depth_desc));
-    depth_desc.Width = state->width;
-    depth_desc.Height = state->height;
+    depth_desc.Width = state->width * d3d8_GetResScale();
+    depth_desc.Height = state->height * d3d8_GetResScale();
     depth_desc.MipLevels = 1;
     depth_desc.ArraySize = 1;
     depth_desc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
@@ -1159,10 +1203,10 @@ static HRESULT __stdcall dev_SetViewport(IDirect3DDevice8 *self, const D3DVIEWPO
         g_device_state.viewport = *pViewport;
 
         D3D11_VIEWPORT d3d11_vp;
-        d3d11_vp.TopLeftX = (FLOAT)pViewport->X;
-        d3d11_vp.TopLeftY = (FLOAT)pViewport->Y;
-        d3d11_vp.Width    = (FLOAT)pViewport->Width;
-        d3d11_vp.Height   = (FLOAT)pViewport->Height;
+        d3d11_vp.TopLeftX = (FLOAT)(pViewport->X * d3d8_GetResScale());
+        d3d11_vp.TopLeftY = (FLOAT)(pViewport->Y * d3d8_GetResScale());
+        d3d11_vp.Width    = (FLOAT)(pViewport->Width * d3d8_GetResScale());
+        d3d11_vp.Height   = (FLOAT)(pViewport->Height * d3d8_GetResScale());
         d3d11_vp.MinDepth = pViewport->MinZ;
         d3d11_vp.MaxDepth = pViewport->MaxZ;
         ID3D11DeviceContext_RSSetViewports(g_device_state.d3d11_context, 1, &d3d11_vp);
@@ -1438,8 +1482,8 @@ static HRESULT __stdcall d3d8_CreateDevice(IDirect3D8 *self, UINT Adapter, DWORD
         D3D11_VIEWPORT vp;
         vp.TopLeftX = 0.0f;
         vp.TopLeftY = 0.0f;
-        vp.Width    = (FLOAT)g_device_state.width;
-        vp.Height   = (FLOAT)g_device_state.height;
+        vp.Width    = (FLOAT)(g_device_state.width * d3d8_GetResScale());
+        vp.Height   = (FLOAT)(g_device_state.height * d3d8_GetResScale());
         vp.MinDepth = 0.0f;
         vp.MaxDepth = 1.0f;
         ID3D11DeviceContext_RSSetViewports(g_device_state.d3d11_context, 1, &vp);

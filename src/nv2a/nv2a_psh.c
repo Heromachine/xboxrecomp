@@ -599,6 +599,7 @@ static const char k_preamble[] =
     "    float  depthScale;\n"
     "    float  depthOffset;\n"
     "    float  depthFactor;\n"
+    "    float4 texScale;\n"
     "};\n"
     /* The same order as d3d8_vsh.c's VS_OUT: D3D11 links stages by
      * position, so every field up to the last one read must be present. */
@@ -706,8 +707,10 @@ int nv2a_psh_generate(const NV2APshState *s, char *buf, size_t cap)
     sb_printf(&vars, "float4 fragColor = float4(0.0, 0.0, 0.0, 0.0);\n");
     for (i = 0; i < 4; i++) {
         if (s->rect_tex[i])
-            sb_printf(&vars, "float2 texSize%d; texSamp%d.GetDimensions(texSize%d.x, texSize%d.y);\n",
-                      i, i, i, i);
+            /* In guest texels: a rendered surface is texScale times larger
+             * on the D3D11 side than the guest's pitch-addressed UVs. */
+            sb_printf(&vars, "float2 texSize%d; texSamp%d.GetDimensions(texSize%d.x, texSize%d.y); "
+                      "texSize%d /= texScale[%d];\n", i, i, i, i, i, i);
     }
 
     for (i = 0; i < 4; i++)

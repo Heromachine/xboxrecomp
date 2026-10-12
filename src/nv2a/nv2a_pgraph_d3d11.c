@@ -1192,6 +1192,7 @@ typedef struct {
     ID3D11Texture2D          *tex2d;
     ID3D11ShaderResourceView *srv;
     float    width, height;       /* real texel dimensions, for UV normalization */
+    float    res_scale;           /* D3D11 texels per guest texel; 0 means 1 */
 } TexCacheEntry;
 
 static TexCacheEntry g_tex_cache[TEX_CACHE_SIZE];
@@ -2026,7 +2027,10 @@ static void surface_release(int idx)
     if (g_present_surf == idx) g_present_surf = -1;
 }
 
-/* Create the D3D11 texture and view for `s` at s->d.width x s->d.height. */
+/* Create the D3D11 texture and view for `s`: s->d.width x s->d.height guest
+ * pixels, times the resolution scale. s->d stays in guest units throughout;
+ * only the D3D11 objects, and the viewports, scissors and copy boxes that
+ * address them, are scaled. */
 static int surface_create_objects(Surface *s)
 {
     ID3D11Device *dev = d3d8_GetD3D11Device();
@@ -2034,8 +2038,8 @@ static int surface_create_objects(Surface *s)
     HRESULT hr;
 
     memset(&td, 0, sizeof(td));
-    td.Width = s->d.width;
-    td.Height = s->d.height;
+    td.Width = s->d.width * d3d8_GetResScale();
+    td.Height = s->d.height * d3d8_GetResScale();
     td.MipLevels = 1;
     td.ArraySize = 1;
     td.SampleDesc.Count = 1;
@@ -2126,7 +2130,8 @@ static int surface_get(uint32_t addr, int is_color, uint32_t w, uint32_t h,
                 return -1;
             }
             if (old.is_color && old.tex && ctx) {
-                D3D11_BOX box = { 0, 0, 0, old.d.width, old.d.height, 1 };
+                UINT rs = d3d8_GetResScale();
+                D3D11_BOX box = { 0, 0, 0, old.d.width * rs, old.d.height * rs, 1 };
                 ID3D11DeviceContext_CopySubresourceRegion(ctx,
                     (ID3D11Resource *)s->tex, 0, 0, 0, 0,
                     (ID3D11Resource *)old.tex, 0, &box);
@@ -2262,8 +2267,8 @@ static int bind_targets(int clearing, uint32_t clear_flags)
 
     vp.TopLeftX = 0.0f;
     vp.TopLeftY = 0.0f;
-    vp.Width = (float)w;
-    vp.Height = (float)h;
+    vp.Width = (float)(w * d3d8_GetResScale());
+    vp.Height = (float)(h * d3d8_GetResScale());
     vp.MinDepth = 0.0f;
     vp.MaxDepth = 1.0f;
     ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
@@ -2280,6 +2285,10 @@ static int bind_targets(int clearing, uint32_t clear_flags)
             sr.left = sr.top = 0;
             sr.right = (LONG)w;
             sr.bottom = (LONG)h;
+        }
+        {
+            LONG rs = (LONG)d3d8_GetResScale();
+            sr.left *= rs; sr.top *= rs; sr.right *= rs; sr.bottom *= rs;
         }
         ID3D11DeviceContext_RSSetScissorRects(ctx, 1, &sr);
         d3d8_states_set_scissor(TRUE);
@@ -2779,8 +2788,8 @@ static void present_surface(void)
     box.left = 0;
     box.top = 0;
     box.front = 0;
-    box.right = s->d.width < bw ? s->d.width : bw;
-    box.bottom = s->d.height < bh ? s->d.height : bh;
+    box.right = (s->d.width < bw ? s->d.width : bw) * d3d8_GetResScale();
+    box.bottom = (s->d.height < bh ? s->d.height : bh) * d3d8_GetResScale();
     box.back = 1;
     {
         const uint8_t *pal = nv2a_get_dac_palette();
@@ -2952,8 +2961,10 @@ static TexCacheEntry *resolve_surface_texture(int stage)
         v = &g_surfview[vi];
         surfview_release(v);
         memset(&td, 0, sizeof(td));
-        td.Width = tw;
-        td.Height = th;
+        /* Scaled like the surface; te.width/height below stay in guest
+         * texels, which is what the shaders' texel-space UVs divide by. */
+        td.Width = tw * d3d8_GetResScale();
+        td.Height = th * d3d8_GetResScale();
         td.MipLevels = 1;
         td.ArraySize = 1;
         td.SampleDesc.Count = 1;
@@ -2982,6 +2993,7 @@ static TexCacheEntry *resolve_surface_texture(int stage)
         v->te.in_use = 1;
         v->te.width = (float)tw;
         v->te.height = (float)th;
+        v->te.res_scale = (float)d3d8_GetResScale();
         v->te.normalized = !linear;
         v->te.tex2d = v->tex;
     }
@@ -2994,7 +3006,8 @@ static TexCacheEntry *resolve_surface_texture(int stage)
             if (g_dbg.dumpz && s->d.addr == g_dbg.dumpz && surftrace_on())
                 dump_depth_view(v, s->d.addr);
         } else {
-            D3D11_BOX box = { x, y, 0, x + tw, y + th, 1 };
+            UINT rs = d3d8_GetResScale();
+            D3D11_BOX box = { x * rs, y * rs, 0, (x + tw) * rs, (y + th) * rs, 1 };
             ID3D11DeviceContext_CopySubresourceRegion(ctx, (ID3D11Resource *)v->tex,
                 0, 0, 0, 0, (ID3D11Resource *)s->tex, 0, &box);
         }
@@ -3121,6 +3134,7 @@ static int bind_pixel_stage(void)
         return 0;
     memset(&st, 0, sizeof(st));
     memset(&k, 0, sizeof(k));
+    k.tex_scale[0] = k.tex_scale[1] = k.tex_scale[2] = k.tex_scale[3] = 1.0f;
     st.combiner_control = g_pg.psh.control;
     st.shader_stage_program = g_pg.psh.stage_program;
     st.other_stage_input = g_pg.psh.other_stage_input;
@@ -3167,6 +3181,8 @@ static int bind_pixel_stage(void)
         k.depth_max[i] = nv2a_psh_tex_depth_max(color);
         te = resolve_texture_stage(i);
         if (te) {
+            if (te->res_scale > 0.0f)
+                k.tex_scale[i] = te->res_scale;
             srv[i] = te->srv;
             samp[i] = get_stage_sampler(i);
         }
