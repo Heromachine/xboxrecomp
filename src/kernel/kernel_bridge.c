@@ -1820,7 +1820,26 @@ static volatile LONG g_connected_interrupt_count = 0;
  * needs 1,500 32-sample subframes per second. Keep the poll as fallback,
  * but wake this handler as soon as the APU raises GINTSTS. */
 #define BREAKDOWN_APU_ISR_ROUTINE 0x001D4F3Fu
+/* The APU is the MCPX's interrupt 5 (the AC97 controller is 6). Keying on the
+ * vector, not on Breakdown's routine address, gives every title the wake-up:
+ * Burnout's APU ISR (0x0015BC55, vector 5) only ran on the 60 Hz poll, and its
+ * audio fell behind real time in busy scenes (HeroLab Burnout task 81fb516d). */
+#define APU_INTERRUPT_VECTOR 5u
 static HANDLE g_apu_irq_event;
+
+/* The NV2A interrupt is vector 3 (the GPU's bus interrupt level). Its ISR is
+ * woken when the GPU raises its line -- vblank, or a re-enable with an event
+ * pending -- rather than only on the 60 Hz poll, whose phase is unrelated to
+ * the vblank it is meant to service. */
+#define GPU_INTERRUPT_VECTOR 3u
+static HANDLE g_gpu_irq_event;
+void nv2a_set_irq_callback(void (*callback)(void *opaque), void *opaque);
+
+static void wake_gpu_isr(void *opaque)
+{
+    HANDLE event = (HANDLE)opaque;
+    if (event) SetEvent(event);
+}
 
 static void wake_breakdown_apu_isr(void *opaque)
 {
@@ -1862,7 +1881,7 @@ static DWORD WINAPI interrupt_delivery_thread(LPVOID param)
 {
     int slot;
     uint32_t stack_top, routine, context, interrupt_va;
-    bool apu_isr;
+    bool apu_isr, gpu_isr;
 
     interrupt_va = (uint32_t)(uintptr_t)param;
 
@@ -1880,12 +1899,16 @@ static DWORD WINAPI interrupt_delivery_thread(LPVOID param)
 
     routine = BRIDGE_MEM32(interrupt_va + 0);
     context = BRIDGE_MEM32(interrupt_va + 4);
-    apu_isr = routine == BREAKDOWN_APU_ISR_ROUTINE && g_apu_irq_event != NULL;
+    apu_isr = (routine == BREAKDOWN_APU_ISR_ROUTINE ||
+               BRIDGE_MEM32(interrupt_va + 8) == APU_INTERRUPT_VECTOR) &&
+              g_apu_irq_event != NULL;
+    gpu_isr = BRIDGE_MEM32(interrupt_va + 8) == GPU_INTERRUPT_VECTOR &&
+              g_gpu_irq_event != NULL;
 
     fprintf(stderr, "  [KERNEL] interrupt delivery: armed on interrupt 0x%08X, "
-            "routine=0x%08X context=0x%08X, %d Hz, thread %lu\n",
-            interrupt_va, routine, context, INTERRUPT_DELIVERY_HZ,
-            GetCurrentThreadId());
+            "routine=0x%08X context=0x%08X vector=%u, %d Hz, thread %lu\n",
+            interrupt_va, routine, context, BRIDGE_MEM32(interrupt_va + 8),
+            INTERRUPT_DELIVERY_HZ, GetCurrentThreadId());
     fflush(stderr);
 
     for (;;) {
@@ -1893,6 +1916,8 @@ static DWORD WINAPI interrupt_delivery_thread(LPVOID param)
 
         if (apu_isr)
             WaitForSingleObject(g_apu_irq_event, 1000 / INTERRUPT_DELIVERY_HZ);
+        else if (gpu_isr)
+            WaitForSingleObject(g_gpu_irq_event, 1000 / INTERRUPT_DELIVERY_HZ);
         else
             Sleep(1000 / INTERRUPT_DELIVERY_HZ);
 
@@ -1959,7 +1984,13 @@ static void bridge_KeConnectInterrupt(void)
         LONG idx = InterlockedIncrement(&g_connected_interrupt_count) - 1;
         if (idx < MAX_DELIVERED_INTERRUPTS) {
             HANDLE h;
-            if (routine == BREAKDOWN_APU_ISR_ROUTINE && !g_apu_irq_event) {
+            /* XBOXRECOMP_APU_ISR_WAKE=0 / XBOXRECOMP_GPU_ISR_WAKE=0 put a
+             * title's APU / GPU ISR back on the 60 Hz poll alone. */
+            const char *apu_wake_env = getenv("XBOXRECOMP_APU_ISR_WAKE");
+            if ((routine == BREAKDOWN_APU_ISR_ROUTINE ||
+                 (BRIDGE_MEM32(interrupt_va + 8) == APU_INTERRUPT_VECTOR &&
+                  !(apu_wake_env && apu_wake_env[0] == '0'))) &&
+                !g_apu_irq_event) {
                 g_apu_irq_event = CreateEventA(NULL, FALSE, FALSE, NULL);
                 if (g_apu_irq_event && g_apu_state) {
                     mcpx_apu_set_irq_callback(g_apu_state,
@@ -1969,6 +2000,15 @@ static void bridge_KeConnectInterrupt(void)
                         mcpx_apu_set_ien_barrier(g_apu_state, apu_ien_barrier, NULL);
                         xbox_set_irq_line_query(apu_irq_line_pending);
                     }
+                }
+            }
+            if (BRIDGE_MEM32(interrupt_va + 8) == GPU_INTERRUPT_VECTOR &&
+                !g_gpu_irq_event) {
+                const char *gpu_wake_env = getenv("XBOXRECOMP_GPU_ISR_WAKE");
+                if (!(gpu_wake_env && gpu_wake_env[0] == '0')) {
+                    g_gpu_irq_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+                    if (g_gpu_irq_event)
+                        nv2a_set_irq_callback(wake_gpu_isr, g_gpu_irq_event);
                 }
             }
             g_connected_interrupts[idx] = interrupt_va;

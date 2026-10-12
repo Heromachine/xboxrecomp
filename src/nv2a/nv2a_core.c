@@ -33,6 +33,17 @@ NV2AState *nv2a_get_state(void) {
  * ============================================================ */
 
 static bool g_pfifo_async_enabled; /* defined with the PFIFO async code */
+static void (*g_nv2a_irq_callback)(void *);
+static void *g_nv2a_irq_opaque;
+
+/* Called whenever the GPU's interrupt line is (re)asserted: PMC_INTR_0 has a
+ * pending source and PMC_INTR_EN_0 is non-zero. Covers both a new event and
+ * the title re-enabling interrupts while one is pending. */
+void nv2a_set_irq_callback(void (*callback)(void *opaque), void *opaque)
+{
+    __atomic_store_n(&g_nv2a_irq_opaque, opaque, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_nv2a_irq_callback, callback, __ATOMIC_RELEASE);
+}
 
 void nv2a_update_irq(NV2AState *d)
 {
@@ -59,6 +70,11 @@ void nv2a_update_irq(NV2AState *d)
 
     if (d->pmc.pending_interrupts && d->pmc.enabled_interrupts) {
         pci_irq_assert(PCI_DEVICE(d));
+        /* Wake the kernel's GPU ISR delivery now, instead of on its own
+         * 60 Hz poll, so a vblank and the ISR that services it share one
+         * clock (HeroLab Burnout task 81fb516d). */
+        void (*cb)(void *) = __atomic_load_n(&g_nv2a_irq_callback, __ATOMIC_ACQUIRE);
+        if (cb) cb(g_nv2a_irq_opaque);
     } else {
         pci_irq_deassert(PCI_DEVICE(d));
     }
