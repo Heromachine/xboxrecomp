@@ -59,6 +59,7 @@ void nv2a_vtx_batch_free(NV2AVtxBatch *b);
  * caller must first drain every run but the last (see _leading_runs) --
  * xemu draws those before expanding the last run into the element list. */
 void nv2a_vtx_batch_element16(NV2AVtxBatch *b, uint32_t param);
+void nv2a_vtx_batch_element16_run(NV2AVtxBatch *b, const uint32_t *params, uint32_t n);
 void nv2a_vtx_batch_element32(NV2AVtxBatch *b, uint32_t param);
 
 /* Runs an ARRAY_ELEMENT arriving now would have to draw first: all but the

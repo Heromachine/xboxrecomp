@@ -43,6 +43,10 @@
 /* Decoder state that survives a bounded PFIFO pull. */
 typedef struct PFIFOChannelState {
     uint32_t jmp_shadow;
+    /* Return offset of the active call, bit 0 set while the puller is
+     * inside it (as NV_PFIFO_CACHE1_DMA_SUBROUTINE). Inside a call GET is
+     * unrelated to PUT, which pfifo_pull's bulk path needs to know. */
+    uint32_t subroutine;
     uint32_t words;
     uint32_t method;
     uint32_t method_index;

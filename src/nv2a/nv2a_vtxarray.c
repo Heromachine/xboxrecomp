@@ -97,6 +97,31 @@ void nv2a_vtx_batch_element16(NV2AVtxBatch *b, uint32_t param)
     push_element(b, param >> 16);
 }
 
+void nv2a_vtx_batch_element16_run(NV2AVtxBatch *b, const uint32_t *params, uint32_t n)
+{
+    expand_last_run(b);
+    uint64_t need = (uint64_t)b->element_count + 2ull * n;
+    if (need > b->element_capacity) {
+        uint64_t cap = b->element_capacity ? b->element_capacity : 4096;
+        while (cap < need)
+            cap *= 2;
+        uint32_t *grown = cap <= 0xFFFFFFFFu
+            ? realloc(b->elements, (size_t)cap * sizeof(*grown)) : NULL;
+        if (!grown) {
+            b->oom = 1;
+            return;
+        }
+        b->elements = grown;
+        b->element_capacity = (uint32_t)cap;
+    }
+    uint32_t *e = b->elements + b->element_count;
+    for (uint32_t i = 0; i < n; i++) {
+        e[2 * i] = params[i] & 0xFFFF;
+        e[2 * i + 1] = params[i] >> 16;
+    }
+    b->element_count += 2 * n;
+}
+
 void nv2a_vtx_batch_element32(NV2AVtxBatch *b, uint32_t param)
 {
     expand_last_run(b);

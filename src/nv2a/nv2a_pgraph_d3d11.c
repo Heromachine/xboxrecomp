@@ -4208,6 +4208,42 @@ static void texdump_stage(int stage)
  * Method Handler
  * ══════════════════════════════════════════════════════════════════════ */
 
+/* A run of `n` parameters of one non-increasing vertex-data method, taken in
+ * one call instead of n pgraph_d3d11_method() dispatches. Returns 1 if the
+ * method is one this handles (all n are then consumed), 0 otherwise. */
+int pgraph_d3d11_method_run(uint32_t method, const uint32_t *params, uint32_t n)
+{
+    if (!g_pg.initialized || surftrace_on())
+        return 0;
+    switch (method) {
+    case NV097_INLINE_ARRAY:
+        g_pg.stats.methods_handled += n;
+        if (g_pg.in_draw) {
+            uint32_t room = MAX_INLINE_DWORDS - g_pg.inline_count;
+            uint32_t take = n < room ? n : room;
+            memcpy(&g_pg.inline_data[g_pg.inline_count], params, (size_t)take * 4);
+            g_pg.inline_count += take;
+        }
+        return 1;
+    case NV097_ARRAY_ELEMENT16:
+    case NV097_ARRAY_ELEMENT32:
+        g_pg.stats.methods_handled += n;
+        if (g_pg.in_draw) {
+            uint32_t lead = nv2a_vtx_batch_leading_runs(&g_pg.batch);
+            if (lead)
+                submit_array_runs(lead);
+            if (method == NV097_ARRAY_ELEMENT16)
+                nv2a_vtx_batch_element16_run(&g_pg.batch, params, n);
+            else
+                for (uint32_t i = 0; i < n; i++)
+                    nv2a_vtx_batch_element32(&g_pg.batch, params[i]);
+        }
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
 {
     if (!g_pg.initialized)

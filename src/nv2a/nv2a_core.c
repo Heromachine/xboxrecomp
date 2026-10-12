@@ -1368,6 +1368,18 @@ static bool pgraph_nop_stalled(NV2AState *d)
     return true;
 }
 
+/* METHODTRACE prints every method of one frame, so it needs the per-word
+ * path. */
+static bool pfifo_methodtrace_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("XBOXRECOMP_METHODTRACE");
+        on = e && *e;
+    }
+    return on;
+}
+
 static void pfifo_pull(NV2AState *d, uint32_t channel, const char *source)
 {
     static uint32_t trace_lines;
@@ -1406,6 +1418,43 @@ static void pfifo_pull(NV2AState *d, uint32_t channel, const char *source)
             break;
         if (pgraph_nop_stalled(d))
             break;
+        bool in_call = (__atomic_load_n(&s->subroutine, __ATOMIC_ACQUIRE) & 1u) != 0;
+        if (s->method_data_pending && !s->increasing &&
+            (s->method == NV097_INLINE_ARRAY ||
+             s->method == NV097_ARRAY_ELEMENT16 ||
+             s->method == NV097_ARRAY_ELEMENT32) &&
+            !pfifo_methodtrace_on()) {
+            /* Vertex data and index runs: hand the whole run to the
+             * translator in one call. Per-word dispatch of these was the
+             * largest share of the worker's decode time in a Burnout race
+             * (HeroLab Burnout task 81fb516d). Only for runs that are already
+             * in the buffer and do not cross the RAM wrap. Ahead of GET with
+             * PUT further on, that is up to PUT. Inside a CALL (D3D's prebuilt
+             * segments, where GET is unrelated to PUT), or with PUT behind GET
+             * (the producer has already wrapped the ring, which is the usual
+             * state while the worker lags), the whole run was written before
+             * the producer moved past it: a method's data never straddles the
+             * jump that wraps the ring. */
+            uint32_t n = (in_call || put < get) ? s->method_count : (put - get) / 4;
+            uint32_t off = get & (g_guest_ram_size - 1);
+            if (n > s->method_count)
+                n = s->method_count;
+            if (n > 1 && off + (uint64_t)n * 4 <= g_guest_ram_size &&
+                pgraph_d3d11_method_run(s->method,
+                                        (const uint32_t *)(g_guest_ram + off), n)) {
+                uint32_t last = *(const uint32_t *)(g_guest_ram + off + (n - 1) * 4);
+                g_pgraph_method_count += n;
+                d->pgraph.regs[s->method / 4] = last;
+                get += n * 4;
+                s->method_index += n;
+                s->method_count -= n;
+                methods += n;
+                pfifo_store(&d->user.dma_get[channel], get);
+                if (s->method_count == 0)
+                    s->method_data_pending = false;
+                continue;
+            }
+        }
         if (s->method_data_pending) {
             uint32_t param = pb_read32(get);
             get += 4;
@@ -1451,9 +1500,11 @@ static void pfifo_pull(NV2AState *d, uint32_t channel, const char *source)
             get = word & 0xfffffffc;
         } else if ((word & 3) == 2) {                     /* call */
             s->jmp_shadow = get;
+            __atomic_store_n(&s->subroutine, (get & 0x1ffffffc) | 1u, __ATOMIC_RELEASE);
             get = word & 0xfffffffc;
         } else if (word == 0x00020000) {                  /* return */
             get = s->jmp_shadow;
+            __atomic_store_n(&s->subroutine, s->subroutine & ~1u, __ATOMIC_RELEASE);
         } else if ((word & 0xe0030003) == 0x00000000 ||
                    (word & 0xe0030003) == 0x40000000) {
             /* A method header is real progress. The runaway guard is for a

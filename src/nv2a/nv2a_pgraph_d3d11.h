@@ -34,6 +34,7 @@ void pgraph_d3d11_shutdown(void);
 /* Process an NV2A PGRAPH method call. Called from push buffer parser.
  * Returns 1 if handled, 0 if unhandled (caller should log/ignore). */
 int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param);
+int pgraph_d3d11_method_run(uint32_t method, const uint32_t *params, uint32_t n);
 
 /* Flush any pending draw commands (call at end of frame). */
 void pgraph_d3d11_flush(void);
