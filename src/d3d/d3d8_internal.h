@@ -30,6 +30,12 @@ IDirect3DDevice8 *d3d8_GetDevice(void);
 IDirect3DDevice8    *d3d8_GetDevice(void);
 ID3D11Device        *d3d8_GetD3D11Device(void);
 ID3D11DeviceContext *d3d8_GetD3D11Context(void);
+void *d3d8_vb_ring_begin(UINT size, UINT *offset);
+void  d3d8_vb_ring_end(void);
+void *d3d8_ib_ring_begin(UINT size, UINT *offset);
+void  d3d8_ib_ring_end(void);
+HRESULT d3d8_draw_indexed_ring(D3DPRIMITIVETYPE PrimitiveType, UINT index_count,
+                               UINT vb_offset, UINT stride, UINT ib_offset, BOOL idx32);
 IDXGISwapChain      *d3d8_GetSwapChain(void);
 ID3D11RenderTargetView *d3d8_GetDefaultRTV(void);
 HWND                 d3d8_GetHWND(void);

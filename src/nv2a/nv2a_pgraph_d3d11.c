@@ -3305,7 +3305,8 @@ static void *scratch_grow(void **buf, size_t *cap, size_t need)
 }
 
 static void submit_vertices(const uint8_t *base, uint32_t num_verts,
-                            const uint32_t byte_offset[16], uint32_t stride_bytes);
+                            const uint32_t byte_offset[16], uint32_t stride_bytes,
+                            const uint32_t *idx, uint32_t n_idx, uint32_t idx_bias);
 
 static int pgraph_profile_on(void)
 {
@@ -3338,7 +3339,8 @@ static void submit_draw(void)
     int profile = pgraph_profile_on();
     if (profile) QueryPerformanceCounter(&start);
     submit_vertices((const uint8_t *)g_pg.inline_data,
-                    (g_pg.inline_count * 4) / stride_bytes, byte_offset, stride_bytes);
+                    (g_pg.inline_count * 4) / stride_bytes, byte_offset, stride_bytes,
+                    NULL, 0, 0);
     if (profile) {
         QueryPerformanceCounter(&end);
         g_profile_inline_ticks += end.QuadPart - start.QuadPart;
@@ -3355,6 +3357,83 @@ static const uint8_t *vtx_guest_span(void *ctx, uint32_t dma_select,
     (void)ctx;
     (void)dma_select;
     return tex_guest_span(addr, len);
+}
+
+/* Indexed draw straight from guest memory, for the usual case where every
+ * enabled attribute comes from one interleaved array: convert each vertex in
+ * the referenced range once, in place in the vertex ring, and draw the
+ * element list as an index buffer. Gathering every element into the packed
+ * layout instead converted each vertex once per reference (1.65 references
+ * per vertex in a Burnout race) and copied the result twice more (HeroLab
+ * Burnout task 81fb516d). Returns 0 to take the gather path. */
+static int try_submit_indexed(const uint32_t *elements, uint32_t n)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("XBOXRECOMP_VTX_INDEXED");
+        enabled = !(e && e[0] == '0');
+    }
+    /* Modes the index path can express: points through quads. */
+    if (!enabled || n < 3 || g_pg.draw_mode < 1 || g_pg.draw_mode > 8)
+        return 0;
+    /* Only the vertex-program and fixed-function-program paths take indices;
+     * the 2D fallback needs expanded vertices. */
+    if (!((g_pg.vsh.transform_mode == 2 && g_pg.vsh.program_length > 0) ||
+          (g_pg.vsh.transform_mode == 0 && !g_dbg.noff)))
+        return 0;
+
+    uint32_t stride = 0, dma = 0, omin = 0, extent = 0;
+    int first = 1;
+    for (int a = 0; a < 16; a++) {
+        const NV2AVtxAttr *at = &g_pg.vattr[a];
+        if (!at->count)
+            continue;
+        if (first) {
+            stride = at->stride;
+            dma = at->dma_select;
+            omin = at->offset;
+            first = 0;
+        } else if (at->stride != stride || at->dma_select != dma) {
+            return 0;
+        }
+        if (at->offset < omin)
+            omin = at->offset;
+    }
+    if (first || stride == 0)
+        return 0;
+    uint32_t byte_offset[16] = {0};
+    for (int a = 0; a < 16; a++) {
+        const NV2AVtxAttr *at = &g_pg.vattr[a];
+        if (!at->count)
+            continue;
+        uint32_t rel = at->offset - omin;
+        uint32_t end = rel + (uint32_t)at->size * at->count;
+        if (end > stride)
+            return 0;  /* attributes overlap the next vertex: not interleaved */
+        byte_offset[a] = rel;
+        if (end > extent)
+            extent = end;
+    }
+
+    uint32_t lo = 0xFFFFFFFFu, hi = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (elements[i] < lo) lo = elements[i];
+        if (elements[i] > hi) hi = elements[i];
+    }
+    uint32_t span = hi - lo + 1;
+    /* A sparse list over a wide range would convert vertices nothing uses. */
+    if (span > 2 * n + 64)
+        return 0;
+    uint64_t start = (uint64_t)omin + (uint64_t)lo * stride;
+    uint64_t len = (uint64_t)(span - 1) * stride + extent;
+    if (start + len > 0xFFFFFFFFu)
+        return 0;
+    const uint8_t *src = vtx_guest_span(NULL, dma, (uint32_t)start, (size_t)len);
+    if (!src)
+        return 0;
+    g_pg.stats.array_draws++;
+    submit_vertices(src, span, byte_offset, stride, elements, n, lo);
+    return 1;
 }
 
 /* Gather `n` array-sourced vertices into the packed inline layout and draw
@@ -3382,6 +3461,8 @@ static void submit_array_elements(const uint32_t *elements, uint32_t n)
         }
         return;
     }
+    if (try_submit_indexed(elements, n))
+        return;
     if (!scratch_grow(&packed, &packed_cap, (size_t)n * stride_bytes))
         return;
     if (profile) QueryPerformanceCounter(&start);
@@ -3396,7 +3477,7 @@ static void submit_array_elements(const uint32_t *elements, uint32_t n)
     }
     if (profile) QueryPerformanceCounter(&after_gather);
     g_pg.stats.array_draws++;
-    submit_vertices(packed, n, byte_offset, stride_bytes);
+    submit_vertices(packed, n, byte_offset, stride_bytes, NULL, 0, 0);
     if (profile) {
         QueryPerformanceCounter(&end);
         g_profile_gather_ticks += after_gather.QuadPart - start.QuadPart;
@@ -3428,19 +3509,30 @@ static void submit_array_runs(uint32_t count)
     g_pg.batch.run_total -= count;
 }
 
+/* With idx != NULL, base holds num_verts distinct vertices and the draw is
+ * the n_idx-entry list idx[] (minus idx_bias, so it indexes base); otherwise
+ * base holds the num_verts vertices of the draw in order. */
 static void submit_vertices(const uint8_t *base, uint32_t num_verts,
-                            const uint32_t byte_offset[16], uint32_t stride_bytes)
+                            const uint32_t byte_offset[16], uint32_t stride_bytes,
+                            const uint32_t *idx, uint32_t n_idx, uint32_t idx_bias)
 {
-    if (num_verts < 3)
+    uint32_t n_in = idx ? n_idx : num_verts;
+    if (n_in < 3)
         return;
     int actual_prim_type = g_pg.d3d_prim_type;
-    uint32_t out_vert_count = num_verts;
+    uint32_t out_vert_count = n_in;
 
     /* Handle QUADS (mode 8): convert to triangle list (6 verts per quad) */
     int is_quads = (g_pg.draw_mode == 8);
-    uint32_t num_quads = is_quads ? (num_verts / 4) : 0;
+    uint32_t num_quads = is_quads ? (n_in / 4) : 0;
     if (is_quads) {
         out_vert_count = num_quads * 6;  /* 2 triangles per quad */
+        actual_prim_type = D3DPT_TRIANGLELIST;
+    }
+    /* Indexed fans become lists here; DrawPrimitiveUP converts its own. */
+    int is_fan = idx && actual_prim_type == D3DPT_TRIANGLEFAN;
+    if (is_fan) {
+        out_vert_count = (n_in - 2) * 3;
         actual_prim_type = D3DPT_TRIANGLELIST;
     }
 
@@ -3653,9 +3745,20 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
         if (vsh_stride == 0)
             use_vsh = 0;  /* Program declares no inputs we can supply -- fall back */
     }
+    if (idx && !use_vsh) {
+        /* try_submit_indexed() only sends draws that take a vertex program;
+         * one whose program then failed to build is dropped, not mis-drawn. */
+        static unsigned dropped;
+        if (dropped++ < 8)
+            fprintf(stderr, "[PGRAPH-D3D11] indexed draw dropped: no vertex program "
+                    "(%u indices)\n", n_idx);
+        return;
+    }
 
     OutputVertex *out = NULL;
     uint8_t *vsh_verts = NULL;
+    UINT vb_off = 0, ib_off = 0;
+    BOOL idx32 = FALSE;
 
     if (use_vsh) {
         /* Programmable path: pack each vertex into whatever layout the
@@ -3666,8 +3769,11 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
          * bytes) computed above -- unchanged from the fixed-function path. */
         static void *vsh_buf;
         static size_t vsh_cap;
-        vsh_verts = (uint8_t *)scratch_grow(&vsh_buf, &vsh_cap,
-                                            (size_t)out_vert_count * vsh_stride);
+        if (idx)
+            vsh_verts = (uint8_t *)d3d8_vb_ring_begin(num_verts * vsh_stride, &vb_off);
+        else
+            vsh_verts = (uint8_t *)scratch_grow(&vsh_buf, &vsh_cap,
+                                                (size_t)out_vert_count * vsh_stride);
         if (!vsh_verts)
             return;
         /* XBOXRECOMP_VTX_FAST=0 converts with the original per-vertex
@@ -3690,7 +3796,45 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
                 convert_vsh_vertex(base + (size_t)(src_idx) * stride_bytes, byte_offset, \
                                    vin, vsh_verts + (size_t)(dst_idx) * vsh_stride); \
             } while (0)
-        if (is_quads) {
+        if (idx) {
+            for (uint32_t i = 0; i < num_verts; i++)
+                CONVERT_VSH_VERT(i, i);
+            d3d8_vb_ring_end();
+            /* 0xFFFF cuts a 16-bit strip in D3D11, so 16-bit only below it. */
+            idx32 = num_verts > 0xFFFF;
+            void *ib = d3d8_ib_ring_begin(out_vert_count * (idx32 ? 4 : 2), &ib_off);
+            if (!ib)
+                return;
+            #define PUT_IDX(o, e) do { uint32_t _v = (e) - idx_bias; \
+                if (idx32) ((uint32_t *)ib)[o] = _v; else ((uint16_t *)ib)[o] = (uint16_t)_v; } while (0)
+            if (is_quads) {
+                for (uint32_t q = 0; q < num_quads; q++) {
+                    const uint32_t *qi = idx + q * 4;
+                    PUT_IDX(q * 6 + 0, qi[0]);
+                    PUT_IDX(q * 6 + 1, qi[1]);
+                    PUT_IDX(q * 6 + 2, qi[2]);
+                    PUT_IDX(q * 6 + 3, qi[0]);
+                    PUT_IDX(q * 6 + 4, qi[2]);
+                    PUT_IDX(q * 6 + 5, qi[3]);
+                }
+            } else if (is_fan) {
+                for (uint32_t t = 0; t + 2 < n_idx; t++) {
+                    PUT_IDX(t * 3 + 0, idx[0]);
+                    PUT_IDX(t * 3 + 1, idx[t + 1]);
+                    PUT_IDX(t * 3 + 2, idx[t + 2]);
+                }
+            } else if (!idx32) {
+                uint16_t *o = (uint16_t *)ib;
+                for (uint32_t i = 0; i < n_idx; i++)
+                    o[i] = (uint16_t)(idx[i] - idx_bias);
+            } else {
+                uint32_t *o = (uint32_t *)ib;
+                for (uint32_t i = 0; i < n_idx; i++)
+                    o[i] = idx[i] - idx_bias;
+            }
+            #undef PUT_IDX
+            d3d8_ib_ring_end();
+        } else if (is_quads) {
             uint32_t out_idx = 0;
             for (uint32_t q = 0; q < num_quads; q++) {
                 uint32_t qi = q * 4;
@@ -4123,7 +4267,11 @@ static void submit_vertices(const uint8_t *base, uint32_t num_verts,
     dev->lpVtbl->BeginScene(dev);
 
     /* Draw */
-    if (use_vsh) {
+    if (use_vsh && idx) {
+        d3d8_draw_indexed_ring((D3DPRIMITIVETYPE)actual_prim_type, out_vert_count,
+                               vb_off, vsh_stride, ib_off, idx32);
+        g_pg.stats.vsh_draws++;
+    } else if (use_vsh) {
         dev->lpVtbl->DrawPrimitiveUP(dev, (D3DPRIMITIVETYPE)actual_prim_type,
                                       prim_count, vsh_verts, vsh_stride);
         g_pg.stats.vsh_draws++;
