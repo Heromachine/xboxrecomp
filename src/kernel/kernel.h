@@ -747,6 +747,11 @@ NTSTATUS __stdcall xbox_NtCreateMutant(PHANDLE MutantHandle, PXBOX_OBJECT_ATTRIB
 NTSTATUS __stdcall xbox_NtReleaseMutant(HANDLE MutantHandle, PLONG PreviousCount);
 
 LONG     __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait);
+/* Guest KEVENT (a dispatcher header in guest memory, not a host HANDLE).
+ * Both return FALSE when `va` is not a recognisable KEVENT; the caller then
+ * uses the host-handle path above. */
+BOOL     xbox_KeSetGuestEvent(uint32_t va, LONG *previous);
+BOOL     xbox_KeWaitGuestEvent(uint32_t va, PLARGE_INTEGER Timeout, NTSTATUS *status);
 NTSTATUS __stdcall xbox_KeWaitForSingleObject(PVOID Object, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
 NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(ULONG Count, PVOID Objects[], ULONG WaitType, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout, PVOID WaitBlockArray);
 

@@ -88,6 +88,21 @@ struct PGRAPHState {
     uint32_t dma_semaphore;
     uint32_t semaphore_offset;
 
+    /* NV097_NO_OPERATION with a non-zero parameter is a software method: it
+     * raises a PGRAPH error/notify interrupt and the pusher stays stopped
+     * until the driver acknowledges it by clearing NV_PGRAPH_INTR_ERROR
+     * (xemu pgraph.c, waiting_for_nop). nop_since is the GetTickCount64() at
+     * which the stall began, for the safety release in pfifo_pull. */
+    uint32_t waiting_for_nop;
+    /* NV_PGRAPH_FIFO access bit as last written (1 = methods accepted), and
+     * whether an acknowledged NOP notify is still held until the handler
+     * re-enables access: the handler acks NV_PGRAPH_INTR BEFORE it reads
+     * TRAPPED_DATA, and hardware keeps the next method out because the
+     * handler cleared FIFO access first. */
+    uint32_t fifo_access_off;
+    uint32_t waiting_for_fifo;
+    uint64_t nop_since;
+
     /* Phase 3-4: Full PGRAPH state will go here */
 };
 

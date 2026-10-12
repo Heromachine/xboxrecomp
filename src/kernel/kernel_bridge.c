@@ -1080,6 +1080,13 @@ static void bridge_KeSetEvent(void)
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
 
+    {
+        LONG prev;
+        if (xbox_KeSetGuestEvent(event_ptr, &prev)) {
+            g_eax = (uint32_t)prev;
+            return;
+        }
+    }
     g_eax = (uint32_t)xbox_KeSetEvent(XBOX_TO_NATIVE(event_ptr), increment, (BOOLEAN)wait);
 }
 
@@ -1092,6 +1099,11 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t alertable = STACK_ARG(3);
     uint32_t timeout_ptr = STACK_ARG(4);
 
+    NTSTATUS gst;
+    if (xbox_KeWaitGuestEvent(object, XBOX_TO_NATIVE(timeout_ptr), &gst)) {
+        g_eax = (uint32_t)gst;
+        return;
+    }
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         XBOX_TO_NATIVE(object), wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));

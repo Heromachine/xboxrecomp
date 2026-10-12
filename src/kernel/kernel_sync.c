@@ -294,6 +294,112 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
     return xbox_wait_result_to_ntstatus(result, 1);
 }
 
+/*
+ * Guest KEVENTs.
+ *
+ * A KEVENT lives in guest memory and the title initialises it itself (the XDK
+ * does it inline): +0 Type (0 notification, 1 synchronization), +1 Absolute,
+ * +2 Size in dwords (4), +3 Inserted, +4 SignalState. It is not a host HANDLE,
+ * and the two functions above treat it as one, so a wait on it always failed
+ * at once and a set on it did nothing. A title that loops until the wait
+ * succeeds (Burnout's D3D push-buffer space wait) then spins forever, which
+ * only shows when the GPU lags the CPU. These two give a recognisable guest
+ * KEVENT real semantics and leave every other object to the old path.
+ *
+ * "Recognisable" is deliberately strict: a mapped, aligned address whose Type
+ * is 0 or 1 and whose Size is 4. Timers (8/9), semaphores, threads and real
+ * host handles do not match and keep their old behaviour.
+ */
+static volatile LONG *xbox_guest_event_signal(uint32_t va)
+{
+    uint8_t *h;
+
+    if (!va || (va & 3) || !xbox_IsXboxAddress(va) ||
+        !xbox_IsXboxAddress(va + 15))
+        return NULL;
+    h = (uint8_t *)((uintptr_t)va + (uintptr_t)xbox_GetMemoryOffset());
+    if (h[0] > 1 || h[2] != 4)
+        return NULL;
+    return (volatile LONG *)(h + 4);
+}
+
+/* Waiting on a guest KEVENT: WaitOnAddress wakes the waiter the moment the
+ * setter writes SignalState, where polling with Sleep(1) cost at least a
+ * millisecond per wait -- several per frame in D3D's push-buffer space wait
+ * under async PFIFO (HeroLab Burnout task 7b994f01). Resolved at run time so
+ * the build needs no new import library; falls back to polling. */
+typedef BOOL (WINAPI *WaitOnAddressFn)(volatile VOID *, PVOID, SIZE_T, DWORD);
+typedef VOID (WINAPI *WakeByAddressAllFn)(PVOID);
+static WaitOnAddressFn g_wait_on_address;
+static WakeByAddressAllFn g_wake_by_address_all;
+static void guest_event_wait_init(void)
+{
+    static volatile LONG done;
+    if (InterlockedCompareExchange(&done, 1, 0) != 0) return;
+    HMODULE m = GetModuleHandleA("kernelbase.dll");
+    if (!m) m = LoadLibraryA("api-ms-win-core-synch-l1-2-0.dll");
+    if (m) {
+        g_wake_by_address_all = (WakeByAddressAllFn)(void *)GetProcAddress(m, "WakeByAddressAll");
+        g_wait_on_address = (WaitOnAddressFn)(void *)GetProcAddress(m, "WaitOnAddress");
+    }
+    if (!g_wait_on_address || !g_wake_by_address_all)
+        g_wait_on_address = NULL, g_wake_by_address_all = NULL;
+}
+
+BOOL xbox_KeSetGuestEvent(uint32_t va, LONG *previous)
+{
+    volatile LONG *sig = xbox_guest_event_signal(va);
+
+    if (!sig)
+        return FALSE;
+    /* KeSetEvent returns the previous state; waiters poll SignalState. */
+    LONG prev = InterlockedExchange(sig, 1);
+    if (previous)
+        *previous = prev;
+    guest_event_wait_init();
+    if (g_wake_by_address_all)
+        g_wake_by_address_all((PVOID)sig);
+    return TRUE;
+}
+
+BOOL xbox_KeWaitGuestEvent(uint32_t va, PLARGE_INTEGER Timeout, NTSTATUS *status)
+{
+    volatile LONG *sig = xbox_guest_event_signal(va);
+    DWORD ms;
+    ULONGLONG start;
+    BOOL auto_reset;
+
+    if (!sig)
+        return FALSE;
+    auto_reset = *(uint8_t *)((uintptr_t)va + (uintptr_t)xbox_GetMemoryOffset()) == 1;
+    ms = xbox_nt_timeout_to_ms(Timeout);
+    start = GetTickCount64();
+    guest_event_wait_init();
+    for (;;) {
+        LONG s = *sig;
+        if (s > 0) {
+            /* A synchronization event releases one waiter and clears itself. */
+            if (!auto_reset || InterlockedCompareExchange(sig, 0, s) == s) {
+                *status = STATUS_SUCCESS;
+                return TRUE;
+            }
+            continue;
+        }
+        if (ms != INFINITE && GetTickCount64() - start >= ms) {
+            *status = STATUS_TIMEOUT;
+            return TRUE;
+        }
+        if (g_wait_on_address) {
+            /* Wakes when the setter changes SignalState; the timeout bounds a
+             * set that happened through a path that does not wake. */
+            LONG zero = 0;
+            g_wait_on_address(sig, &zero, sizeof zero, 10);
+        } else {
+            Sleep(1);
+        }
+    }
+}
+
 NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(
     ULONG Count,
     PVOID Objects[],

@@ -32,6 +32,8 @@ NV2AState *nv2a_get_state(void) {
  * IRQ aggregation (from xemu nv2a.c)
  * ============================================================ */
 
+static bool g_pfifo_async_enabled; /* defined with the PFIFO async code */
+
 void nv2a_update_irq(NV2AState *d)
 {
     /* PFIFO */
@@ -643,12 +645,22 @@ void pvideo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
  * PGRAPH - graphics engine (stub for Phase 1)
  * ============================================================ */
 
+static void pgraph_wake_pusher(NV2AState *d);
+
 uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
-    uint64_t r = addr == NV_PGRAPH_PATT_COLOR0
-        ? __atomic_load_n(&d->pgraph.regs[addr], __ATOMIC_ACQUIRE)
-        : d->pgraph.regs[addr];
+    uint64_t r;
+    /* The interrupt registers are state (nv2a_update_irq reads the same
+     * fields), not a plain register file. */
+    if (addr == NV_PGRAPH_INTR)
+        r = __atomic_load_n(&d->pgraph.pending_interrupts, __ATOMIC_ACQUIRE);
+    else if (addr == NV_PGRAPH_INTR_EN)
+        r = __atomic_load_n(&d->pgraph.enabled_interrupts, __ATOMIC_ACQUIRE);
+    else
+        r = addr == NV_PGRAPH_PATT_COLOR0
+            ? __atomic_load_n(&d->pgraph.regs[addr], __ATOMIC_ACQUIRE)
+            : d->pgraph.regs[addr];
     nv2a_reg_log_read(NV_PGRAPH, addr, size, r);
     return r;
 }
@@ -657,6 +669,36 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
     nv2a_reg_log_write(NV_PGRAPH, addr, size, val);
+    if (addr == NV_PGRAPH_FIFO) {
+        uint32_t off = !(val & 1);
+        __atomic_store_n(&d->pgraph.fifo_access_off, off, __ATOMIC_RELEASE);
+        if (!off && __atomic_exchange_n(&d->pgraph.waiting_for_fifo, 0, __ATOMIC_ACQ_REL))
+            pgraph_wake_pusher(d);
+    }
+    if (addr == NV_PGRAPH_INTR) {
+        /* Write-1-to-clear. Clearing the error bit is the driver's
+         * acknowledgement of a NO_OPERATION software method: the pusher that
+         * was stopped on it may go on. */
+        __atomic_fetch_and(&d->pgraph.pending_interrupts, ~(uint32_t)val,
+                           __ATOMIC_ACQ_REL);
+        if (!(d->pgraph.pending_interrupts & NV_PGRAPH_INTR_ERROR) &&
+            __atomic_load_n(&d->pgraph.waiting_for_nop, __ATOMIC_ACQUIRE)) {
+            if (__atomic_load_n(&d->pgraph.fifo_access_off, __ATOMIC_ACQUIRE)) {
+                d->pgraph.nop_since = GetTickCount64();
+                __atomic_store_n(&d->pgraph.waiting_for_fifo, 1, __ATOMIC_RELEASE);
+            }
+            __atomic_store_n(&d->pgraph.waiting_for_nop, 0, __ATOMIC_RELEASE);
+        }
+        nv2a_update_irq(d);
+        pgraph_wake_pusher(d);
+        return;
+    }
+    if (addr == NV_PGRAPH_INTR_EN) {
+        __atomic_store_n(&d->pgraph.enabled_interrupts, (uint32_t)val,
+                         __ATOMIC_RELEASE);
+        nv2a_update_irq(d);
+        return;
+    }
     d->pgraph.regs[addr] = val;
 }
 
@@ -761,6 +803,43 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
      * the legacy counters further down never see them; presenting has to
      * happen here or it does not happen at all. Flush first: the translator
      * batches draws and the last one of the frame is still pending. */
+    /* NO_OPERATION with a non-zero parameter is a software method call: on
+     * hardware it traps into the driver through a PGRAPH notify interrupt, and
+     * the pusher stays stopped until the driver clears the error bit (xemu
+     * pgraph.c NV097_NO_OPERATION). Burnout's D3D uses it to learn that the
+     * GPU has drained far enough to reuse push-buffer space: it queues the
+     * method, resets a KEVENT and waits on it for the interrupt handler. Left
+     * as a plain no-op the event is never signalled and that wait can never
+     * end, which only shows when the GPU lags the CPU (async PFIFO).
+     *
+     * Only taken when the interrupt can actually be delivered: a title that
+     * has not enabled the PGRAPH error interrupt and PMC interrupts would
+     * stall the pusher with nobody to release it. pfifo_pull also releases a
+     * stall that outlives NOP_STALL_TIMEOUT_MS, so a handler that never runs
+     * cannot hang the GPU. */
+    if (method == M_NO_OPERATION && param != 0 && g_pfifo_async_enabled) {
+        d->pgraph.regs[NV_PGRAPH_TRAPPED_ADDR] =
+            (0u << 20) | ((subchannel & 7u) << 16) | (method & 0x1FFFu);
+        d->pgraph.regs[NV_PGRAPH_TRAPPED_DATA_LOW] = param;
+        d->pgraph.regs[NV_PGRAPH_NSOURCE] = NV_PGRAPH_NSOURCE_NOTIFICATION;
+        d->pgraph.nop_since = GetTickCount64();
+        __atomic_store_n(&d->pgraph.waiting_for_nop, 1, __ATOMIC_RELEASE);
+        __atomic_fetch_or(&d->pgraph.pending_interrupts,
+                          NV_PGRAPH_INTR_ERROR, __ATOMIC_ACQ_REL);
+        nv2a_update_irq(d);
+        {
+            static int logged;
+            if (logged < 8) {
+                logged++;
+                fprintf(stderr, "[PGRAPH] NO_OPERATION param=0x%08X: notify "
+                        "interrupt raised, pusher stopped until acknowledged\n",
+                        param);
+                fflush(stderr);
+            }
+        }
+        return;
+    }
+
     if (method == M_FLIP_STALL) {
         pgraph_d3d11_flush();
         g_pgraph_flip_count++;
@@ -1240,6 +1319,39 @@ static bool pfifo_deep_trace_enabled(void)
     return enabled != 0;
 }
 
+/* A pusher stopped on a NO_OPERATION software method waits for the driver's
+ * interrupt handler. If that handler never runs (not connected, masked), the
+ * stall would be permanent, so give up after this long and carry on as the
+ * earlier plain-no-op behaviour did. */
+#define NOP_STALL_TIMEOUT_MS 250
+
+static bool pgraph_nop_stalled(NV2AState *d)
+{
+    if (__atomic_load_n(&d->pgraph.waiting_for_fifo, __ATOMIC_ACQUIRE)) {
+        if (GetTickCount64() - d->pgraph.nop_since <= NOP_STALL_TIMEOUT_MS)
+            return true;
+        __atomic_store_n(&d->pgraph.waiting_for_fifo, 0, __ATOMIC_RELEASE);
+        fprintf(stderr, "[PGRAPH] FIFO access not re-enabled within %d ms after a "
+                "NOP notify: releasing the pusher\n", NOP_STALL_TIMEOUT_MS);
+    }
+    if (!__atomic_load_n(&d->pgraph.waiting_for_nop, __ATOMIC_ACQUIRE))
+        return false;
+    if (GetTickCount64() - d->pgraph.nop_since > NOP_STALL_TIMEOUT_MS) {
+        static int logged;
+        __atomic_store_n(&d->pgraph.waiting_for_nop, 0, __ATOMIC_RELEASE);
+        __atomic_fetch_and(&d->pgraph.pending_interrupts,
+                           ~(uint32_t)NV_PGRAPH_INTR_ERROR, __ATOMIC_ACQ_REL);
+        nv2a_update_irq(d);
+        if (logged++ < 8) {
+            fprintf(stderr, "[PGRAPH] NO_OPERATION notify not acknowledged "
+                    "within %d ms: releasing the pusher\n", NOP_STALL_TIMEOUT_MS);
+            fflush(stderr);
+        }
+        return false;
+    }
+    return true;
+}
+
 static void pfifo_pull(NV2AState *d, uint32_t channel, const char *source)
 {
     static uint32_t trace_lines;
@@ -1275,6 +1387,8 @@ static void pfifo_pull(NV2AState *d, uint32_t channel, const char *source)
          * from entry can make GET chase a target that is no longer current. */
         put = pfifo_load(&d->user.dma_put[channel]);
         if (get == put)
+            break;
+        if (pgraph_nop_stalled(d))
             break;
         if (s->method_data_pending) {
             uint32_t param = pb_read32(get);
@@ -1326,6 +1440,13 @@ static void pfifo_pull(NV2AState *d, uint32_t channel, const char *source)
             get = s->jmp_shadow;
         } else if ((word & 0xe0030003) == 0x00000000 ||
                    (word & 0xe0030003) == 0x40000000) {
+            /* A method header is real progress. The runaway guard is for a
+             * stream that only ever jumps back to itself; counting every word
+             * since the last drain instead fired under async PFIFO, where a
+             * busy push buffer can go a long time without GET reaching PUT,
+             * and skipped to PUT -- dropping fences and the NOP that D3D was
+             * waiting on (HeroLab Burnout task 3eb8a752). */
+            s->words = 0;
             s->increasing = (word & 0x40000000) == 0;
             s->method_count = (word >> 18) & 0x7ff;
             s->method_index = 0;
@@ -1387,6 +1508,15 @@ static void pfifo_pull(NV2AState *d, uint32_t channel, const char *source)
     }
 }
 
+/* The driver acknowledged a PGRAPH interrupt: let a stopped pusher run. In
+ * async mode the worker sleeps on work_event; in sync mode the next GET/PUT
+ * access pulls. */
+static void pgraph_wake_pusher(NV2AState *d)
+{
+    if (g_pfifo_async_enabled)
+        SetEvent(d->pfifo.work_event);
+}
+
 /* Decode on a dedicated thread. PUT only publishes a pointer and signals the
  * event; GET polling observes published progress without taking the decoder
  * lock. The event remembers a kick that arrives while the worker is busy. */
@@ -1408,6 +1538,10 @@ static DWORD WINAPI pfifo_async_worker(LPVOID opaque)
                 uint32_t get = pfifo_load(&d->user.dma_get[channel]);
                 uint32_t put = pfifo_load(&d->user.dma_put[channel]);
                 if (get == put) continue;
+                /* Stopped on a NO_OPERATION software method: not work, so the
+                 * loop below does not spin. The driver's acknowledgement
+                 * (pgraph_write NV_PGRAPH_INTR) sets work_event again. */
+                if (pgraph_nop_stalled(d)) continue;
                 did_work = true;
                 InterlockedExchange(&g_pfifo_async_channel, (LONG)channel);
                 InterlockedExchange(&g_pfifo_async_stage, 2);
@@ -1797,6 +1931,9 @@ void nv2a_raise_vblank(void)
      * a title that has not enabled vblank must not see one pending. */
     d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
     nv2a_update_irq(d);
+    /* The 60 Hz tick also bounds a NO_OPERATION stall whose handler never
+     * ran, even when nothing is polling the puller. */
+    (void)pgraph_nop_stalled(d);
 }
 
 /* ============================================================
