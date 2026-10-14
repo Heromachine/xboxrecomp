@@ -763,14 +763,15 @@ class FunctionTranslator:
         if has_fpu:
             lines.extend(FP_STACK_MACROS)
 
-        # For fpo_leaf functions that use ebp: initialize from g_seh_ebp.
-        # In x86, these functions inherit EBP from their caller (typically
-        # via a tail jump that shares the caller's frame). In our C translation,
-        # ebp is a local variable that would start uninitialized, causing
-        # crashes when the function reads MEM32(ebp + offset). The g_seh_ebp
-        # global bridges ebp across function boundaries.
-        if frame_type == "fpo_leaf" and "ebp" in used_regs and not has_prologue:
-            lines.append(f"    ebp = g_seh_ebp; /* fpo_leaf: inherit caller's frame */")
+        # fpo_leaf functions used to take ebp from g_seh_ebp here, overriding
+        # the g_ebp line above. g_seh_ebp is written only by tail jumps and the
+        # SEH helpers, so an fpo_leaf entered by a plain `call` inherited
+        # whatever the last tail jump anywhere had left. Burnout's CRT math
+        # error tail sub_000641AB (the same shape as Halo's sub_001DEC07) is
+        # called that way; built with zig it found 7 there and stored
+        # [ebp-0xa2] at Xbox VA 0xFFFFFF65 as every race started (HeroGame,
+        # 2026-10-13). Tail jumps now publish g_ebp too, so g_ebp is right
+        # for both ways in, and the override is gone.
 
         lines.append(f"")
 
