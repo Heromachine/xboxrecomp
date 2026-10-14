@@ -744,7 +744,14 @@ class FunctionTranslator:
         # a function whose only carry user is an rcr would not even declare
         # _cf, which is how the CRT 64-bit divide lost its low half.
         self.lifter.needs_cf = has_carry
-        self.lifter.publishes_ebp = self._func_has_prologue(instructions)
+        # Every function that holds an ebp republishes it before each call,
+        # not only those with `mov ebp, esp`: that is what the hardware
+        # register holds at the call. An SEH function gets its frame back from
+        # __SEH_prolog through g_seh_ebp, and frameless helpers it calls start
+        # from g_ebp (above), which without this is the last callee's dead
+        # frame.
+        self.lifter.publishes_ebp = (self._func_has_prologue(instructions)
+                                     or "ebp" in used_regs)
 
         # SSE/MMX registers (xmm0-xmm7, mm0-mm7) are both architectural
         # state declared globally by the runtime, exactly like the GPRs and
@@ -771,7 +778,15 @@ class FunctionTranslator:
         # called that way; built with zig it found 7 there and stored
         # [ebp-0xa2] at Xbox VA 0xFFFFFF65 as every race started (HeroGame,
         # 2026-10-13). Tail jumps now publish g_ebp too, so g_ebp is right
-        # for both ways in, and the override is gone.
+        # for both ways in, and the override is gone -- except in the SEH
+        # helpers themselves. Their callers hand them the frame through
+        # g_seh_ebp just before the call (see the lifter), and __SEH_prolog
+        # stores it into the new frame for __SEH_epilog to restore; given the
+        # stale g_ebp instead, Burnout's first SEH function returned to its
+        # caller with a dead frame and the title exited at boot.
+        if (start in (self.lifter.SEH_PROLOG, self.lifter.SEH_EPILOG)
+                and "ebp" in used_regs and not has_prologue):
+            lines.append("    ebp = g_seh_ebp; /* SEH helper: caller's frame */")
 
         lines.append(f"")
 
