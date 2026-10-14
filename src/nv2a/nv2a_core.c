@@ -674,7 +674,9 @@ uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
     else if (addr == NV_PGRAPH_INTR_EN)
         r = __atomic_load_n(&d->pgraph.enabled_interrupts, __ATOMIC_ACQUIRE);
     else
-        r = addr == NV_PGRAPH_PATT_COLOR0
+        r = (addr == NV_PGRAPH_PATT_COLOR0 ||
+             addr == NV_PGRAPH_ZSTENCILCLEARVALUE ||
+             addr == NV_PGRAPH_COLORCLEARVALUE)
             ? __atomic_load_n(&d->pgraph.regs[addr], __ATOMIC_ACQUIRE)
             : d->pgraph.regs[addr];
     nv2a_reg_log_read(NV_PGRAPH, addr, size, r);
@@ -791,6 +793,18 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
         d->pgraph.subchannel_class[subchannel] == NV_CONTEXT_PATTERN &&
         method == NV044_SET_MONOCHROME_COLOR0)
         __atomic_store_n(&d->pgraph.regs[NV_PGRAPH_PATT_COLOR0],
+                         param, __ATOMIC_RELEASE);
+
+    /* The clear values are PGRAPH registers too (xemu pgraph.c). The XDK's
+     * callback software method stores the callback in ZSTENCILCLEARVALUE and
+     * its argument in COLORCLEARVALUE, then raises a NO_OPERATION notify
+     * whose handler reads both back and calls the callback. Without them
+     * Breakdown's handler called address 0. */
+    if (method == NV097_SET_ZSTENCIL_CLEAR_VALUE)
+        __atomic_store_n(&d->pgraph.regs[NV_PGRAPH_ZSTENCILCLEARVALUE],
+                         param, __ATOMIC_RELEASE);
+    else if (method == NV097_SET_COLOR_CLEAR_VALUE)
+        __atomic_store_n(&d->pgraph.regs[NV_PGRAPH_COLORCLEARVALUE],
                          param, __ATOMIC_RELEASE);
 
     /* XBOXRECOMP_METHODTRACE=<frame> prints every method of that ONE frame.
