@@ -16,6 +16,7 @@
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#include "xbox_guest_sync.h"
 #include <stdio.h>
 
 /* ============================================================================
@@ -309,11 +310,16 @@ NTSTATUS __stdcall xbox_KeWaitForSingleObject(
  * "Recognisable" is deliberately strict: a mapped, aligned address whose Type
  * is 0 or 1 and whose Size is 4. Timers (8/9), semaphores, threads and real
  * host handles do not match and keep their old behaviour.
+ *
+ * All of this is off unless the title turns it on (xbox_guest_sync.h): a
+ * title can carry patches written for the old fail-at-once waits.
  */
 static volatile LONG *xbox_guest_event_signal(uint32_t va)
 {
     uint8_t *h;
 
+    if (!xbox_guest_kevents_enabled())
+        return NULL;
     if (!va || (va & 3) || !xbox_IsXboxAddress(va) ||
         !xbox_IsXboxAddress(va + 15))
         return NULL;

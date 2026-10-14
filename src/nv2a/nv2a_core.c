@@ -11,6 +11,7 @@
 #include "nv2a_state.h"
 #include "nv2a_pgraph_d3d11.h"
 #include "../d3d/d3d8_xbox.h"   /* d3d8_PresentFrame, called at FLIP_STALL */
+#include "../kernel/xbox_guest_sync.h"
 
 /* ============================================================
  * Global state
@@ -846,8 +847,12 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
      * has not enabled the PGRAPH error interrupt and PMC interrupts would
      * stall the pusher with nobody to release it. pfifo_pull also releases a
      * stall that outlives NOP_STALL_TIMEOUT_MS, so a handler that never runs
-     * cannot hang the GPU. */
-    if (method == M_NO_OPERATION && param != 0 && g_pfifo_async_enabled) {
+     * cannot hang the GPU.
+     *
+     * It is half of one mechanism with the guest KEVENT waits, so it follows
+     * the same per-title switch (xbox_guest_sync.h). */
+    if (method == M_NO_OPERATION && param != 0 && g_pfifo_async_enabled &&
+        xbox_guest_kevents_enabled()) {
         d->pgraph.regs[NV_PGRAPH_TRAPPED_ADDR] =
             (0u << 20) | ((subchannel & 7u) << 16) | (method & 0x1FFFu);
         d->pgraph.regs[NV_PGRAPH_TRAPPED_DATA_LOW] = param;
@@ -1383,13 +1388,15 @@ static bool pgraph_nop_stalled(NV2AState *d)
 }
 
 /* METHODTRACE prints every method of one frame, so it needs the per-word
- * path. */
+ * path. XBOXRECOMP_PFIFO_BULK=0 takes that path too, without the trace, to
+ * rule the bulk runs in or out when a title misbehaves. */
 static bool pfifo_methodtrace_on(void)
 {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("XBOXRECOMP_METHODTRACE");
-        on = e && *e;
+        const char *b = getenv("XBOXRECOMP_PFIFO_BULK");
+        on = (e && *e) || (b && b[0] == '0');
     }
     return on;
 }
