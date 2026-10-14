@@ -224,6 +224,53 @@ def test_fstp_sti_pops():
     assert "fp_pop();" in o, o
 
 
+def test_fxam_classifies_st0_for_fnstsw():
+    """fxam was a comment, so the CRT math dispatchers (fxam; fnstsw; index a
+    handler table) read the last compare's bits and picked a handler for the
+    wrong class of operand. Compiled: each class gives the hardware's
+    C3/C2/C1/C0 in the high byte of `fnstsw ax`."""
+    import shutil
+    cc = shutil.which("clang") or shutil.which("gcc")
+    if not cc:
+        print("  SKIP no C compiler")
+        return
+    L = Lifter()
+    fxam = "\n".join(L.lift_instruction(_Insn("fxam", [], "")))
+    fnstsw = "\n".join(L.lift_instruction(_Insn("fnstsw", [], "ax")))
+    src = r"""
+#include <math.h>
+#include <stdio.h>
+#include <stdint.h>
+static double st0; static int g_fp_cmp; static unsigned g_fp_top; static uint32_t eax;
+#define fp_top() st0
+static unsigned ah(double v) { st0 = v; g_fp_top = 0; eax = 0;
+""" + fxam + "\n" + fnstsw + r"""
+  return (eax >> 8) & 0x47u; }
+int main(void) {
+  struct { double v; unsigned want; const char *n; } t[] = {
+    { 1.5, 0x04, "normal" }, { -1.5, 0x06, "-normal" }, { 0.0, 0x40, "zero" },
+    { -0.0, 0x42, "-zero" }, { INFINITY, 0x05, "inf" }, { -INFINITY, 0x07, "-inf" },
+    { NAN, 0x01, "nan" }, { 4.9e-324, 0x44, "denormal" } };
+  for (unsigned i = 0; i < sizeof t / sizeof t[0]; i++)
+    if (ah(t[i].v) != t[i].want) {
+      printf("FAIL %s: ah&0x47 = 0x%02x, want 0x%02x\n", t[i].n, ah(t[i].v), t[i].want);
+      return 1; }
+  /* A compare after fxam reports compare bits again. */
+  g_fp_cmp = -1; eax = 0;
+""" + fnstsw + r"""
+  if (((eax >> 8) & 0x45u) != 0x01) { printf("FAIL compare after fxam\n"); return 1; }
+  printf("OK fxam classes\n"); return 0; }
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        c = os.path.join(tmp, "t.c")
+        open(c, "w").write(src)
+        exe = os.path.join(tmp, "t.exe")
+        r = subprocess.run([cc, "-w", c, "-o", exe, "-lm"], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[-1500:]
+        r = subprocess.run([exe], capture_output=True, text=True)
+        assert r.returncode == 0 and r.stdout.startswith("OK"), r.stdout + r.stderr
+
+
 def _run():
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

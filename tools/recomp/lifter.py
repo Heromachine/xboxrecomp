@@ -2788,6 +2788,23 @@ class Lifter:
             return [f"fp_push(0.30102999566398119521); /* fldlg2 */"]
         if m == "fldln2":
             return [f"fp_push(0.69314718055994530942); /* fldln2 */"]
+        if m == "fxam":
+            # Classify st0 into C3/C2/C0 (and its sign into C1) for the
+            # following fnstsw. It was a comment, so fnstsw reported whatever
+            # the last compare left. The CRT's math dispatchers (_trandisp1/2;
+            # Burnout's sub_000641AB) fxam each operand, fnstsw, and index a
+            # handler table with the result, so every pow/atan2/acos chose a
+            # handler for the wrong class of operand. Compares leave -1..2 in
+            # g_fp_cmp; 0x10000 and up tells fnstsw to report these bits as
+            # they are (a bit test would also match -1). The stack has no
+            # empty-tag model, so an empty st0 classifies by whatever value
+            # the slot holds.
+            return ["{ double _fx = fp_top(); g_fp_cmp = (int)(0x10000u"
+                    " | (signbit(_fx) ? 0x0200u : 0u)"
+                    " | (isnan(_fx) ? 0x0100u : isinf(_fx) ? 0x0500u"
+                    " : _fx == 0.0 ? 0x4000u"
+                    " : fpclassify(_fx) == FP_SUBNORMAL ? 0x4400u : 0x0400u)); }"
+                    " /* fxam */"]
         if m == "ftst":
             return [f"g_fp_cmp = (fp_top() < 0.0) ? -1 : "
                     f"(fp_top() > 0.0) ? 1 : 0; /* ftst */"]
@@ -2850,8 +2867,11 @@ class Lifter:
             # `test ah, 0x44; jp` -- the standard isnan idiom -- reads exactly
             # those two bits. Reporting equal for a NaN compare sends every
             # float classification in a title down the wrong branch.
+            # After fxam, g_fp_cmp carries its condition bits as they are (see
+            # fxam above).
             status = ("(uint16_t)(((g_fp_top & 7u) << 11) |"
-                      " (g_fp_cmp == 2 ? 0x4500u :"
+                      " (g_fp_cmp >= 0x10000 ? ((uint32_t)g_fp_cmp & 0x4700u) :"
+                      " g_fp_cmp == 2 ? 0x4500u :"
                       " g_fp_cmp < 0 ? 0x0100u :"
                       " g_fp_cmp > 0 ? 0x0000u : 0x4000u))")
             if insn.op_str.strip() in ("ax", "eax"):
